@@ -37,7 +37,7 @@ INSTALL_DEST_DIR="/Applications"
 INSTALL_DEST_APP="$INSTALL_DEST_DIR/$BUNDLE_NAME"
 
 echo "Building $EXECUTABLE_NAME ($BUILD_PROFILE)..."
-cargo build "${CARGO_BUILD_ARGS[@]}"
+cargo build "${CARGO_BUILD_ARGS[@]}" --bin "$EXECUTABLE_NAME"
 
 if [[ ! -f "$APP_BINARY_SOURCE" ]]; then
   echo "Error: expected binary not found at $APP_BINARY_SOURCE" >&2
