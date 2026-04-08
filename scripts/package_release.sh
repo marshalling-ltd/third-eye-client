@@ -26,7 +26,7 @@ if [[ ! -x "$FFMPEG_SOURCE" ]]; then
 fi
 
 echo "Building release binary..."
-cargo build --release
+cargo build --release --bin third-eye-client
 
 mkdir -p "$BUNDLE_DIR"
 if [[ -e "$BUNDLED_FFMPEG" && "$FFMPEG_SOURCE" -ef "$BUNDLED_FFMPEG" ]]; then

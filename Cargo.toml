@@ -3,12 +3,22 @@ name = "third-eye-client"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test-tools = []
+
+[[bin]]
+name = "test_udp_server"
+path = "src/bin/test_udp_server.rs"
+required-features = ["test-tools"]
+
 [dependencies]
 anyhow = "1.0.100"
 eframe = "0.33.0"
 egui = "0.33.0"
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 webbrowser = "1.0.6"
 

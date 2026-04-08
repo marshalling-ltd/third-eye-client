@@ -14,8 +14,10 @@ use eframe::egui::{self, ColorImage, TextureHandle};
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
 use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationAccuracyBest};
+use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::Value;
+use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
@@ -42,6 +44,8 @@ enum Screen {
 struct AppConfig {
     rtsp_url: String,
     rov_http_base: String,
+    rov_status_udp_bind_host: String,
+    rov_status_udp_port: u16,
     osm_tile_user_agent: String,
 }
 
@@ -50,9 +54,26 @@ impl Default for AppConfig {
         Self {
             rtsp_url: DEFAULT_TEST_RTSP.to_owned(),
             rov_http_base: DEFAULT_ROV_HTTP_BASE.to_owned(),
+            rov_status_udp_bind_host: default_rov_udp_bind_host(),
+            rov_status_udp_port: ROV_STATUS_UDP_PORT,
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
         }
     }
+}
+
+fn parse_host_from_http_base(base: &str) -> Option<String> {
+    let normalized = if base.contains("://") {
+        base.trim().to_owned()
+    } else {
+        format!("http://{}", base.trim())
+    };
+    Url::parse(&normalized)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+fn default_rov_udp_bind_host() -> String {
+    parse_host_from_http_base(DEFAULT_ROV_HTTP_BASE).unwrap_or_else(|| "0.0.0.0".to_owned())
 }
 
 fn stream_stderr_loop(
@@ -61,26 +82,34 @@ fn stream_stderr_loop(
     tx: mpsc::Sender<StreamEvent>,
 ) {
     let mut read_buffer = [0_u8; 8 * 1024];
-    let mut collected = Vec::new();
+    let mut line_buffer = Vec::new();
     while !stop_flag.load(Ordering::Relaxed) {
         match stderr.read(&mut read_buffer) {
             Ok(0) => break,
-            Ok(n) => collected.extend_from_slice(&read_buffer[..n]),
+            Ok(n) => {
+                line_buffer.extend_from_slice(&read_buffer[..n]);
+                // Send complete lines as they arrive
+                while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
+                    let line_bytes = line_buffer.drain(..=pos).collect::<Vec<_>>();
+                    if let Ok(line) = String::from_utf8(line_bytes) {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
+                        }
+                    }
+                }
+            }
             Err(_) => break,
         }
     }
-
-    if stop_flag.load(Ordering::Relaxed) || collected.is_empty() {
-        return;
-    }
-
-    if let Ok(stderr_text) = String::from_utf8(collected)
-        && let Some(last_line) = stderr_text
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-    {
-        let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {last_line}")));
+    // Flush any remaining partial line
+    if !line_buffer.is_empty() {
+        if let Ok(line) = String::from_utf8(line_buffer) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
+            }
+        }
     }
 }
 
@@ -117,6 +146,7 @@ struct ThirdEyeApp {
     map: MapState,
     rov_info: String,
     stream: StreamState,
+    rov_status: UdpStatusState,
 }
 
 impl ThirdEyeApp {
@@ -131,6 +161,7 @@ impl ThirdEyeApp {
             },
             rov_info: String::new(),
             stream: StreamState::default(),
+            rov_status: UdpStatusState::default(),
         };
         app.initialize_location_on_startup();
         app
@@ -238,6 +269,28 @@ impl ThirdEyeApp {
         ui.text_edit_singleline(&mut self.config.rov_http_base);
         if ui.button("Use default ROV HTTP API URL").clicked() {
             self.config.rov_http_base = DEFAULT_ROV_HTTP_BASE.to_owned();
+            self.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
+        }
+        if ui
+            .button("Use host from ROV HTTP API URL for telemetry UDP bind")
+            .clicked()
+        {
+            if let Some(host) = parse_host_from_http_base(&self.config.rov_http_base) {
+                self.config.rov_status_udp_bind_host = host;
+            } else {
+                self.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
+            }
+        }
+        ui.separator();
+        ui.label("ROV telemetry UDP bind host:");
+        ui.text_edit_singleline(&mut self.config.rov_status_udp_bind_host);
+        ui.label("ROV telemetry UDP port:");
+        ui.add(egui::DragValue::new(&mut self.config.rov_status_udp_port).range(1..=u16::MAX));
+        if ui
+            .button("Use default ROV telemetry UDP port (8500)")
+            .clicked()
+        {
+            self.config.rov_status_udp_port = ROV_STATUS_UDP_PORT;
         }
         ui.separator();
         ui.label("OpenStreetMap tile User-Agent:");
@@ -409,6 +462,10 @@ impl ThirdEyeApp {
         ui.monospace(&self.config.rtsp_url);
         ui.separator();
         ui.label("Embedded stream is decoded with ffmpeg and rendered directly in this window.");
+        ui.label(format!(
+            "ROV telemetry bind target: {}:{}.",
+            self.config.rov_status_udp_bind_host, self.config.rov_status_udp_port
+        ));
 
         ui.horizontal_wrapped(|ui| {
             if ui.button("Start embedded stream").clicked() {
@@ -423,13 +480,67 @@ impl ThirdEyeApp {
                 self.stream.stop();
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Start ROV status listener").clicked() {
+                self.rov_status.stop();
+                if let Err(err) = self.rov_status.start(
+                    &self.config.rov_status_udp_bind_host,
+                    self.config.rov_status_udp_port,
+                ) {
+                    self.rov_status
+                        .set_status_text(format!("Failed to start UDP listener: {err:#}"));
+                }
+            }
+
+            if ui.button("Stop ROV status listener").clicked() {
+                self.rov_status.stop();
+            }
+        });
 
         ui.separator();
         ui.label(&self.stream.status);
         ui.label(format!("Frames received: {}", self.stream.frames_received));
+        ui.label(self.rov_status.status_text());
+        ui.label(format!(
+            "Status packets received: {}",
+            self.rov_status.packets_received()
+        ));
 
-        if self.stream.is_running() {
+        if self.stream.is_running() || self.rov_status.is_running() {
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        if let Some(status) = self.rov_status.latest_status() {
+            ui.separator();
+            ui.heading("Latest ROV status");
+            ui.label(format!(
+                "Attitude [rad]: pitch={:.3}, roll={:.3}, yaw={:.3}",
+                status.pitch, status.roll, status.yaw
+            ));
+            ui.label(format!(
+                "Depth: {:.2} m | Temperature: {:.1} °C",
+                status.depth, status.temperature
+            ));
+            ui.label(format!(
+                "Coordinates: lat_degE7={}, lon_degE7={}",
+                status.lat, status.lon
+            ));
+            ui.label(format!(
+                "IMU gyro [0.1°/s]: x={}, y={}, z={}",
+                status.imu.gyro_x, status.imu.gyro_y, status.imu.gyro_z
+            ));
+            if status.batteries.is_empty() {
+                ui.label("Batteries: no battery data in payload.");
+            } else {
+                ui.collapsing("Batteries", |ui| {
+                    for battery in &status.batteries {
+                        ui.label(format!(
+                            "ID {}: {} mV, {} (10mA), {}%",
+                            battery.id, battery.voltage, battery.current, battery.remaining
+                        ));
+                    }
+                });
+            }
         }
 
         if let Some(texture) = &self.stream.texture {
@@ -451,6 +562,7 @@ impl ThirdEyeApp {
 impl eframe::App for ThirdEyeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.stream.poll_events(ctx);
+        self.rov_status.poll_events();
         self.materialize_pending_map_texture(ctx);
         egui::TopBottomPanel::top("top_menu").show(ctx, |ui| {
             self.top_menu(ui);
@@ -472,6 +584,7 @@ impl eframe::App for ThirdEyeApp {
 impl Drop for ThirdEyeApp {
     fn drop(&mut self) {
         self.stream.stop();
+        self.rov_status.stop();
     }
 }
 
@@ -607,14 +720,12 @@ fn spawn_stream_pipeline(
     let mut ffmpeg_child = Command::new(ffmpeg_bin)
         .arg("-hide_banner")
         .arg("-loglevel")
-        .arg("error")
+        .arg("warning")
         .arg("-rtsp_transport")
         .arg("tcp")
-        .arg("-fflags")
-        .arg("nobuffer")
-        .arg("-flags")
-        .arg("low_delay")
-        .arg("-rw_timeout")
+        .arg("-analyzeduration")
+        .arg("10000000")
+        .arg("-probesize")
         .arg("10000000")
         .arg("-i")
         .arg(rtsp_url)
