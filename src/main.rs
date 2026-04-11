@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -9,7 +11,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use eframe::egui::{self, ColorImage, TextureHandle};
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
@@ -17,6 +18,7 @@ use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationA
 use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::Value;
+use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
@@ -30,8 +32,379 @@ const MAP_IMAGE_SIZE_PX: u32 = 768;
 const CORELOCATION_FIX_POLL_ATTEMPTS: u32 = 8;
 #[cfg(target_os = "macos")]
 const CORELOCATION_FIX_POLL_INTERVAL_MS: u64 = 250;
+const CUPERTINO_ACCENT_COLOR: [u8; 4] = [10, 132, 255, 255];
+const MAP_PIN_OUTLINE_COLOR: [u8; 4] = [255, 255, 255, 255];
+const MAP_PIN_CENTER_COLOR: [u8; 4] = [255, 255, 255, 255];
 const DEFAULT_OSM_TILE_USER_AGENT: &str =
     "third-eye-client/0.1 (desktop map viewer; set contact URL/email for production use)";
+
+slint::slint! {
+import { Button, HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Third Eye Client";
+    width: 1520px;
+    height: 960px;
+
+    in-out property <int> active_screen: 0;
+
+    in-out property <string> rtsp_url;
+    in-out property <string> rov_http_base;
+    in-out property <string> rov_status_udp_bind_host;
+    in-out property <string> rov_status_udp_port;
+    in-out property <string> osm_tile_user_agent;
+    in-out property <string> rov_info;
+
+    in-out property <string> map_status;
+    in-out property <string> corelocation_debug;
+    in-out property <string> lat_lon_text;
+    in-out property <string> zoom_text;
+    in-out property <image> map_image;
+    in-out property <bool> has_map_image: false;
+
+    in-out property <string> stream_status;
+    in-out property <string> frames_received_text;
+    in-out property <image> stream_image;
+    in-out property <bool> has_stream_image: false;
+
+    in-out property <string> rov_status_text;
+    in-out property <string> rov_packets_received_text;
+    in-out property <bool> has_rov_status: false;
+    in-out property <string> rov_attitude_text;
+    in-out property <string> rov_depth_temp_text;
+    in-out property <string> rov_coordinates_text;
+    in-out property <string> rov_imu_text;
+    in-out property <string> rov_batteries_text;
+
+    callback navigate_configuration();
+    callback navigate_map();
+    callback navigate_stream();
+
+    callback use_default_test_rtsp();
+    callback use_default_rov_rtsp();
+    callback use_default_rov_http_base();
+    callback use_host_from_rov_http_base();
+    callback use_default_rov_status_udp_port();
+    callback use_default_osm_tile_user_agent();
+
+    callback list_medias();
+    callback capture_photo();
+
+    callback detect_location();
+    callback load_map_tile();
+    callback zoom_out();
+    callback zoom_in();
+    callback open_interactive_map();
+
+    callback start_stream();
+    callback stop_stream();
+    callback start_rov_status_listener();
+    callback stop_rov_status_listener();
+    HorizontalBox {
+        padding: 10px;
+        spacing: 10px;
+
+        Rectangle {
+            min-width: 240px;
+            max-width: 240px;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #1f2127;
+
+            VerticalBox {
+                padding: 12px;
+                spacing: 8px;
+
+                Text {
+                    text: "Third Eye Client";
+                    font-size: 26px;
+                }
+                Text {
+                    text: "Navigation";
+                    color: #8f96a3;
+                }
+                Rectangle {
+                    height: 1px;
+                    background: #3f4148;
+                }
+
+                Button {
+                    text: "Configuration";
+                    clicked => { root.navigate_configuration(); }
+                }
+                Button {
+                    text: "Device Map";
+                    clicked => { root.navigate_map(); }
+                }
+                Button {
+                    text: "Live Stream";
+                    clicked => { root.navigate_stream(); }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #202328;
+
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
+
+                if root.active_screen == 0 : VerticalBox {
+                    spacing: 8px;
+                    Text {
+                        text: "RTSP + ROV Configuration";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.";
+                        wrap: word-wrap;
+                    }
+
+                    Text { text: "RTSP URL:"; }
+                    LineEdit { text <=> root.rtsp_url; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default test RTSP URL";
+                            clicked => { root.use_default_test_rtsp(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default ROV RTSP URL";
+                            clicked => { root.use_default_rov_rtsp(); }
+                        }
+                    }
+
+                    Text { text: "ROV HTTP API Base URL:"; }
+                    LineEdit { text <=> root.rov_http_base; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default ROV HTTP API URL";
+                            clicked => { root.use_default_rov_http_base(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use host from ROV HTTP API URL for telemetry UDP bind";
+                            clicked => { root.use_host_from_rov_http_base(); }
+                        }
+                    }
+
+                    Text { text: "ROV telemetry UDP bind host:"; }
+                    LineEdit { text <=> root.rov_status_udp_bind_host; }
+                    Text { text: "ROV telemetry UDP port:"; }
+                    LineEdit { text <=> root.rov_status_udp_port; }
+                    Button {
+                        text: "Use default ROV telemetry UDP port (8500)";
+                        clicked => { root.use_default_rov_status_udp_port(); }
+                    }
+
+                    Text { text: "OpenStreetMap tile User-Agent:"; }
+                    LineEdit { text <=> root.osm_tile_user_agent; }
+                    Button {
+                        text: "Use default OSM tile User-Agent";
+                        clicked => { root.use_default_osm_tile_user_agent(); }
+                    }
+                    Text {
+                        text: "Include an app identifier and contact URL/email for OSM tile policy compliance.";
+                        wrap: word-wrap;
+                    }
+
+                    Text { text: "ROV API notes:"; }
+                    Text {
+                        text: "• RTSP stream example: rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• HTTP API server example: http://192.168.1.88:80";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• Capture endpoint: POST /v1/capture";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• Media list endpoint: GET /v1/medias";
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "List medias (GET /v1/medias)";
+                            clicked => { root.list_medias(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Capture photo (POST /v1/capture)";
+                            clicked => { root.capture_photo(); }
+                        }
+                    }
+
+                    Text { text: root.rov_info; wrap: word-wrap; }
+                }
+
+                if root.active_screen == 1 : VerticalBox {
+                    spacing: 8px;
+                    Text {
+                        text: "Device Location on OpenStreetMap";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "This desktop app uses native location when available, with IP geolocation fallback.";
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Detect location";
+                            clicked => { root.detect_location(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Load OSM map tile";
+                            clicked => { root.load_map_tile(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Zoom out";
+                            clicked => { root.zoom_out(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Zoom in";
+                            clicked => { root.zoom_in(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Open interactive map in browser";
+                            clicked => { root.open_interactive_map(); }
+                        }
+                    }
+
+                    Text { text: "Coordinates: " + root.lat_lon_text; }
+                    Text { text: "Zoom: " + root.zoom_text; }
+                    Text { text: root.corelocation_debug; wrap: word-wrap; }
+                    Text { text: root.map_status; wrap: word-wrap; }
+
+                    Rectangle {
+                        border-width: 1px;
+                        border-color: #5f5f5f;
+                        min-height: 320px;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        if root.has_map_image : Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.map_image;
+                            image-fit: contain;
+                        }
+                        if !root.has_map_image : Text {
+                            text: "No map image loaded yet.";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if root.active_screen == 2 : VerticalBox {
+                    spacing: 8px;
+                    Text {
+                        text: "RTSP Live Stream";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "Current stream URL (shared from configuration screen): " + root.rtsp_url;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "ROV telemetry bind target: " + root.rov_status_udp_bind_host + ":" + root.rov_status_udp_port;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start embedded stream";
+                            clicked => { root.start_stream(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop stream";
+                            clicked => { root.stop_stream(); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start ROV status listener";
+                            clicked => { root.start_rov_status_listener(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop ROV status listener";
+                            clicked => { root.stop_rov_status_listener(); }
+                        }
+                    }
+
+                    Text { text: root.stream_status; wrap: word-wrap; }
+                    Text { text: "Frames received: " + root.frames_received_text; }
+                    Text { text: root.rov_status_text; wrap: word-wrap; }
+                    Text { text: "Status packets received: " + root.rov_packets_received_text; }
+
+                    if root.has_rov_status : VerticalBox {
+                        spacing: 4px;
+                        Text { text: "Latest ROV status"; font-size: 18px; }
+                        Text { text: root.rov_attitude_text; wrap: word-wrap; }
+                        Text { text: root.rov_depth_temp_text; wrap: word-wrap; }
+                        Text { text: root.rov_coordinates_text; wrap: word-wrap; }
+                        Text { text: root.rov_imu_text; wrap: word-wrap; }
+                        Text { text: root.rov_batteries_text; wrap: word-wrap; }
+                    }
+
+                    Rectangle {
+                        border-width: 1px;
+                        border-color: #5f5f5f;
+                        min-height: 320px;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        if root.has_stream_image : Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.stream_image;
+                            image-fit: contain;
+                        }
+                        if !root.has_stream_image : Text {
+                            text: "No frames rendered yet.";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -40,12 +413,22 @@ enum Screen {
     Stream,
 }
 
+impl Screen {
+    const fn index(self) -> i32 {
+        match self {
+            Self::Configuration => 0,
+            Self::Map => 1,
+            Self::Stream => 2,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppConfig {
     rtsp_url: String,
     rov_http_base: String,
     rov_status_udp_bind_host: String,
-    rov_status_udp_port: u16,
+    rov_status_udp_port: String,
     osm_tile_user_agent: String,
 }
 
@@ -55,9 +438,22 @@ impl Default for AppConfig {
             rtsp_url: DEFAULT_TEST_RTSP.to_owned(),
             rov_http_base: DEFAULT_ROV_HTTP_BASE.to_owned(),
             rov_status_udp_bind_host: default_rov_udp_bind_host(),
-            rov_status_udp_port: ROV_STATUS_UDP_PORT,
+            rov_status_udp_port: ROV_STATUS_UDP_PORT.to_string(),
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
         }
+    }
+}
+
+impl AppConfig {
+    fn parse_rov_status_udp_port(&self) -> Result<u16> {
+        let port_text = self.rov_status_udp_port.trim();
+        let port = port_text
+            .parse::<u16>()
+            .context("ROV telemetry UDP port must be a number between 1 and 65535")?;
+        if port == 0 {
+            anyhow::bail!("ROV telemetry UDP port must be between 1 and 65535");
+        }
+        Ok(port)
     }
 }
 
@@ -76,56 +472,18 @@ fn default_rov_udp_bind_host() -> String {
     parse_host_from_http_base(DEFAULT_ROV_HTTP_BASE).unwrap_or_else(|| "0.0.0.0".to_owned())
 }
 
-fn stream_stderr_loop(
-    mut stderr: ChildStderr,
-    stop_flag: Arc<AtomicBool>,
-    tx: mpsc::Sender<StreamEvent>,
-) {
-    let mut read_buffer = [0_u8; 8 * 1024];
-    let mut line_buffer = Vec::new();
-    while !stop_flag.load(Ordering::Relaxed) {
-        match stderr.read(&mut read_buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                line_buffer.extend_from_slice(&read_buffer[..n]);
-                // Send complete lines as they arrive
-                while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
-                    let line_bytes = line_buffer.drain(..=pos).collect::<Vec<_>>();
-                    if let Ok(line) = String::from_utf8(line_bytes) {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
-                        }
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    // Flush any remaining partial line
-    if !line_buffer.is_empty() {
-        if let Ok(line) = String::from_utf8(line_buffer) {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct MapState {
     lat: Option<f64>,
     lon: Option<f64>,
     zoom: u32,
     status: String,
-    texture: Option<TextureHandle>,
-    pending_texture_image: Option<ColorImage>,
     #[cfg(target_os = "macos")]
     corelocation_manager: Option<Retained<CLLocationManager>>,
     #[cfg(target_os = "macos")]
     corelocation_permission_requested: bool,
 }
+
 struct DetectedLocation {
     lat: f64,
     lon: f64,
@@ -139,7 +497,7 @@ enum CoreLocationDetectionOutcome {
     PendingFix(String),
 }
 
-struct ThirdEyeApp {
+struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
     config: AppConfig,
@@ -149,9 +507,9 @@ struct ThirdEyeApp {
     rov_status: UdpStatusState,
 }
 
-impl ThirdEyeApp {
+impl ThirdEyeState {
     fn new() -> Self {
-        let mut app = Self {
+        Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
             config: AppConfig::default(),
@@ -162,12 +520,10 @@ impl ThirdEyeApp {
             rov_info: String::new(),
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
-        };
-        app.initialize_location_on_startup();
-        app
+        }
     }
 
-    fn initialize_location_on_startup(&mut self) {
+    fn initialize_location_on_startup(&mut self) -> MapImageResult {
         match detect_location(&mut self.map) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
@@ -178,38 +534,39 @@ impl ThirdEyeApp {
                 );
                 self.load_map_tile_for_current_location(format!(
                     "{success_message} Map tile auto-loaded."
-                ));
+                ))
             }
             Err(err) => {
                 self.map.status = format!("Startup location detection failed: {err:#}");
+                MapImageResult::Keep
             }
         }
     }
 
-    fn load_map_tile_for_current_location(&mut self, success_status: String) {
+    fn load_map_tile_for_current_location(&mut self, success_status: String) -> MapImageResult {
         match (self.map.lat, self.map.lon) {
             (Some(lat), Some(lon)) => {
                 match fetch_map_tile(lat, lon, self.map.zoom, &self.config.osm_tile_user_agent) {
                     Ok(image) => {
-                        self.map.pending_texture_image = Some(image);
                         self.map.status = success_status;
+                        MapImageResult::Updated(image)
                     }
                     Err(err) => {
-                        self.map.texture = None;
-                        self.map.pending_texture_image = None;
                         self.map.status = format!(
                             "Failed to load OSM tile: {err:#}. Check OSM tile policy compliance (User-Agent, rate limits, caching) or use browser mode."
                         );
+                        MapImageResult::Clear
                     }
                 }
             }
             _ => {
                 self.map.status = "No location set. Use Detect location first.".to_owned();
+                MapImageResult::Keep
             }
         }
     }
 
-    fn auto_refresh_map_on_tab_enter(&mut self) {
+    fn auto_refresh_map_on_tab_enter(&mut self) -> MapImageResult {
         match detect_location(&mut self.map) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
@@ -217,380 +574,37 @@ impl ThirdEyeApp {
                 self.load_map_tile_for_current_location(format!(
                     "Auto-refreshed map on entering Device Map tab via {}: lat={:.6}, lon={:.6}.",
                     location.source, location.lat, location.lon
-                ));
+                ))
             }
             Err(err) => {
                 if self.map.lat.is_some() && self.map.lon.is_some() {
                     self.load_map_tile_for_current_location(format!(
                         "Auto-refreshed map using last known location (new detection unavailable: {err:#})."
-                    ));
+                    ))
                 } else {
                     self.map.status = format!("Auto-refresh on tab enter failed: {err:#}");
+                    MapImageResult::Keep
                 }
             }
-        }
-    }
-    fn materialize_pending_map_texture(&mut self, ctx: &egui::Context) {
-        if let Some(image) = self.map.pending_texture_image.take() {
-            self.map.texture =
-                Some(ctx.load_texture("osm_tile", image, egui::TextureOptions::LINEAR));
-        }
-    }
-
-    fn top_menu(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(
-                &mut self.active_screen,
-                Screen::Configuration,
-                "1) Configuration",
-            );
-            ui.selectable_value(&mut self.active_screen, Screen::Map, "2) Device Map");
-            ui.selectable_value(&mut self.active_screen, Screen::Stream, "3) Live Stream");
-        });
-        ui.separator();
-    }
-
-    fn show_configuration_screen(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RTSP + ROV Configuration");
-        ui.label("Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.");
-        ui.separator();
-
-        ui.label("RTSP URL:");
-        ui.text_edit_singleline(&mut self.config.rtsp_url);
-        if ui.button("Use default test RTSP URL").clicked() {
-            self.config.rtsp_url = DEFAULT_TEST_RTSP.to_owned();
-        }
-        if ui.button("Use default ROV RTSP URL").clicked() {
-            self.config.rtsp_url = DEFAULT_ROV_RTSP.to_owned();
-        }
-
-        ui.separator();
-        ui.label("ROV HTTP API Base URL:");
-        ui.text_edit_singleline(&mut self.config.rov_http_base);
-        if ui.button("Use default ROV HTTP API URL").clicked() {
-            self.config.rov_http_base = DEFAULT_ROV_HTTP_BASE.to_owned();
-            self.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
-        }
-        if ui
-            .button("Use host from ROV HTTP API URL for telemetry UDP bind")
-            .clicked()
-        {
-            if let Some(host) = parse_host_from_http_base(&self.config.rov_http_base) {
-                self.config.rov_status_udp_bind_host = host;
-            } else {
-                self.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
-            }
-        }
-        ui.separator();
-        ui.label("ROV telemetry UDP bind host:");
-        ui.text_edit_singleline(&mut self.config.rov_status_udp_bind_host);
-        ui.label("ROV telemetry UDP port:");
-        ui.add(egui::DragValue::new(&mut self.config.rov_status_udp_port).range(1..=u16::MAX));
-        if ui
-            .button("Use default ROV telemetry UDP port (8500)")
-            .clicked()
-        {
-            self.config.rov_status_udp_port = ROV_STATUS_UDP_PORT;
-        }
-        ui.separator();
-        ui.label("OpenStreetMap tile User-Agent:");
-        ui.text_edit_singleline(&mut self.config.osm_tile_user_agent);
-        if ui.button("Use default OSM tile User-Agent").clicked() {
-            self.config.osm_tile_user_agent = DEFAULT_OSM_TILE_USER_AGENT.to_owned();
-        }
-        ui.label("Include an app identifier and contact URL/email for OSM tile policy compliance.");
-
-        ui.separator();
-        ui.collapsing("ROV API notes", |ui| {
-            ui.label("• RTSP stream example: rtsp://admin:admin@192.168.1.88:8554/stream/0/0");
-            ui.label("• HTTP API server example: http://192.168.1.88:80");
-            ui.label("• Use HTTP status 2xx for success checks (avoid relying on error codes).");
-            ui.label("• Capture endpoint: POST /v1/capture");
-            ui.label("• Media list endpoint: GET /v1/medias");
-            ui.label("• Download endpoint: GET /v1/medias/{name}/download");
-        });
-
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("List medias (GET /v1/medias)").clicked() {
-                let client = RovApiClient::new(self.config.rov_http_base.clone());
-                match client.list_medias() {
-                    Ok(names) => {
-                        self.rov_info = if names.is_empty() {
-                            "No media names detected in response.".to_owned()
-                        } else {
-                            format!("Media files:\n{}", names.join("\n"))
-                        };
-                    }
-                    Err(err) => {
-                        self.rov_info = format!("List medias failed: {err:#}");
-                    }
-                }
-            }
-
-            if ui.button("Capture photo (POST /v1/capture)").clicked() {
-                let client = RovApiClient::new(self.config.rov_http_base.clone());
-                match client.capture() {
-                    Ok(()) => {
-                        self.rov_info = "Capture request sent successfully (HTTP 2xx).".to_owned();
-                    }
-                    Err(err) => {
-                        self.rov_info = format!("Capture failed: {err:#}");
-                    }
-                }
-            }
-        });
-
-        if !self.rov_info.is_empty() {
-            ui.separator();
-            ui.label(&self.rov_info);
-        }
-    }
-
-    fn show_map_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Device Location on OpenStreetMap");
-        ui.label(
-            "This desktop app uses native location when available, with IP geolocation fallback.",
-        );
-        ui.separator();
-
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Detect location").clicked() {
-                match detect_location(&mut self.map) {
-                    Ok(location) => {
-                        self.map.lat = Some(location.lat);
-                        self.map.lon = Some(location.lon);
-                        let success_message = format!(
-                            "Detected location via {}: lat={:.6}, lon={:.6}",
-                            location.source, location.lat, location.lon
-                        );
-                        self.load_map_tile_for_current_location(format!(
-                            "{success_message}. Map auto-refreshed."
-                        ));
-                    }
-                    Err(err) => {
-                        self.map.status = format!("Failed to detect location: {err:#}");
-                    }
-                }
-                ctx.request_repaint();
-            }
-
-            if ui.button("Load OSM map tile").clicked() {
-                self.load_map_tile_for_current_location(
-                    "Loaded OpenStreetMap tile for detected location.".to_owned(),
-                );
-            }
-            ui.separator();
-            ui.label(format!("Zoom: {}", self.map.zoom));
-            if ui.button("Zoom out").clicked() {
-                let next_zoom = self.map.zoom.saturating_sub(1).max(MIN_ZOOM);
-                if next_zoom != self.map.zoom {
-                    self.map.zoom = next_zoom;
-                    self.load_map_tile_for_current_location(format!(
-                        "Zoomed out to {} and refreshed map tile.",
-                        self.map.zoom
-                    ));
-                }
-            }
-            if ui.button("Zoom in").clicked() {
-                let next_zoom = self.map.zoom.saturating_add(1).min(MAX_ZOOM);
-                if next_zoom != self.map.zoom {
-                    self.map.zoom = next_zoom;
-                    self.load_map_tile_for_current_location(format!(
-                        "Zoomed in to {} and refreshed map tile.",
-                        self.map.zoom
-                    ));
-                }
-            }
-
-            if ui.button("Open interactive map in browser").clicked() {
-                match (self.map.lat, self.map.lon) {
-                    (Some(lat), Some(lon)) => {
-                        let url = format!(
-                            "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={}/{lat}/{lon}",
-                            self.map.zoom
-                        );
-                        match webbrowser::open(&url) {
-                            Ok(()) => {
-                                self.map.status = "Opened map in browser.".to_owned();
-                            }
-                            Err(err) => {
-                                self.map.status =
-                                    format!("Failed to open browser map: {err:#}");
-                            }
-                        }
-                    }
-                    _ => {
-                        self.map.status =
-                            "No location set. Use Detect location first.".to_owned();
-                    }
-                }
-            }
-        });
-
-        #[cfg(target_os = "macos")]
-        ui.monospace(corelocation_debug_status(&self.map));
-
-        if !self.map.status.is_empty() {
-            ui.separator();
-            ui.label(&self.map.status);
-        }
-
-        if let Some(texture) = &self.map.texture {
-            ui.separator();
-            let available = ui.available_size();
-            let size = egui::vec2(available.x.max(100.0), available.y.max(100.0));
-            ui.horizontal_centered(|ui| {
-                let response = ui.add(
-                    egui::Image::new((texture.id(), texture.size_vec2())).fit_to_exact_size(size),
-                );
-                let center = response.rect.center();
-                ui.painter()
-                    .circle_filled(center, 7.0, egui::Color32::from_rgb(220, 20, 60));
-                ui.painter().circle_stroke(
-                    center,
-                    13.0,
-                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                );
-            });
-        }
-    }
-
-    fn show_stream_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("RTSP Live Stream");
-        ui.label("Current stream URL (shared from configuration screen):");
-        ui.monospace(&self.config.rtsp_url);
-        ui.separator();
-        ui.label("Embedded stream is decoded with ffmpeg and rendered directly in this window.");
-        ui.label(format!(
-            "ROV telemetry bind target: {}:{}.",
-            self.config.rov_status_udp_bind_host, self.config.rov_status_udp_port
-        ));
-
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Start embedded stream").clicked() {
-                self.stream.stop();
-                self.stream.status = match self.stream.start(self.config.rtsp_url.clone()) {
-                    Ok(msg) => msg,
-                    Err(err) => format!("Failed to start stream: {err:#}"),
-                };
-            }
-
-            if ui.button("Stop stream").clicked() {
-                self.stream.stop();
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Start ROV status listener").clicked() {
-                self.rov_status.stop();
-                if let Err(err) = self.rov_status.start(
-                    &self.config.rov_status_udp_bind_host,
-                    self.config.rov_status_udp_port,
-                ) {
-                    self.rov_status
-                        .set_status_text(format!("Failed to start UDP listener: {err:#}"));
-                }
-            }
-
-            if ui.button("Stop ROV status listener").clicked() {
-                self.rov_status.stop();
-            }
-        });
-
-        ui.separator();
-        ui.label(&self.stream.status);
-        ui.label(format!("Frames received: {}", self.stream.frames_received));
-        ui.label(self.rov_status.status_text());
-        ui.label(format!(
-            "Status packets received: {}",
-            self.rov_status.packets_received()
-        ));
-
-        if self.stream.is_running() || self.rov_status.is_running() {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
-
-        if let Some(status) = self.rov_status.latest_status() {
-            ui.separator();
-            ui.heading("Latest ROV status");
-            ui.label(format!(
-                "Attitude [rad]: pitch={:.3}, roll={:.3}, yaw={:.3}",
-                status.pitch, status.roll, status.yaw
-            ));
-            ui.label(format!(
-                "Depth: {:.2} m | Temperature: {:.1} °C",
-                status.depth, status.temperature
-            ));
-            ui.label(format!(
-                "Coordinates: lat_degE7={}, lon_degE7={}",
-                status.lat, status.lon
-            ));
-            ui.label(format!(
-                "IMU gyro [0.1°/s]: x={}, y={}, z={}",
-                status.imu.gyro_x, status.imu.gyro_y, status.imu.gyro_z
-            ));
-            if status.batteries.is_empty() {
-                ui.label("Batteries: no battery data in payload.");
-            } else {
-                ui.collapsing("Batteries", |ui| {
-                    for battery in &status.batteries {
-                        ui.label(format!(
-                            "ID {}: {} mV, {} (10mA), {}%",
-                            battery.id, battery.voltage, battery.current, battery.remaining
-                        ));
-                    }
-                });
-            }
-        }
-
-        if let Some(texture) = &self.stream.texture {
-            ui.separator();
-            let available = ui.available_size();
-            let mut size = texture.size_vec2();
-            if size.x > available.x || size.y > available.y {
-                let scale = (available.x / size.x).min(available.y / size.y).max(0.1);
-                size *= scale;
-            }
-            ui.image((texture.id(), size));
-        } else {
-            ui.separator();
-            ui.label("No frames rendered yet.");
         }
     }
 }
 
-impl eframe::App for ThirdEyeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.stream.poll_events(ctx);
-        self.rov_status.poll_events();
-        self.materialize_pending_map_texture(ctx);
-        egui::TopBottomPanel::top("top_menu").show(ctx, |ui| {
-            self.top_menu(ui);
-        });
-        if self.active_screen == Screen::Map && self.last_screen != Screen::Map {
-            self.auto_refresh_map_on_tab_enter();
-            self.materialize_pending_map_texture(ctx);
-        }
-        self.last_screen = self.active_screen;
-
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_screen {
-            Screen::Configuration => self.show_configuration_screen(ui),
-            Screen::Map => self.show_map_screen(ui, ctx),
-            Screen::Stream => self.show_stream_screen(ui, ctx),
-        });
-    }
+#[derive(Clone)]
+struct RgbaFrame {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
-impl Drop for ThirdEyeApp {
-    fn drop(&mut self) {
-        self.stream.stop();
-        self.rov_status.stop();
-    }
+enum MapImageResult {
+    Keep,
+    Clear,
+    Updated(RgbaFrame),
 }
 
 #[derive(Default)]
 struct StreamState {
-    texture: Option<TextureHandle>,
     event_rx: Option<Receiver<StreamEvent>>,
     controller: Option<StreamController>,
     status: String,
@@ -607,7 +621,6 @@ impl StreamState {
         self.event_rx = Some(rx);
         self.controller = Some(controller);
         self.frames_received = 0;
-        self.texture = None;
         Ok(format!(
             "Embedded stream started via ffmpeg at {ffmpeg_label}."
         ))
@@ -621,29 +634,15 @@ impl StreamState {
         self.event_rx = None;
     }
 
-    fn is_running(&self) -> bool {
-        self.controller.is_some()
-    }
-
-    fn poll_events(&mut self, ctx: &egui::Context) {
+    fn poll_events(&mut self) -> Option<RgbaFrame> {
         let mut disconnected = false;
+        let mut latest_frame = None;
+
         if let Some(rx) = &self.event_rx {
             loop {
                 match rx.try_recv() {
                     Ok(StreamEvent::Frame(frame)) => {
-                        let image = ColorImage::from_rgba_unmultiplied(
-                            [frame.width, frame.height],
-                            &frame.rgba,
-                        );
-                        if let Some(texture) = &mut self.texture {
-                            texture.set(image, egui::TextureOptions::LINEAR);
-                        } else {
-                            self.texture = Some(ctx.load_texture(
-                                "embedded_rtsp",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ));
-                        }
+                        latest_frame = Some(frame);
                         self.frames_received = self.frames_received.saturating_add(1);
                     }
                     Ok(StreamEvent::Status(text)) => {
@@ -674,6 +673,8 @@ impl StreamState {
             self.controller = None;
             self.event_rx = None;
         }
+
+        latest_frame
     }
 }
 
@@ -700,17 +701,560 @@ impl Drop for StreamController {
     }
 }
 
-struct FrameMessage {
-    width: usize,
-    height: usize,
-    rgba: Vec<u8>,
-}
-
 enum StreamEvent {
-    Frame(FrameMessage),
+    Frame(RgbaFrame),
     Status(String),
     Error(String),
     Ended,
+}
+
+fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
+    ui.set_active_screen(state.active_screen.index());
+
+    ui.set_rtsp_url(state.config.rtsp_url.clone().into());
+    ui.set_rov_http_base(state.config.rov_http_base.clone().into());
+    ui.set_rov_status_udp_bind_host(state.config.rov_status_udp_bind_host.clone().into());
+    ui.set_rov_status_udp_port(state.config.rov_status_udp_port.clone().into());
+    ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
+    ui.set_rov_info(state.rov_info.clone().into());
+
+    ui.set_map_status(state.map.status.clone().into());
+    ui.set_zoom_text(state.map.zoom.to_string().into());
+    let lat_lon = match (state.map.lat, state.map.lon) {
+        (Some(lat), Some(lon)) => format!("{lat:.6}, {lon:.6}"),
+        _ => "n/a".to_owned(),
+    };
+    ui.set_lat_lon_text(lat_lon.into());
+    #[cfg(target_os = "macos")]
+    ui.set_corelocation_debug(corelocation_debug_status(&state.map).into());
+    #[cfg(not(target_os = "macos"))]
+    ui.set_corelocation_debug("CoreLocation debug: not available on this platform.".into());
+
+    apply_stream_and_rov_runtime_to_ui(ui, state);
+}
+
+fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
+    ui.set_stream_status(state.stream.status.clone().into());
+    ui.set_frames_received_text(state.stream.frames_received.to_string().into());
+
+    ui.set_rov_status_text(state.rov_status.status_text().to_owned().into());
+    ui.set_rov_packets_received_text(state.rov_status.packets_received().to_string().into());
+
+    if let Some(status) = state.rov_status.latest_status() {
+        ui.set_has_rov_status(true);
+        ui.set_rov_attitude_text(
+            format!(
+                "Attitude [rad]: pitch={:.3}, roll={:.3}, yaw={:.3}",
+                status.pitch, status.roll, status.yaw
+            )
+            .into(),
+        );
+        ui.set_rov_depth_temp_text(
+            format!(
+                "Depth: {:.2} m | Temperature: {:.1} °C",
+                status.depth, status.temperature
+            )
+            .into(),
+        );
+        ui.set_rov_coordinates_text(
+            format!(
+                "Coordinates: lat_degE7={}, lon_degE7={}",
+                status.lat, status.lon
+            )
+            .into(),
+        );
+        ui.set_rov_imu_text(
+            format!(
+                "IMU gyro [0.1°/s]: x={}, y={}, z={}",
+                status.imu.gyro_x, status.imu.gyro_y, status.imu.gyro_z
+            )
+            .into(),
+        );
+        let batteries_text = if status.batteries.is_empty() {
+            "Batteries: no battery data in payload.".to_owned()
+        } else {
+            let mut lines = vec!["Batteries:".to_owned()];
+            for battery in &status.batteries {
+                lines.push(format!(
+                    "ID {}: {} mV, {} (10mA), {}%",
+                    battery.id, battery.voltage, battery.current, battery.remaining
+                ));
+            }
+            lines.join("\n")
+        };
+        ui.set_rov_batteries_text(batteries_text.into());
+    } else {
+        ui.set_has_rov_status(false);
+        ui.set_rov_attitude_text("".into());
+        ui.set_rov_depth_temp_text("".into());
+        ui.set_rov_coordinates_text("".into());
+        ui.set_rov_imu_text("".into());
+        ui.set_rov_batteries_text("".into());
+    }
+}
+
+fn apply_map_image_result(ui: &AppWindow, map_image_result: MapImageResult) {
+    match map_image_result {
+        MapImageResult::Keep => {}
+        MapImageResult::Clear => {
+            ui.set_has_map_image(false);
+        }
+        MapImageResult::Updated(frame) => {
+            ui.set_map_image(rgba_frame_to_slint_image(&frame));
+            ui.set_has_map_image(true);
+        }
+    }
+}
+
+fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState) {
+    state.config.rtsp_url = ui.get_rtsp_url().to_string();
+    state.config.rov_http_base = ui.get_rov_http_base().to_string();
+    state.config.rov_status_udp_bind_host = ui.get_rov_status_udp_bind_host().to_string();
+    state.config.rov_status_udp_port = ui.get_rov_status_udp_port().to_string();
+    state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
+}
+
+fn rgba_frame_to_slint_image(frame: &RgbaFrame) -> Image {
+    let shared_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+        frame.rgba.as_slice(),
+        frame.width,
+        frame.height,
+    );
+    Image::from_rgba8(shared_buffer)
+}
+
+fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
+    let ui_weak = ui.as_weak();
+    let state_for_configuration = Rc::clone(&state);
+    ui.on_navigate_configuration(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_configuration.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        state.active_screen = Screen::Configuration;
+        state.last_screen = Screen::Configuration;
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_navigation = Rc::clone(&state);
+    ui.on_navigate_map(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_map_navigation.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        state.active_screen = Screen::Map;
+        let image_update = if state.last_screen != Screen::Map {
+            state.auto_refresh_map_on_tab_enter()
+        } else {
+            MapImageResult::Keep
+        };
+        state.last_screen = Screen::Map;
+        apply_state_to_ui(&ui, &state);
+        apply_map_image_result(&ui, image_update);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stream_navigation = Rc::clone(&state);
+    ui.on_navigate_stream(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stream_navigation.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        state.active_screen = Screen::Stream;
+        state.last_screen = Screen::Stream;
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_test_rtsp = Rc::clone(&state);
+    ui.on_use_default_test_rtsp(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_test_rtsp.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.rtsp_url = DEFAULT_TEST_RTSP.to_owned();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_rov_rtsp = Rc::clone(&state);
+    ui.on_use_default_rov_rtsp(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_rov_rtsp.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.rtsp_url = DEFAULT_ROV_RTSP.to_owned();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_rov_http = Rc::clone(&state);
+    ui.on_use_default_rov_http_base(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_rov_http.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.rov_http_base = DEFAULT_ROV_HTTP_BASE.to_owned();
+        state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_use_host_from_base = Rc::clone(&state);
+    ui.on_use_host_from_rov_http_base(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_use_host_from_base.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        if let Some(host) = parse_host_from_http_base(&state.config.rov_http_base) {
+            state.config.rov_status_udp_bind_host = host;
+        } else {
+            state.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_rov_udp_port = Rc::clone(&state);
+    ui.on_use_default_rov_status_udp_port(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_rov_udp_port.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.rov_status_udp_port = ROV_STATUS_UDP_PORT.to_string();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_osm_ua = Rc::clone(&state);
+    ui.on_use_default_osm_tile_user_agent(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_osm_ua.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.osm_tile_user_agent = DEFAULT_OSM_TILE_USER_AGENT.to_owned();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_list_medias = Rc::clone(&state);
+    ui.on_list_medias(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_list_medias.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let client = RovApiClient::new(state.config.rov_http_base.clone());
+        state.rov_info = match client.list_medias() {
+            Ok(names) => {
+                if names.is_empty() {
+                    "No media names detected in response.".to_owned()
+                } else {
+                    format!("Media files:\n{}", names.join("\n"))
+                }
+            }
+            Err(err) => format!("List medias failed: {err:#}"),
+        };
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_capture = Rc::clone(&state);
+    ui.on_capture_photo(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_capture.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let client = RovApiClient::new(state.config.rov_http_base.clone());
+        state.rov_info = match client.capture() {
+            Ok(()) => "Capture request sent successfully (HTTP 2xx).".to_owned(),
+            Err(err) => format!("Capture failed: {err:#}"),
+        };
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_detect_location = Rc::clone(&state);
+    ui.on_detect_location(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_detect_location.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let image_update = match detect_location(&mut state.map) {
+            Ok(location) => {
+                state.map.lat = Some(location.lat);
+                state.map.lon = Some(location.lon);
+                let success_message = format!(
+                    "Detected location via {}: lat={:.6}, lon={:.6}",
+                    location.source, location.lat, location.lon
+                );
+                state.load_map_tile_for_current_location(format!(
+                    "{success_message}. Map auto-refreshed."
+                ))
+            }
+            Err(err) => {
+                state.map.status = format!("Failed to detect location: {err:#}");
+                MapImageResult::Keep
+            }
+        };
+        apply_state_to_ui(&ui, &state);
+        apply_map_image_result(&ui, image_update);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_load_map_tile = Rc::clone(&state);
+    ui.on_load_map_tile(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_load_map_tile.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let image_update = state.load_map_tile_for_current_location(
+            "Loaded OpenStreetMap tile for detected location.".to_owned(),
+        );
+        apply_state_to_ui(&ui, &state);
+        apply_map_image_result(&ui, image_update);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_zoom_out = Rc::clone(&state);
+    ui.on_zoom_out(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_zoom_out.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let next_zoom = state.map.zoom.saturating_sub(1).max(MIN_ZOOM);
+        let image_update = if next_zoom != state.map.zoom {
+            state.map.zoom = next_zoom;
+            let zoom_value = state.map.zoom;
+            state.load_map_tile_for_current_location(format!(
+                "Zoomed out to {} and refreshed map tile.",
+                zoom_value
+            ))
+        } else {
+            MapImageResult::Keep
+        };
+        apply_state_to_ui(&ui, &state);
+        apply_map_image_result(&ui, image_update);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_zoom_in = Rc::clone(&state);
+    ui.on_zoom_in(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_zoom_in.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        let next_zoom = state.map.zoom.saturating_add(1).min(MAX_ZOOM);
+        let image_update = if next_zoom != state.map.zoom {
+            state.map.zoom = next_zoom;
+            let zoom_value = state.map.zoom;
+            state.load_map_tile_for_current_location(format!(
+                "Zoomed in to {} and refreshed map tile.",
+                zoom_value
+            ))
+        } else {
+            MapImageResult::Keep
+        };
+        apply_state_to_ui(&ui, &state);
+        apply_map_image_result(&ui, image_update);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_open_map = Rc::clone(&state);
+    ui.on_open_interactive_map(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_open_map.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.map.status = match (state.map.lat, state.map.lon) {
+            (Some(lat), Some(lon)) => {
+                let url = format!(
+                    "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={}/{lat}/{lon}",
+                    state.map.zoom
+                );
+                match webbrowser::open(&url) {
+                    Ok(()) => "Opened map in browser.".to_owned(),
+                    Err(err) => format!("Failed to open browser map: {err:#}"),
+                }
+            }
+            _ => "No location set. Use Detect location first.".to_owned(),
+        };
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_start_stream = Rc::clone(&state);
+    ui.on_start_stream(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_start_stream.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        state.stream.stop();
+        let rtsp_url = state.config.rtsp_url.clone();
+        state.stream.status = match state.stream.start(rtsp_url) {
+            Ok(msg) => msg,
+            Err(err) => format!("Failed to start stream: {err:#}"),
+        };
+        ui.set_has_stream_image(false);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stop_stream = Rc::clone(&state);
+    ui.on_stop_stream(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stop_stream.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.stream.stop();
+        ui.set_has_stream_image(false);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_start_rov_listener = Rc::clone(&state);
+    ui.on_start_rov_status_listener(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_start_rov_listener.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state);
+        state.rov_status.stop();
+        let port = match state.config.parse_rov_status_udp_port() {
+            Ok(port) => port,
+            Err(err) => {
+                state
+                    .rov_status
+                    .set_status_text(format!("Invalid telemetry UDP port: {err:#}"));
+                apply_state_to_ui(&ui, &state);
+                return;
+            }
+        };
+        let bind_host = state.config.rov_status_udp_bind_host.clone();
+        if let Err(err) = state.rov_status.start(&bind_host, port) {
+            state
+                .rov_status
+                .set_status_text(format!("Failed to start UDP listener: {err:#}"));
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stop_rov_listener = Rc::clone(&state);
+    ui.on_stop_rov_status_listener(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stop_rov_listener.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.rov_status.stop();
+        apply_state_to_ui(&ui, &state);
+    });
+}
+
+fn stream_stderr_loop(
+    mut stderr: ChildStderr,
+    stop_flag: Arc<AtomicBool>,
+    tx: mpsc::Sender<StreamEvent>,
+) {
+    let mut read_buffer = [0_u8; 8 * 1024];
+    let mut line_buffer = Vec::new();
+    while !stop_flag.load(Ordering::Relaxed) {
+        match stderr.read(&mut read_buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                line_buffer.extend_from_slice(&read_buffer[..n]);
+                while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
+                    let line_bytes = line_buffer.drain(..=pos).collect::<Vec<_>>();
+                    if let Ok(line) = String::from_utf8(line_bytes) {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !line_buffer.is_empty()
+        && let Ok(line) = String::from_utf8(line_buffer)
+    {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
+        }
+    }
 }
 
 fn spawn_stream_pipeline(
@@ -720,12 +1264,14 @@ fn spawn_stream_pipeline(
     let mut ffmpeg_child = Command::new(ffmpeg_bin)
         .arg("-hide_banner")
         .arg("-loglevel")
-        .arg("warning")
+        .arg("error")
         .arg("-rtsp_transport")
         .arg("tcp")
-        .arg("-analyzeduration")
-        .arg("10000000")
-        .arg("-probesize")
+        .arg("-fflags")
+        .arg("nobuffer")
+        .arg("-flags")
+        .arg("low_delay")
+        .arg("-rw_timeout")
         .arg("10000000")
         .arg("-i")
         .arg(rtsp_url)
@@ -828,14 +1374,14 @@ fn extract_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(frame)
 }
 
-fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<FrameMessage> {
+fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
     let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
         .context("invalid jpeg frame")?;
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok(FrameMessage {
-        width: width as usize,
-        height: height as usize,
+    Ok(RgbaFrame {
+        width,
+        height,
         rgba: rgba.into_raw(),
     })
 }
@@ -1120,7 +1666,7 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
     ))
 }
 
-fn fetch_map_tile(lat: f64, lon: f64, zoom: u32, user_agent: &str) -> Result<ColorImage> {
+fn fetch_map_tile(lat: f64, lon: f64, zoom: u32, user_agent: &str) -> Result<RgbaFrame> {
     let image_size_px = MAP_IMAGE_SIZE_PX;
     let lat_rad = lat.to_radians();
     let world_tiles = 1_i64 << zoom;
@@ -1202,20 +1748,133 @@ fn fetch_map_tile(lat: f64, lon: f64, zoom: u32, user_agent: &str) -> Result<Col
             }
         }
     }
+    draw_center_map_pin(&mut canvas);
 
-    let (w, h) = canvas.dimensions();
-    Ok(ColorImage::from_rgba_unmultiplied(
-        [w as usize, h as usize],
-        canvas.as_raw(),
-    ))
+    let (width, height) = canvas.dimensions();
+    Ok(RgbaFrame {
+        width,
+        height,
+        rgba: canvas.into_raw(),
+    })
+}
+
+fn draw_center_map_pin(canvas: &mut image::RgbaImage) {
+    let cx = (canvas.width() as i32) / 2;
+    let cy = (canvas.height() as i32) / 2 + 4;
+    draw_pin_shape(canvas, cx, cy - 20, 15, cy + 16, 8, MAP_PIN_OUTLINE_COLOR);
+    draw_pin_shape(canvas, cx, cy - 20, 13, cy + 14, 7, CUPERTINO_ACCENT_COLOR);
+    draw_filled_circle(canvas, cx, cy - 20, 5, MAP_PIN_CENTER_COLOR);
+}
+
+fn draw_pin_shape(
+    canvas: &mut image::RgbaImage,
+    center_x: i32,
+    head_center_y: i32,
+    head_radius: i32,
+    tip_y: i32,
+    tail_half_width: i32,
+    color: [u8; 4],
+) {
+    draw_filled_circle(canvas, center_x, head_center_y, head_radius, color);
+    let tail_start_y = head_center_y + head_radius - 3;
+    let tail_height = (tip_y - tail_start_y).max(1);
+    for y in tail_start_y..=tip_y {
+        let progress = (y - tail_start_y) as f32 / tail_height as f32;
+        let half_width = ((1.0 - progress) * tail_half_width as f32).ceil() as i32;
+        for x in (center_x - half_width)..=(center_x + half_width) {
+            draw_solid_pixel(canvas, x, y, color);
+        }
+    }
+}
+
+fn draw_filled_circle(
+    canvas: &mut image::RgbaImage,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: [u8; 4],
+) {
+    let radius_sq = radius * radius;
+    for y in (center_y - radius)..=(center_y + radius) {
+        for x in (center_x - radius)..=(center_x + radius) {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            if dx * dx + dy * dy <= radius_sq {
+                draw_solid_pixel(canvas, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_solid_pixel(canvas: &mut image::RgbaImage, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let Ok(x_u32) = u32::try_from(x) else {
+        return;
+    };
+    let Ok(y_u32) = u32::try_from(y) else {
+        return;
+    };
+    if x_u32 < canvas.width() && y_u32 < canvas.height() {
+        canvas.put_pixel(x_u32, y_u32, image::Rgba(color));
+    }
+}
+
+fn configure_slint_style() {
+    if std::env::var_os("SLINT_STYLE").is_none() {
+        // SAFETY: Called in main before UI initialization or background threads.
+        unsafe {
+            std::env::set_var("SLINT_STYLE", "cupertino");
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "Third Eye Client",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(ThirdEyeApp::new()))),
-    )
-    .map_err(|err| anyhow::anyhow!("failed to run GUI app: {err}"))
+    configure_slint_style();
+    let ui = AppWindow::new().context("failed to initialize Slint window")?;
+    let state = Rc::new(RefCell::new(ThirdEyeState::new()));
+
+    let startup_map_image = state.borrow_mut().initialize_location_on_startup();
+
+    {
+        let state = state.borrow();
+        apply_state_to_ui(&ui, &state);
+    }
+    apply_map_image_result(&ui, startup_map_image);
+
+    register_callbacks(&ui, Rc::clone(&state));
+
+    let ui_weak = ui.as_weak();
+    let poll_state = Rc::clone(&state);
+    let stream_poll_timer = slint::Timer::default();
+    stream_poll_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(16),
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut state = match poll_state.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if let Some(frame) = state.stream.poll_events() {
+                ui.set_stream_image(rgba_frame_to_slint_image(&frame));
+                ui.set_has_stream_image(true);
+            }
+            state.rov_status.poll_events();
+            apply_stream_and_rov_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    ui.run()
+        .map_err(|err| anyhow::anyhow!("failed to run GUI app: {err}"))?;
+
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.stream.stop();
+        state.rov_status.stop();
+    }
+
+    Ok(())
 }
