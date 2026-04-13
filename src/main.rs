@@ -91,7 +91,7 @@ export component AppWindow inherits Window {
     in-out property <string> rov_batteries_text;
 
     callback navigate_configuration();
-    callback navigate_map();
+    callback navigate_map(length, length);
     callback navigate_stream();
 
     callback use_default_test_rtsp();
@@ -163,7 +163,7 @@ export component AppWindow inherits Window {
                 }
                 Button {
                     text: "Device Map";
-                    clicked => { root.navigate_map(); }
+                    clicked => { root.navigate_map(content_panel.width, content_panel.height); }
                 }
                 Button {
                     text: "Live Stream";
@@ -175,7 +175,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        Rectangle {
+        content_panel := Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
             border-width: 1px;
@@ -341,22 +341,41 @@ export component AppWindow inherits Window {
                                 image-fit: fill;
                             }
                             if root.map_has_pin : Rectangle {
-                                width: 18px;
-                                height: 18px;
+                                width: 52px;
+                                height: 52px;
                                 x: root.map_pin_world_x - self.width / 2;
                                 y: root.map_pin_world_y - self.height / 2;
-                                border-width: 2px;
-                                border-color: #ffffff;
-                                border-radius: 9px;
-                                background: #0a84ff;
+                                background: #00000000;
 
                                 Rectangle {
-                                    width: 6px;
-                                    height: 6px;
+                                    width: 52px;
+                                    height: 52px;
+                                    border-radius: 26px;
+                                    background: #0a84ff15;
+                                }
+                                Rectangle {
+                                    width: 42px;
+                                    height: 42px;
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
-                                    border-radius: 3px;
-                                    background: #ffffff;
+                                    border-radius: 21px;
+                                    background: #0a84ff28;
+                                }
+                                Rectangle {
+                                    width: 34px;
+                                    height: 34px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 17px;
+                                    background: #0a84ff40;
+                                }
+                                Image {
+                                    width: 26px;
+                                    height: 26px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    source: @image-url("../assets/macbook_pin.png");
+                                    image-fit: contain;
                                 }
                             }
 
@@ -1535,7 +1554,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_map_navigation = Rc::clone(&state);
-    ui.on_navigate_map(move || {
+    ui.on_navigate_map(move |content_width, content_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
@@ -1545,11 +1564,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
         };
         pull_configuration_from_ui(&ui, &mut state);
         state.active_screen = Screen::Map;
-        if state.last_screen != Screen::Map {
-            state.auto_refresh_map_on_tab_enter();
-        } else {
-            state.request_visible_map_tiles();
-        }
+        // Estimate map canvas size from content panel (minus padding/header)
+        let est_width = (content_width as f64 - 30.0).max(320.0);
+        let est_height = (content_height as f64 - 180.0).max(320.0);
+        state.set_map_visible_size(est_width, est_height);
+        state.map_tiles.fallback_zoom = None;
+        state.auto_refresh_map_on_tab_enter();
         state.last_screen = Screen::Map;
         apply_state_to_ui(&ui, &state);
     });
