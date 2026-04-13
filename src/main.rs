@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::io::Read;
 use std::path::PathBuf;
@@ -18,31 +19,38 @@ use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationA
 use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::Value;
-use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
 
-const DEFAULT_TEST_RTSP: &str = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
+const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
 const DEFAULT_ZOOM: u32 = 14;
-const MIN_ZOOM: u32 = 1;
+const MIN_ZOOM: u32 = 3;
 const MAX_ZOOM: u32 = 19;
 const MAP_IMAGE_SIZE_PX: u32 = 768;
+const MAP_TILE_SIZE_PX: isize = 256;
+const MAP_TILE_CACHE_MARGIN: isize = 8;
 #[cfg(target_os = "macos")]
 const CORELOCATION_FIX_POLL_ATTEMPTS: u32 = 8;
 #[cfg(target_os = "macos")]
 const CORELOCATION_FIX_POLL_INTERVAL_MS: u64 = 250;
-const CUPERTINO_ACCENT_COLOR: [u8; 4] = [10, 132, 255, 255];
-const MAP_PIN_OUTLINE_COLOR: [u8; 4] = [255, 255, 255, 255];
-const MAP_PIN_CENTER_COLOR: [u8; 4] = [255, 255, 255, 255];
 const DEFAULT_OSM_TILE_USER_AGENT: &str =
     "third-eye-client/0.1 (desktop map viewer; set contact URL/email for production use)";
 
 slint::slint! {
 import { Button, HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
 
+export struct MapTile {
+    x: length,
+    y: length,
+    size: length,
+    tile: image,
+}
+
 export component AppWindow inherits Window {
     title: "Third Eye Client";
+    icon: @image-url("../assets/logo.png");
     width: 1520px;
     height: 960px;
 
@@ -59,8 +67,14 @@ export component AppWindow inherits Window {
     in-out property <string> corelocation_debug;
     in-out property <string> lat_lon_text;
     in-out property <string> zoom_text;
-    in-out property <image> map_image;
-    in-out property <bool> has_map_image: false;
+    in property <[MapTile]> map_tiles;
+    in-out property <length> map_pin_world_x: 0px;
+    in-out property <length> map_pin_world_y: 0px;
+    in-out property <bool> map_has_pin: false;
+    in-out property <length> map_viewport_x: 0px;
+    in-out property <length> map_viewport_y: 0px;
+    in-out property <length> map_viewport_width: 0px;
+    in-out property <length> map_viewport_height: 0px;
 
     in-out property <string> stream_status;
     in-out property <string> frames_received_text;
@@ -90,16 +104,25 @@ export component AppWindow inherits Window {
     callback list_medias();
     callback capture_photo();
 
-    callback detect_location();
-    callback load_map_tile();
-    callback zoom_out();
-    callback zoom_in();
+    callback detect_location(length, length);
+    callback load_map_tile(length, length);
     callback open_interactive_map();
+    callback map_flicked(length, length, length, length);
+    callback map_zoom_in(length, length, length, length);
+    callback map_zoom_out(length, length, length, length);
+    callback center_map_on_pin(length, length, length, length);
 
     callback start_stream();
     callback stop_stream();
     callback start_rov_status_listener();
     callback stop_rov_status_listener();
+
+    public function set_map_viewport(ox: length, oy: length, width: length, height: length) {
+        root.map_viewport_x = ox;
+        root.map_viewport_y = oy;
+        root.map_viewport_width = width;
+        root.map_viewport_height = height;
+    }
     HorizontalBox {
         padding: 10px;
         spacing: 10px;
@@ -114,6 +137,12 @@ export component AppWindow inherits Window {
             VerticalBox {
                 padding: 12px;
                 spacing: 8px;
+                Image {
+                    width: 90px;
+                    height: 70px;
+                    source: @image-url("../assets/logo.png");
+                    image-fit: contain;
+                }
 
                 Text {
                     text: "Third Eye Client";
@@ -271,22 +300,12 @@ export component AppWindow inherits Window {
                         Button {
                             horizontal-stretch: 1;
                             text: "Detect location";
-                            clicked => { root.detect_location(); }
+                            clicked => { root.detect_location(map_canvas.width, map_canvas.height); }
                         }
                         Button {
                             horizontal-stretch: 1;
-                            text: "Load OSM map tile";
-                            clicked => { root.load_map_tile(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Zoom out";
-                            clicked => { root.zoom_out(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Zoom in";
-                            clicked => { root.zoom_in(); }
+                            text: "Refresh visible tiles";
+                            clicked => { root.load_map_tile(map_canvas.width, map_canvas.height); }
                         }
                         Button {
                             horizontal-stretch: 1;
@@ -300,26 +319,223 @@ export component AppWindow inherits Window {
                     Text { text: root.corelocation_debug; wrap: word-wrap; }
                     Text { text: root.map_status; wrap: word-wrap; }
 
-                    Rectangle {
+                    map_canvas := Rectangle {
                         border-width: 1px;
                         border-color: #5f5f5f;
                         min-height: 320px;
                         horizontal-stretch: 1;
                         vertical-stretch: 1;
                         clip: true;
+                        map_fli := Flickable {
+                            viewport-x <=> root.map_viewport_x;
+                            viewport-y <=> root.map_viewport_y;
+                            viewport-width: root.map_viewport_width;
+                            viewport-height: root.map_viewport_height;
 
-                        if root.has_map_image : Image {
-                            width: parent.width;
-                            height: parent.height;
-                            source: root.map_image;
-                            image-fit: contain;
+                            for tile in root.map_tiles : Image {
+                                x: tile.x;
+                                y: tile.y;
+                                width: tile.size;
+                                height: tile.size;
+                                source: tile.tile;
+                                image-fit: fill;
+                            }
+                            if root.map_has_pin : Rectangle {
+                                width: 18px;
+                                height: 18px;
+                                x: root.map_pin_world_x - self.width / 2;
+                                y: root.map_pin_world_y - self.height / 2;
+                                border-width: 2px;
+                                border-color: #ffffff;
+                                border-radius: 9px;
+                                background: #0a84ff;
+
+                                Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: #ffffff;
+                                }
+                            }
+
+
+                            flicked => {
+                                root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                            }
                         }
-                        if !root.has_map_image : Text {
-                            text: "No map image loaded yet.";
+
+
+                        if root.map_tiles.length == 0 : Text {
+                            text: "Loading map tiles...";
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
+
+                        // Map control button group – top-right
+                        Rectangle {
+                            width: 46px;
+                            height: 132px;
+                            x: parent.width - self.width - 10px;
+                            y: 10px;
+                            border-radius: 12px;
+                            background: #0d1a2acc;
+                            border-width: 1px;
+                            border-color: #0a84ff44;
+
+                            // Zoom-in button
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                x: 3px;
+                                y: 3px;
+                                border-radius: 10px;
+                                background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                                animate background { duration: 120ms; }
+                                Text {
+                                    text: "+";
+                                    font-size: 26px;
+                                    color: #ffffff;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                btn-plus-ta := TouchArea {
+                                    clicked => {
+                                        root.map_zoom_in(
+                                            map_fli.viewport-x,
+                                            map_fli.viewport-y,
+                                            map_canvas.width,
+                                            map_canvas.height
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Separator
+                            Rectangle {
+                                width: 28px;
+                                height: 1px;
+                                x: (parent.width - self.width) / 2;
+                                y: 44px;
+                                background: #0a84ff33;
+                            }
+
+                            // Zoom-out button
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                x: 3px;
+                                y: 46px;
+                                border-radius: 10px;
+                                background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                                animate background { duration: 120ms; }
+                                Text {
+                                    text: "−";
+                                    font-size: 26px;
+                                    color: #ffffff;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                btn-minus-ta := TouchArea {
+                                    clicked => {
+                                        root.map_zoom_out(
+                                            map_fli.viewport-x,
+                                            map_fli.viewport-y,
+                                            map_canvas.width,
+                                            map_canvas.height
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Separator
+                            Rectangle {
+                                width: 28px;
+                                height: 1px;
+                                x: (parent.width - self.width) / 2;
+                                y: 87px;
+                                background: #0a84ff33;
+                            }
+
+                            // Center / locate button
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                x: 3px;
+                                y: 89px;
+                                border-radius: 10px;
+                                background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                                animate background { duration: 120ms; }
+
+                                // Crosshair ring
+                                Rectangle {
+                                    width: 16px;
+                                    height: 16px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-width: 2px;
+                                    border-color: #ffffff;
+                                    border-radius: 8px;
+                                    background: #00000000;
+                                }
+                                // Center dot
+                                Rectangle {
+                                    width: 4px;
+                                    height: 4px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 2px;
+                                    background: #ffffff;
+                                }
+                                // Crosshair top
+                                Rectangle {
+                                    width: 2px;
+                                    height: 5px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - 16px) / 2 - self.height;
+                                    background: #ffffff;
+                                }
+                                // Crosshair bottom
+                                Rectangle {
+                                    width: 2px;
+                                    height: 5px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height + 16px) / 2;
+                                    background: #ffffff;
+                                }
+                                // Crosshair left
+                                Rectangle {
+                                    width: 5px;
+                                    height: 2px;
+                                    x: (parent.width - 16px) / 2 - self.width;
+                                    y: (parent.height - self.height) / 2;
+                                    background: #ffffff;
+                                }
+                                // Crosshair right
+                                Rectangle {
+                                    width: 5px;
+                                    height: 2px;
+                                    x: (parent.width + 16px) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    background: #ffffff;
+                                }
+
+                                btn-center-ta := TouchArea {
+                                    clicked => {
+                                        root.center_map_on_pin(
+                                            map_fli.viewport-x,
+                                            map_fli.viewport-y,
+                                            map_canvas.width,
+                                            map_canvas.height
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                     }
+
                 }
 
                 if root.active_screen == 2 : VerticalBox {
@@ -497,11 +713,347 @@ enum CoreLocationDetectionOutcome {
     PendingFix(String),
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+struct TileCoordinate {
+    z: u32,
+    x: isize,
+    y: isize,
+}
+
+struct TileLoadResult {
+    coord: TileCoordinate,
+    frame: Option<RgbaFrame>,
+    error: Option<String>,
+}
+
+struct MapTilesState {
+    client: Client,
+    loaded_tiles: BTreeMap<TileCoordinate, Image>,
+    loading_tiles: BTreeSet<TileCoordinate>,
+    tile_cache: BTreeMap<TileCoordinate, Image>,
+    fallback_zoom: Option<u32>,
+    tile_result_tx: mpsc::Sender<TileLoadResult>,
+    tile_result_rx: Receiver<TileLoadResult>,
+    visible_width: f64,
+    visible_height: f64,
+    offset_x: f64,
+    offset_y: f64,
+}
+
+impl MapTilesState {
+    fn new() -> Self {
+        let (tile_result_tx, tile_result_rx) = mpsc::channel();
+        Self {
+            client: Client::new(),
+            loaded_tiles: BTreeMap::new(),
+            loading_tiles: BTreeSet::new(),
+            tile_cache: BTreeMap::new(),
+            fallback_zoom: None,
+            tile_result_tx,
+            tile_result_rx,
+            visible_width: MAP_IMAGE_SIZE_PX as f64,
+            visible_height: MAP_IMAGE_SIZE_PX as f64,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    }
+
+    fn world_size_px(zoom_level: u32) -> f64 {
+        (MAP_TILE_SIZE_PX as f64) * f64::exp2(zoom_level as f64)
+    }
+
+    fn clamp_offset_to_world(&mut self, zoom_level: u32) {
+        let world_size = Self::world_size_px(zoom_level);
+        let min_x = (world_size - self.visible_width).min(0.0);
+        let max_x = (world_size - self.visible_width).max(0.0);
+        let min_y = (world_size - self.visible_height).min(0.0);
+        let max_y = (world_size - self.visible_height).max(0.0);
+        self.offset_x = self.offset_x.clamp(min_x, max_x);
+        self.offset_y = self.offset_y.clamp(min_y, max_y);
+    }
+
+    fn update_visible_size(&mut self, width: f64, height: f64, zoom_level: u32) -> bool {
+        let width = width.clamp(32.0, 4096.0);
+        let height = height.clamp(32.0, 4096.0);
+        let changed = (self.visible_width - width).abs() > f64::EPSILON
+            || (self.visible_height - height).abs() > f64::EPSILON;
+        if changed {
+            self.visible_width = width;
+            self.visible_height = height;
+            self.clamp_offset_to_world(zoom_level);
+        }
+        changed
+    }
+
+    fn center_on_location(&mut self, lat: f64, lon: f64, zoom_level: u32) {
+        let world_size = Self::world_size_px(zoom_level);
+        let x_world = ((lon + 180.0) / 360.0) * world_size;
+        let lat_rad = lat.to_radians();
+        let y_world =
+            ((1.0 - (lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / PI) / 2.0) * world_size;
+        self.offset_x = x_world - (self.visible_width / 2.0);
+        self.offset_y = y_world - (self.visible_height / 2.0);
+        self.clamp_offset_to_world(zoom_level);
+    }
+
+    fn set_offset_from_viewport(&mut self, viewport_x: f64, viewport_y: f64, zoom_level: u32) {
+        self.offset_x = -viewport_x;
+        self.offset_y = -viewport_y;
+        self.clamp_offset_to_world(zoom_level);
+    }
+
+    fn set_zoom_level(&mut self, current_zoom: u32, new_zoom: u32, focus_x: f64, focus_y: f64) {
+        if current_zoom == new_zoom {
+            return;
+        }
+        let old_world_size = Self::world_size_px(current_zoom);
+        let new_world_size = Self::world_size_px(new_zoom);
+        let focus_x = focus_x.clamp(0.0, self.visible_width);
+        let focus_y = focus_y.clamp(0.0, self.visible_height);
+        let old_anchor_x = (self.offset_x + focus_x).clamp(0.0, old_world_size);
+        let old_anchor_y = (self.offset_y + focus_y).clamp(0.0, old_world_size);
+        let anchor_u = if old_world_size > 0.0 {
+            old_anchor_x / old_world_size
+        } else {
+            0.5
+        };
+        let anchor_v = if old_world_size > 0.0 {
+            old_anchor_y / old_world_size
+        } else {
+            0.5
+        };
+        self.offset_x = anchor_u * new_world_size - focus_x;
+        self.offset_y = anchor_v * new_world_size - focus_y;
+        self.loading_tiles.clear();
+        self.fallback_zoom = Some(current_zoom);
+        self.clamp_offset_to_world(new_zoom);
+    }
+
+    fn zoom_focus_center(&self) -> (f64, f64) {
+        (self.visible_width / 2.0, self.visible_height / 2.0)
+    }
+
+    fn center_lat_lon(&self, zoom_level: u32) -> Option<(f64, f64)> {
+        let world_size = Self::world_size_px(zoom_level);
+        if world_size <= 0.0 {
+            return None;
+        }
+        let x_world = (self.offset_x + (self.visible_width / 2.0)).clamp(0.0, world_size);
+        let y_world = (self.offset_y + (self.visible_height / 2.0)).clamp(0.0, world_size);
+        let lon = (x_world / world_size) * 360.0 - 180.0;
+        let n = PI - (2.0 * PI * y_world / world_size);
+        let lat = n.sinh().atan().to_degrees();
+        Some((lat, lon))
+    }
+
+    fn viewport_for_slint(&self, zoom_level: u32) -> (f32, f32, f32, f32) {
+        let world_size = Self::world_size_px(zoom_level) as f32;
+        (
+            -(self.offset_x as f32),
+            -(self.offset_y as f32),
+            world_size,
+            world_size,
+        )
+    }
+    fn visible_tile_bounds(
+        &self,
+        current_zoom: u32,
+        target_zoom: u32,
+    ) -> (isize, isize, isize, isize, isize) {
+        let scale = f64::exp2((target_zoom as i32 - current_zoom as i32) as f64);
+        let world_tiles = 1_isize << target_zoom;
+        let offset_x = self.offset_x * scale;
+        let offset_y = self.offset_y * scale;
+        let visible_width = self.visible_width * scale;
+        let visible_height = self.visible_height * scale;
+        let min_x = (offset_x / MAP_TILE_SIZE_PX as f64).floor() as isize;
+        let min_y = (offset_y / MAP_TILE_SIZE_PX as f64).floor() as isize;
+        let max_x = (((offset_x + visible_width) / MAP_TILE_SIZE_PX as f64).ceil() as isize + 1)
+            .min(world_tiles);
+        let max_y = (((offset_y + visible_height) / MAP_TILE_SIZE_PX as f64).ceil() as isize + 1)
+            .min(world_tiles);
+        (min_x, min_y, max_x, max_y, world_tiles)
+    }
+
+    fn coord_in_bounds(
+        coord: &TileCoordinate,
+        min_x: isize,
+        min_y: isize,
+        max_x: isize,
+        max_y: isize,
+        world_tiles: isize,
+    ) -> bool {
+        coord.x >= 0
+            && coord.x < world_tiles
+            && coord.y >= 0
+            && coord.y < world_tiles
+            && coord.x > min_x - MAP_TILE_CACHE_MARGIN
+            && coord.x < max_x + MAP_TILE_CACHE_MARGIN
+            && coord.y > min_y - MAP_TILE_CACHE_MARGIN
+            && coord.y < max_y + MAP_TILE_CACHE_MARGIN
+    }
+
+    fn request_visible_tiles(&mut self, zoom_level: u32, user_agent: &str) {
+        const MAX_TILE_CACHE: usize = 500;
+        if self.tile_cache.len() > MAX_TILE_CACHE {
+            self.tile_cache.retain(|c, _| {
+                (c.z as i32 - zoom_level as i32).unsigned_abs() <= 2
+            });
+        }
+        let (min_x, min_y, max_x, max_y, world_tiles) =
+            self.visible_tile_bounds(zoom_level, zoom_level);
+        let fallback_bounds = self.fallback_zoom.map(|fallback_zoom| {
+            let (fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles) =
+                self.visible_tile_bounds(zoom_level, fallback_zoom);
+            (fallback_zoom, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)
+        });
+        let keep = |coord: &TileCoordinate| {
+            if coord.z == zoom_level {
+                Self::coord_in_bounds(coord, min_x, min_y, max_x, max_y, world_tiles)
+            } else if let Some((fallback_zoom, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)) =
+                fallback_bounds
+            {
+                coord.z == fallback_zoom
+                    && Self::coord_in_bounds(coord, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)
+            } else {
+                false
+            }
+        };
+        self.loaded_tiles.retain(|coord, _| keep(coord));
+        self.loading_tiles.retain(keep);
+
+        let user_agent = if user_agent.trim().is_empty() {
+            DEFAULT_OSM_TILE_USER_AGENT.to_owned()
+        } else {
+            user_agent.trim().to_owned()
+        };
+        for x in min_x..max_x {
+            for y in min_y..max_y {
+                if !(0..world_tiles).contains(&x) || !(0..world_tiles).contains(&y) {
+                    continue;
+                }
+                let coord = TileCoordinate {
+                    z: zoom_level,
+                    x,
+                    y,
+                };
+                if self.loaded_tiles.contains_key(&coord) || self.loading_tiles.contains(&coord) {
+                    continue;
+                }
+                if let Some(cached) = self.tile_cache.get(&coord).cloned() {
+                    self.loaded_tiles.insert(coord, cached);
+                    continue;
+                }
+                self.loading_tiles.insert(coord);
+                let client = self.client.clone();
+                let tx = self.tile_result_tx.clone();
+                let user_agent = user_agent.clone();
+                let tx_for_thread = tx.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!("osm-tile-{}-{}-{}", coord.z, coord.x, coord.y))
+                    .spawn(move || {
+                        let outcome = load_osm_tile(client, coord, &user_agent)
+                            .map(|frame| TileLoadResult {
+                                coord,
+                                frame: Some(frame),
+                                error: None,
+                            })
+                            .unwrap_or_else(|err| TileLoadResult {
+                                coord,
+                                frame: None,
+                                error: Some(format!(
+                                    "Failed loading tile z{} x{} y{}: {err:#}",
+                                    coord.z, coord.x, coord.y
+                                )),
+                            });
+                        let _ = tx_for_thread.send(outcome);
+                    });
+                if let Err(err) = spawn_result {
+                    self.loading_tiles.remove(&coord);
+                    let _ = tx.send(TileLoadResult {
+                        coord,
+                        frame: None,
+                        error: Some(format!(
+                            "Failed spawning tile loader z{} x{} y{}: {err}",
+                            coord.z, coord.x, coord.y
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
+    fn poll_loaded_tiles(&mut self, zoom_level: u32) -> (bool, Option<String>) {
+        let mut changed = false;
+        let mut latest_error = None;
+        while let Ok(result) = self.tile_result_rx.try_recv() {
+            self.loading_tiles.remove(&result.coord);
+            if let Some(frame) = result.frame {
+                let image = rgba_frame_to_slint_image(&frame);
+                self.tile_cache.insert(result.coord, image.clone());
+                if result.coord.z == zoom_level {
+                    self.loaded_tiles.insert(result.coord, image);
+                    changed = true;
+                }
+            } else if result.coord.z == zoom_level
+                && let Some(error) = result.error
+            {
+                latest_error = Some(error);
+            }
+        }
+        if let Some(fallback_zoom) = self.fallback_zoom {
+            if fallback_zoom == zoom_level {
+                self.fallback_zoom = None;
+            } else {
+                let current_loaded_count = self
+                    .loaded_tiles
+                    .keys()
+                    .filter(|coord| coord.z == zoom_level)
+                    .count();
+                if current_loaded_count >= 8 {
+                    self.fallback_zoom = None;
+                    self.loaded_tiles.retain(|coord, _| coord.z == zoom_level);
+                    self.loading_tiles.retain(|coord| coord.z == zoom_level);
+                }
+            }
+        }
+        (changed, latest_error)
+    }
+
+    fn tile_model(&self, render_zoom: u32) -> ModelRc<MapTile> {
+        let model = VecModel::from(
+            self.loaded_tiles
+                .iter()
+                .filter(|(coord, _)| {
+                    coord.z == render_zoom
+                        || self
+                            .fallback_zoom
+                            .is_some_and(|fallback_zoom| coord.z == fallback_zoom)
+                })
+                .map(|(coord, image)| MapTile {
+                    x: (coord.x as f32)
+                        * (MAP_TILE_SIZE_PX as f32)
+                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
+                    y: (coord.y as f32)
+                        * (MAP_TILE_SIZE_PX as f32)
+                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
+                    size: (MAP_TILE_SIZE_PX as f32)
+                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
+                    tile: image.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        ModelRc::new(model)
+    }
+}
+
 struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
+    suppress_next_map_flick: bool,
     config: AppConfig,
     map: MapState,
+    map_tiles: MapTilesState,
     rov_info: String,
     stream: StreamState,
     rov_status: UdpStatusState,
@@ -512,18 +1064,20 @@ impl ThirdEyeState {
         Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
+            suppress_next_map_flick: false,
             config: AppConfig::default(),
             map: MapState {
                 zoom: DEFAULT_ZOOM,
                 ..MapState::default()
             },
+            map_tiles: MapTilesState::new(),
             rov_info: String::new(),
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
         }
     }
 
-    fn initialize_location_on_startup(&mut self) -> MapImageResult {
+    fn initialize_location_on_startup(&mut self) {
         match detect_location(&mut self.map) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
@@ -533,40 +1087,29 @@ impl ThirdEyeState {
                     location.source, location.lat, location.lon
                 );
                 self.load_map_tile_for_current_location(format!(
-                    "{success_message} Map tile auto-loaded."
-                ))
+                    "{success_message} Map tiles are loading."
+                ));
             }
             Err(err) => {
                 self.map.status = format!("Startup location detection failed: {err:#}");
-                MapImageResult::Keep
             }
         }
     }
 
-    fn load_map_tile_for_current_location(&mut self, success_status: String) -> MapImageResult {
+    fn load_map_tile_for_current_location(&mut self, success_status: String) {
         match (self.map.lat, self.map.lon) {
             (Some(lat), Some(lon)) => {
-                match fetch_map_tile(lat, lon, self.map.zoom, &self.config.osm_tile_user_agent) {
-                    Ok(image) => {
-                        self.map.status = success_status;
-                        MapImageResult::Updated(image)
-                    }
-                    Err(err) => {
-                        self.map.status = format!(
-                            "Failed to load OSM tile: {err:#}. Check OSM tile policy compliance (User-Agent, rate limits, caching) or use browser mode."
-                        );
-                        MapImageResult::Clear
-                    }
-                }
+                self.map_tiles.center_on_location(lat, lon, self.map.zoom);
+                self.request_visible_map_tiles();
+                self.map.status = success_status;
             }
             _ => {
                 self.map.status = "No location set. Use Detect location first.".to_owned();
-                MapImageResult::Keep
             }
         }
     }
 
-    fn auto_refresh_map_on_tab_enter(&mut self) -> MapImageResult {
+    fn auto_refresh_map_on_tab_enter(&mut self) {
         match detect_location(&mut self.map) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
@@ -574,19 +1117,57 @@ impl ThirdEyeState {
                 self.load_map_tile_for_current_location(format!(
                     "Auto-refreshed map on entering Device Map tab via {}: lat={:.6}, lon={:.6}.",
                     location.source, location.lat, location.lon
-                ))
+                ));
             }
             Err(err) => {
                 if self.map.lat.is_some() && self.map.lon.is_some() {
                     self.load_map_tile_for_current_location(format!(
                         "Auto-refreshed map using last known location (new detection unavailable: {err:#})."
-                    ))
+                    ));
                 } else {
                     self.map.status = format!("Auto-refresh on tab enter failed: {err:#}");
-                    MapImageResult::Keep
                 }
             }
         }
+    }
+
+    fn request_visible_map_tiles(&mut self) {
+        self.map_tiles
+            .request_visible_tiles(self.map.zoom, &self.config.osm_tile_user_agent);
+    }
+
+    fn set_map_visible_size(&mut self, width: f64, height: f64) {
+        let center_before_resize = self
+            .map_tiles
+            .center_lat_lon(self.map.zoom)
+            .or(self.map.lat.zip(self.map.lon));
+        if self
+            .map_tiles
+            .update_visible_size(width, height, self.map.zoom)
+        {
+            if let Some((lat, lon)) = center_before_resize {
+                self.map_tiles.center_on_location(lat, lon, self.map.zoom);
+            }
+            self.request_visible_map_tiles();
+        }
+    }
+
+    fn set_map_viewport(&mut self, viewport_x: f64, viewport_y: f64) {
+        self.map_tiles
+            .set_offset_from_viewport(viewport_x, viewport_y, self.map.zoom);
+        self.request_visible_map_tiles();
+    }
+
+    fn set_map_zoom(&mut self, next_zoom: u32, focus_x: f64, focus_y: f64) {
+        if next_zoom == self.map.zoom {
+            return;
+        }
+        let bounded_zoom = next_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let current_zoom = self.map.zoom;
+        self.map_tiles
+            .set_zoom_level(current_zoom, bounded_zoom, focus_x, focus_y);
+        self.map.zoom = bounded_zoom;
+        self.request_visible_map_tiles();
     }
 }
 
@@ -595,12 +1176,6 @@ struct RgbaFrame {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
-}
-
-enum MapImageResult {
-    Keep,
-    Clear,
-    Updated(RgbaFrame),
 }
 
 #[derive(Default)]
@@ -717,7 +1292,11 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_rov_status_udp_port(state.config.rov_status_udp_port.clone().into());
     ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
+    apply_map_runtime_to_ui(ui, state);
+    apply_stream_and_rov_runtime_to_ui(ui, state);
+}
 
+fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_map_status(state.map.status.clone().into());
     ui.set_zoom_text(state.map.zoom.to_string().into());
     let lat_lon = match (state.map.lat, state.map.lon) {
@@ -725,14 +1304,38 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
         _ => "n/a".to_owned(),
     };
     ui.set_lat_lon_text(lat_lon.into());
+    match (state.map.lat, state.map.lon) {
+        (Some(lat), Some(lon)) => {
+            let (pin_x, pin_y) = lat_lon_to_world_px(lat, lon, state.map.zoom);
+            ui.set_map_pin_world_x(pin_x);
+            ui.set_map_pin_world_y(pin_y);
+            ui.set_map_has_pin(true);
+        }
+        _ => {
+            ui.set_map_has_pin(false);
+        }
+    }
     #[cfg(target_os = "macos")]
     ui.set_corelocation_debug(corelocation_debug_status(&state.map).into());
     #[cfg(not(target_os = "macos"))]
     ui.set_corelocation_debug("CoreLocation debug: not available on this platform.".into());
-
+    let (viewport_x, viewport_y, viewport_width, viewport_height) =
+        state.map_tiles.viewport_for_slint(state.map.zoom);
+    ui.invoke_set_map_viewport(viewport_x, viewport_y, viewport_width, viewport_height);
+    ui.set_map_tiles(state.map_tiles.tile_model(state.map.zoom));
     apply_stream_and_rov_runtime_to_ui(ui, state);
 }
 
+fn lat_lon_to_world_px(lat: f64, lon: f64, zoom_level: u32) -> (f32, f32) {
+    let world_size = MapTilesState::world_size_px(zoom_level);
+    let lon = lon.clamp(-180.0, 180.0);
+    let lat = lat.clamp(-85.051_128_78, 85.051_128_78);
+    let x_world = (((lon + 180.0) / 360.0) * world_size).clamp(0.0, world_size);
+    let lat_rad = lat.to_radians();
+    let y_world = ((1.0 - (lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / PI) / 2.0) * world_size;
+    let y_world = y_world.clamp(0.0, world_size);
+    (x_world as f32, y_world as f32)
+}
 fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_stream_status(state.stream.status.clone().into());
     ui.set_frames_received_text(state.stream.frames_received.to_string().into());
@@ -793,19 +1396,6 @@ fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     }
 }
 
-fn apply_map_image_result(ui: &AppWindow, map_image_result: MapImageResult) {
-    match map_image_result {
-        MapImageResult::Keep => {}
-        MapImageResult::Clear => {
-            ui.set_has_map_image(false);
-        }
-        MapImageResult::Updated(frame) => {
-            ui.set_map_image(rgba_frame_to_slint_image(&frame));
-            ui.set_has_map_image(true);
-        }
-    }
-}
-
 fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState) {
     state.config.rtsp_url = ui.get_rtsp_url().to_string();
     state.config.rov_http_base = ui.get_rov_http_base().to_string();
@@ -841,6 +1431,109 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_map_flicked = Rc::clone(&state);
+    ui.on_map_flicked(
+        move |viewport_x, viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut state = match state_for_map_flicked.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if state.suppress_next_map_flick {
+                state.suppress_next_map_flick = false;
+                return;
+            }
+            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_zoom_in = Rc::clone(&state);
+    ui.on_map_zoom_in(
+        move |viewport_x, viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut state = match state_for_map_zoom_in.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            let next_zoom = state.map.zoom.saturating_add(1).min(MAX_ZOOM);
+            let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
+            state.set_map_zoom(next_zoom, focus_x, focus_y);
+            state.suppress_next_map_flick = true;
+            state.map.status = format!("Zoomed in to {}.", state.map.zoom);
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_zoom_out = Rc::clone(&state);
+    ui.on_map_zoom_out(
+        move |viewport_x, viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut state = match state_for_map_zoom_out.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            let next_zoom = state.map.zoom.saturating_sub(1).max(MIN_ZOOM);
+            let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
+            state.set_map_zoom(next_zoom, focus_x, focus_y);
+            state.suppress_next_map_flick = true;
+            state.map.status = format!("Zoomed out to {}.", state.map.zoom);
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_center_on_pin = Rc::clone(&state);
+    ui.on_center_map_on_pin(
+        move |_viewport_x, _viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut state = match state_for_map_center_on_pin.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+            state.map_tiles.fallback_zoom = None;
+            match detect_location(&mut state.map) {
+                Ok(location) => {
+                    state.map.lat = Some(location.lat);
+                    state.map.lon = Some(location.lon);
+                    state.load_map_tile_for_current_location(format!(
+                        "Centered on device location via {}: lat={:.6}, lon={:.6}.",
+                        location.source, location.lat, location.lon
+                    ));
+                }
+                Err(err) => {
+                    if state.map.lat.is_some() && state.map.lon.is_some() {
+                        state.load_map_tile_for_current_location(format!(
+                            "Centered on last known location (detection unavailable: {err:#})."
+                        ));
+                    } else {
+                        state.map.status =
+                            format!("Cannot center: no location available ({err:#}).");
+                    }
+                }
+            }
+            state.suppress_next_map_flick = true;
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let ui_weak = ui.as_weak();
     let state_for_map_navigation = Rc::clone(&state);
     ui.on_navigate_map(move || {
         let Some(ui) = ui_weak.upgrade() else {
@@ -852,14 +1545,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
         };
         pull_configuration_from_ui(&ui, &mut state);
         state.active_screen = Screen::Map;
-        let image_update = if state.last_screen != Screen::Map {
-            state.auto_refresh_map_on_tab_enter()
+        if state.last_screen != Screen::Map {
+            state.auto_refresh_map_on_tab_enter();
         } else {
-            MapImageResult::Keep
-        };
+            state.request_visible_map_tiles();
+        }
         state.last_screen = Screen::Map;
         apply_state_to_ui(&ui, &state);
-        apply_map_image_result(&ui, image_update);
     });
 
     let ui_weak = ui.as_weak();
@@ -1014,7 +1706,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_detect_location = Rc::clone(&state);
-    ui.on_detect_location(move || {
+    ui.on_detect_location(move |viewport_width, viewport_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
@@ -1023,7 +1715,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state);
-        let image_update = match detect_location(&mut state.map) {
+        state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+        match detect_location(&mut state.map) {
             Ok(location) => {
                 state.map.lat = Some(location.lat);
                 state.map.lon = Some(location.lon);
@@ -1033,20 +1726,18 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
                 );
                 state.load_map_tile_for_current_location(format!(
                     "{success_message}. Map auto-refreshed."
-                ))
+                ));
             }
             Err(err) => {
                 state.map.status = format!("Failed to detect location: {err:#}");
-                MapImageResult::Keep
             }
-        };
+        }
         apply_state_to_ui(&ui, &state);
-        apply_map_image_result(&ui, image_update);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_load_map_tile = Rc::clone(&state);
-    ui.on_load_map_tile(move || {
+    ui.on_load_map_tile(move |viewport_width, viewport_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
@@ -1055,63 +1746,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state);
-        let image_update = state.load_map_tile_for_current_location(
+        state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+        state.load_map_tile_for_current_location(
             "Loaded OpenStreetMap tile for detected location.".to_owned(),
         );
         apply_state_to_ui(&ui, &state);
-        apply_map_image_result(&ui, image_update);
-    });
-
-    let ui_weak = ui.as_weak();
-    let state_for_zoom_out = Rc::clone(&state);
-    ui.on_zoom_out(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let mut state = match state_for_zoom_out.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        pull_configuration_from_ui(&ui, &mut state);
-        let next_zoom = state.map.zoom.saturating_sub(1).max(MIN_ZOOM);
-        let image_update = if next_zoom != state.map.zoom {
-            state.map.zoom = next_zoom;
-            let zoom_value = state.map.zoom;
-            state.load_map_tile_for_current_location(format!(
-                "Zoomed out to {} and refreshed map tile.",
-                zoom_value
-            ))
-        } else {
-            MapImageResult::Keep
-        };
-        apply_state_to_ui(&ui, &state);
-        apply_map_image_result(&ui, image_update);
-    });
-
-    let ui_weak = ui.as_weak();
-    let state_for_zoom_in = Rc::clone(&state);
-    ui.on_zoom_in(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let mut state = match state_for_zoom_in.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        pull_configuration_from_ui(&ui, &mut state);
-        let next_zoom = state.map.zoom.saturating_add(1).min(MAX_ZOOM);
-        let image_update = if next_zoom != state.map.zoom {
-            state.map.zoom = next_zoom;
-            let zoom_value = state.map.zoom;
-            state.load_map_tile_for_current_location(format!(
-                "Zoomed in to {} and refreshed map tile.",
-                zoom_value
-            ))
-        } else {
-            MapImageResult::Keep
-        };
-        apply_state_to_ui(&ui, &state);
-        apply_map_image_result(&ui, image_update);
     });
 
     let ui_weak = ui.as_weak();
@@ -1271,8 +1910,6 @@ fn spawn_stream_pipeline(
         .arg("nobuffer")
         .arg("-flags")
         .arg("low_delay")
-        .arg("-rw_timeout")
-        .arg("10000000")
         .arg("-i")
         .arg(rtsp_url)
         .arg("-vf")
@@ -1666,159 +2303,31 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
     ))
 }
 
-fn fetch_map_tile(lat: f64, lon: f64, zoom: u32, user_agent: &str) -> Result<RgbaFrame> {
-    let image_size_px = MAP_IMAGE_SIZE_PX;
-    let lat_rad = lat.to_radians();
-    let world_tiles = 1_i64 << zoom;
-    let world_px = world_tiles * 256;
-    let x_world = (((lon + 180.0) / 360.0) * world_px as f64).round() as i64;
-    let y_world = (((1.0 - (lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / PI) / 2.0)
-        * world_px as f64)
-        .round() as i64;
-    let half = (image_size_px as i64) / 2;
-    let start_world_x = x_world - half;
-    let start_world_y = y_world - half;
-    let end_world_x = start_world_x + image_size_px as i64;
-    let end_world_y = start_world_y + image_size_px as i64;
-    let min_tile_x = start_world_x.div_euclid(256);
-    let max_tile_x = (end_world_x - 1).div_euclid(256);
-    let min_tile_y = start_world_y.div_euclid(256);
-    let max_tile_y = (end_world_y - 1).div_euclid(256);
-    let user_agent = if user_agent.trim().is_empty() {
-        DEFAULT_OSM_TILE_USER_AGENT
-    } else {
-        user_agent.trim()
-    };
-    let client = Client::builder()
-        .user_agent(user_agent)
-        .build()
-        .context("failed to build tile HTTP client")?;
-
-    let mut canvas = image::RgbaImage::new(image_size_px, image_size_px);
-
-    for tile_y in min_tile_y..=max_tile_y {
-        if tile_y < 0 || tile_y >= world_tiles {
-            continue;
-        }
-        for tile_x in min_tile_x..=max_tile_x {
-            let wrapped_tile_x = tile_x.rem_euclid(world_tiles) as u32;
-            let tile_y_u32 = tile_y as u32;
-            let url =
-                format!("https://tile.openstreetmap.org/{zoom}/{wrapped_tile_x}/{tile_y_u32}.png");
-            let response = client
-                .get(&url)
-                .send()
-                .with_context(|| format!("tile request failed for {url}"))?
-                .error_for_status()
-                .with_context(|| {
-                    format!(
-                        "OpenStreetMap tile request was rejected for {url} (HTTP error status returned)"
-                    )
-                })?;
-            let bytes = response.bytes().context("tile bytes missing")?;
-            let tile = image::load_from_memory(&bytes)
-                .context("tile decoding failed")?
-                .to_rgba8();
-
-            let tile_start_x = tile_x * 256;
-            let tile_start_y = tile_y * 256;
-            let tile_end_x = tile_start_x + 256;
-            let tile_end_y = tile_start_y + 256;
-
-            let overlap_start_x = start_world_x.max(tile_start_x);
-            let overlap_start_y = start_world_y.max(tile_start_y);
-            let overlap_end_x = end_world_x.min(tile_end_x);
-            let overlap_end_y = end_world_y.min(tile_end_y);
-            if overlap_start_x >= overlap_end_x || overlap_start_y >= overlap_end_y {
-                continue;
-            }
-
-            let copy_w = (overlap_end_x - overlap_start_x) as u32;
-            let copy_h = (overlap_end_y - overlap_start_y) as u32;
-            let src_x = (overlap_start_x - tile_start_x) as u32;
-            let src_y = (overlap_start_y - tile_start_y) as u32;
-            let dst_x = (overlap_start_x - start_world_x) as u32;
-            let dst_y = (overlap_start_y - start_world_y) as u32;
-
-            for dy in 0..copy_h {
-                for dx in 0..copy_w {
-                    let pixel = tile.get_pixel(src_x + dx, src_y + dy);
-                    canvas.put_pixel(dst_x + dx, dst_y + dy, *pixel);
-                }
-            }
-        }
-    }
-    draw_center_map_pin(&mut canvas);
-
-    let (width, height) = canvas.dimensions();
+fn load_osm_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Result<RgbaFrame> {
+    let tile_base_url =
+        std::env::var("OSM_TILES_URL").unwrap_or_else(|_| "https://tile.openstreetmap.org".into());
+    let url = format!("{tile_base_url}/{}/{}/{}.png", coord.z, coord.x, coord.y);
+    let response = client
+        .get(&url)
+        .header("User-Agent", user_agent)
+        .send()
+        .with_context(|| format!("tile request failed for {url}"))?
+        .error_for_status()
+        .with_context(|| format!("tile request returned non-success for {url}"))?;
+    let bytes = response.bytes().context("tile bytes missing")?;
+    let image = image::load_from_memory(&bytes)
+        .with_context(|| format!("tile decode failed for {url}"))?
+        .resize_exact(
+            MAP_TILE_SIZE_PX as u32,
+            MAP_TILE_SIZE_PX as u32,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgba8();
     Ok(RgbaFrame {
-        width,
-        height,
-        rgba: canvas.into_raw(),
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
     })
-}
-
-fn draw_center_map_pin(canvas: &mut image::RgbaImage) {
-    let cx = (canvas.width() as i32) / 2;
-    let cy = (canvas.height() as i32) / 2 + 4;
-    draw_pin_shape(canvas, cx, cy - 20, 15, cy + 16, 8, MAP_PIN_OUTLINE_COLOR);
-    draw_pin_shape(canvas, cx, cy - 20, 13, cy + 14, 7, CUPERTINO_ACCENT_COLOR);
-    draw_filled_circle(canvas, cx, cy - 20, 5, MAP_PIN_CENTER_COLOR);
-}
-
-fn draw_pin_shape(
-    canvas: &mut image::RgbaImage,
-    center_x: i32,
-    head_center_y: i32,
-    head_radius: i32,
-    tip_y: i32,
-    tail_half_width: i32,
-    color: [u8; 4],
-) {
-    draw_filled_circle(canvas, center_x, head_center_y, head_radius, color);
-    let tail_start_y = head_center_y + head_radius - 3;
-    let tail_height = (tip_y - tail_start_y).max(1);
-    for y in tail_start_y..=tip_y {
-        let progress = (y - tail_start_y) as f32 / tail_height as f32;
-        let half_width = ((1.0 - progress) * tail_half_width as f32).ceil() as i32;
-        for x in (center_x - half_width)..=(center_x + half_width) {
-            draw_solid_pixel(canvas, x, y, color);
-        }
-    }
-}
-
-fn draw_filled_circle(
-    canvas: &mut image::RgbaImage,
-    center_x: i32,
-    center_y: i32,
-    radius: i32,
-    color: [u8; 4],
-) {
-    let radius_sq = radius * radius;
-    for y in (center_y - radius)..=(center_y + radius) {
-        for x in (center_x - radius)..=(center_x + radius) {
-            let dx = x - center_x;
-            let dy = y - center_y;
-            if dx * dx + dy * dy <= radius_sq {
-                draw_solid_pixel(canvas, x, y, color);
-            }
-        }
-    }
-}
-
-fn draw_solid_pixel(canvas: &mut image::RgbaImage, x: i32, y: i32, color: [u8; 4]) {
-    if x < 0 || y < 0 {
-        return;
-    }
-    let Ok(x_u32) = u32::try_from(x) else {
-        return;
-    };
-    let Ok(y_u32) = u32::try_from(y) else {
-        return;
-    };
-    if x_u32 < canvas.width() && y_u32 < canvas.height() {
-        canvas.put_pixel(x_u32, y_u32, image::Rgba(color));
-    }
 }
 
 fn configure_slint_style() {
@@ -1834,14 +2343,12 @@ fn main() -> Result<()> {
     configure_slint_style();
     let ui = AppWindow::new().context("failed to initialize Slint window")?;
     let state = Rc::new(RefCell::new(ThirdEyeState::new()));
-
-    let startup_map_image = state.borrow_mut().initialize_location_on_startup();
+    state.borrow_mut().initialize_location_on_startup();
 
     {
         let state = state.borrow();
         apply_state_to_ui(&ui, &state);
     }
-    apply_map_image_result(&ui, startup_map_image);
 
     register_callbacks(&ui, Rc::clone(&state));
 
@@ -1862,6 +2369,16 @@ fn main() -> Result<()> {
             if let Some(frame) = state.stream.poll_events() {
                 ui.set_stream_image(rgba_frame_to_slint_image(&frame));
                 ui.set_has_stream_image(true);
+            }
+            let current_zoom = state.map.zoom;
+            let (map_changed, map_error) = state.map_tiles.poll_loaded_tiles(current_zoom);
+            let has_map_error = map_error.is_some();
+            if let Some(error) = map_error {
+                state.map.status = error;
+                state.request_visible_map_tiles();
+            }
+            if map_changed || has_map_error {
+                apply_map_runtime_to_ui(&ui, &state);
             }
             state.rov_status.poll_events();
             apply_stream_and_rov_runtime_to_ui(&ui, &state);

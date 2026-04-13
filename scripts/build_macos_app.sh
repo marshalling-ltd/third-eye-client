@@ -31,6 +31,7 @@ CONTENTS_DIR="$APP_BUNDLE_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 INFO_PLIST_SOURCE="$ROOT_DIR/macos/Info.plist"
+APP_ICON_SOURCE="$ROOT_DIR/assets/logo.icns"
 APP_BINARY_SOURCE="$TARGET_DIR/$EXECUTABLE_NAME"
 APP_BINARY_DEST="$MACOS_DIR/$EXECUTABLE_NAME"
 INSTALL_DEST_DIR="/Applications"
@@ -55,6 +56,11 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$APP_BINARY_SOURCE" "$APP_BINARY_DEST"
 chmod 755 "$APP_BINARY_DEST"
 cp "$INFO_PLIST_SOURCE" "$CONTENTS_DIR/Info.plist"
+if [[ -f "$APP_ICON_SOURCE" ]]; then
+  cp "$APP_ICON_SOURCE" "$RESOURCES_DIR/logo.icns"
+else
+  echo "Warning: app icon file not found at $APP_ICON_SOURCE; bundle icon will fall back to default."
+fi
 
 if [[ -z "$FFMPEG_SOURCE" ]]; then
   if [[ -x "$ROOT_DIR/bin/ffmpeg" ]]; then

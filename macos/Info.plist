@@ -12,6 +12,8 @@
 	<string>APPL</string>
 	<key>CFBundleName</key>
 	<string>Third Eye Client</string>
+	<key>CFBundleIconFile</key>
+	<string>logo.icns</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
