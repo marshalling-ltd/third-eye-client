@@ -1,6 +1,6 @@
+mod map;
+
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::f64::consts::PI;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -13,33 +13,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
-use objc2::rc::Retained;
-#[cfg(target_os = "macos")]
-use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationAccuracyBest};
+use map::corelocation_debug_status;
+use map::{
+    MapState, MapTilesState, RgbaFrame, ViewportAnimation, compute_scale_bar, detect_location,
+    ease_out_cubic, lat_lon_to_world_px, rgba_frame_to_slint_image, DEFAULT_OSM_TILE_USER_AGENT,
+    DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM,
+};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::Value;
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
-const DEFAULT_ZOOM: u32 = 14;
-const MIN_ZOOM: u32 = 3;
-const MAX_ZOOM: u32 = 19;
-const MAP_IMAGE_SIZE_PX: u32 = 768;
-const MAP_TILE_SIZE_PX: isize = 256;
-const MAP_TILE_CACHE_MARGIN: isize = 8;
-#[cfg(target_os = "macos")]
-const CORELOCATION_FIX_POLL_ATTEMPTS: u32 = 8;
-#[cfg(target_os = "macos")]
-const CORELOCATION_FIX_POLL_INTERVAL_MS: u64 = 250;
-const DEFAULT_OSM_TILE_USER_AGENT: &str =
-    "third-eye-client/0.1 (desktop map viewer; set contact URL/email for production use)";
 
 slint::slint! {
-import { Button, HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
+import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct MapTile {
     x: length,
@@ -51,8 +42,10 @@ export struct MapTile {
 export component AppWindow inherits Window {
     title: "Third Eye Client";
     icon: @image-url("../assets/logo.png");
-    width: 1520px;
-    height: 960px;
+    preferred-width: 1520px;
+    preferred-height: 960px;
+    min-width: 680px;
+    min-height: 400px;
 
     in-out property <int> active_screen: 0;
 
@@ -75,6 +68,9 @@ export component AppWindow inherits Window {
     in-out property <length> map_viewport_y: 0px;
     in-out property <length> map_viewport_width: 0px;
     in-out property <length> map_viewport_height: 0px;
+    in-out property <string> pin_lat_lon_short;
+    in property <length> scale_bar_width: 100px;
+    in-out property <string> scale_bar_text;
 
     in-out property <string> stream_status;
     in-out property <string> frames_received_text;
@@ -182,9 +178,12 @@ export component AppWindow inherits Window {
             border-color: #3f4148;
             background: #202328;
 
-            VerticalBox {
-                padding: 14px;
-                spacing: 10px;
+            if root.active_screen != 1 : ScrollView {
+                viewport-width: self.visible-width;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 10px;
 
                 if root.active_screen == 0 : VerticalBox {
                     spacing: 8px;
@@ -284,279 +283,6 @@ export component AppWindow inherits Window {
                     Text { text: root.rov_info; wrap: word-wrap; }
                 }
 
-                if root.active_screen == 1 : VerticalBox {
-                    spacing: 8px;
-                    Text {
-                        text: "Device Location on OpenStreetMap";
-                        font-size: 24px;
-                    }
-                    Text {
-                        text: "This desktop app uses native location when available, with IP geolocation fallback.";
-                        wrap: word-wrap;
-                    }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Detect location";
-                            clicked => { root.detect_location(map_canvas.width, map_canvas.height); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Refresh visible tiles";
-                            clicked => { root.load_map_tile(map_canvas.width, map_canvas.height); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Open interactive map in browser";
-                            clicked => { root.open_interactive_map(); }
-                        }
-                    }
-
-                    Text { text: "Coordinates: " + root.lat_lon_text; }
-                    Text { text: "Zoom: " + root.zoom_text; }
-                    Text { text: root.corelocation_debug; wrap: word-wrap; }
-                    Text { text: root.map_status; wrap: word-wrap; }
-
-                    map_canvas := Rectangle {
-                        border-width: 1px;
-                        border-color: #5f5f5f;
-                        min-height: 320px;
-                        horizontal-stretch: 1;
-                        vertical-stretch: 1;
-                        clip: true;
-                        map_fli := Flickable {
-                            viewport-x <=> root.map_viewport_x;
-                            viewport-y <=> root.map_viewport_y;
-                            viewport-width: root.map_viewport_width;
-                            viewport-height: root.map_viewport_height;
-
-                            for tile in root.map_tiles : Image {
-                                x: tile.x;
-                                y: tile.y;
-                                width: tile.size;
-                                height: tile.size;
-                                source: tile.tile;
-                                image-fit: fill;
-                            }
-                            if root.map_has_pin : Rectangle {
-                                width: 52px;
-                                height: 52px;
-                                x: root.map_pin_world_x - self.width / 2;
-                                y: root.map_pin_world_y - self.height / 2;
-                                background: #00000000;
-
-                                Rectangle {
-                                    width: 52px;
-                                    height: 52px;
-                                    border-radius: 26px;
-                                    background: #0a84ff15;
-                                }
-                                Rectangle {
-                                    width: 42px;
-                                    height: 42px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 21px;
-                                    background: #0a84ff28;
-                                }
-                                Rectangle {
-                                    width: 34px;
-                                    height: 34px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 17px;
-                                    background: #0a84ff40;
-                                }
-                                Image {
-                                    width: 26px;
-                                    height: 26px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    source: @image-url("../assets/macbook_pin.png");
-                                    image-fit: contain;
-                                }
-                            }
-
-
-                            flicked => {
-                                root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
-                            }
-                        }
-
-
-                        if root.map_tiles.length == 0 : Text {
-                            text: "Loading map tiles...";
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-
-                        // Map control button group – top-right
-                        Rectangle {
-                            width: 46px;
-                            height: 132px;
-                            x: parent.width - self.width - 10px;
-                            y: 10px;
-                            border-radius: 12px;
-                            background: #0d1a2acc;
-                            border-width: 1px;
-                            border-color: #0a84ff44;
-
-                            // Zoom-in button
-                            Rectangle {
-                                width: 40px;
-                                height: 40px;
-                                x: 3px;
-                                y: 3px;
-                                border-radius: 10px;
-                                background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                                animate background { duration: 120ms; }
-                                Text {
-                                    text: "+";
-                                    font-size: 26px;
-                                    color: #ffffff;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                btn-plus-ta := TouchArea {
-                                    clicked => {
-                                        root.map_zoom_in(
-                                            map_fli.viewport-x,
-                                            map_fli.viewport-y,
-                                            map_canvas.width,
-                                            map_canvas.height
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Separator
-                            Rectangle {
-                                width: 28px;
-                                height: 1px;
-                                x: (parent.width - self.width) / 2;
-                                y: 44px;
-                                background: #0a84ff33;
-                            }
-
-                            // Zoom-out button
-                            Rectangle {
-                                width: 40px;
-                                height: 40px;
-                                x: 3px;
-                                y: 46px;
-                                border-radius: 10px;
-                                background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                                animate background { duration: 120ms; }
-                                Text {
-                                    text: "−";
-                                    font-size: 26px;
-                                    color: #ffffff;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                btn-minus-ta := TouchArea {
-                                    clicked => {
-                                        root.map_zoom_out(
-                                            map_fli.viewport-x,
-                                            map_fli.viewport-y,
-                                            map_canvas.width,
-                                            map_canvas.height
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Separator
-                            Rectangle {
-                                width: 28px;
-                                height: 1px;
-                                x: (parent.width - self.width) / 2;
-                                y: 87px;
-                                background: #0a84ff33;
-                            }
-
-                            // Center / locate button
-                            Rectangle {
-                                width: 40px;
-                                height: 40px;
-                                x: 3px;
-                                y: 89px;
-                                border-radius: 10px;
-                                background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                                animate background { duration: 120ms; }
-
-                                // Crosshair ring
-                                Rectangle {
-                                    width: 16px;
-                                    height: 16px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    border-width: 2px;
-                                    border-color: #ffffff;
-                                    border-radius: 8px;
-                                    background: #00000000;
-                                }
-                                // Center dot
-                                Rectangle {
-                                    width: 4px;
-                                    height: 4px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 2px;
-                                    background: #ffffff;
-                                }
-                                // Crosshair top
-                                Rectangle {
-                                    width: 2px;
-                                    height: 5px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - 16px) / 2 - self.height;
-                                    background: #ffffff;
-                                }
-                                // Crosshair bottom
-                                Rectangle {
-                                    width: 2px;
-                                    height: 5px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height + 16px) / 2;
-                                    background: #ffffff;
-                                }
-                                // Crosshair left
-                                Rectangle {
-                                    width: 5px;
-                                    height: 2px;
-                                    x: (parent.width - 16px) / 2 - self.width;
-                                    y: (parent.height - self.height) / 2;
-                                    background: #ffffff;
-                                }
-                                // Crosshair right
-                                Rectangle {
-                                    width: 5px;
-                                    height: 2px;
-                                    x: (parent.width + 16px) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    background: #ffffff;
-                                }
-
-                                btn-center-ta := TouchArea {
-                                    clicked => {
-                                        root.center_map_on_pin(
-                                            map_fli.viewport-x,
-                                            map_fli.viewport-y,
-                                            map_canvas.width,
-                                            map_canvas.height
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                    }
-
-                }
-
                 if root.active_screen == 2 : VerticalBox {
                     spacing: 8px;
                     Text {
@@ -636,6 +362,311 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+
+            // Full-bleed map screen
+            if root.active_screen == 1 : Rectangle {
+                width: parent.width;
+                height: parent.height;
+
+                map_canvas := Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    clip: true;
+                    background: #ffffff;
+
+                    map_fli := Flickable {
+                        viewport-x <=> root.map_viewport_x;
+                        viewport-y <=> root.map_viewport_y;
+                        viewport-width: root.map_viewport_width;
+                        viewport-height: root.map_viewport_height;
+
+                        for tile in root.map_tiles : Image {
+                            x: tile.x;
+                            y: tile.y;
+                            width: tile.size;
+                            height: tile.size;
+                            source: tile.tile;
+                            image-fit: fill;
+                        }
+
+                        if root.map_has_pin : Rectangle {
+                            width: 52px;
+                            height: 52px;
+                            x: root.map_pin_world_x - self.width / 2;
+                            y: root.map_pin_world_y - self.height / 2;
+                            background: #00000000;
+
+                            Rectangle {
+                                width: 52px;
+                                height: 52px;
+                                border-radius: 26px;
+                                background: #0a84ff15;
+                            }
+                            Rectangle {
+                                width: 42px;
+                                height: 42px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 21px;
+                                background: #0a84ff28;
+                            }
+                            Rectangle {
+                                width: 34px;
+                                height: 34px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 17px;
+                                background: #0a84ff40;
+                            }
+                            Image {
+                                width: 26px;
+                                height: 26px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                source: @image-url("../assets/macbook_pin.png");
+                                image-fit: contain;
+                            }
+                        }
+
+                        // Coordinate label below pin
+                        if root.map_has_pin : Rectangle {
+                            width: 140px;
+                            height: 20px;
+                            x: root.map_pin_world_x - self.width / 2;
+                            y: root.map_pin_world_y + 30px;
+                            border-radius: 4px;
+                            background: #000000aa;
+
+                            Text {
+                                text: root.pin_lat_lon_short;
+                                font-size: 11px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        flicked => {
+                            root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                        }
+                    }
+
+                    if root.map_tiles.length == 0 : Text {
+                        text: "Loading map tiles...";
+                        color: #888888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Map control button group – top-right
+                    Rectangle {
+                        width: 46px;
+                        height: 132px;
+                        x: parent.width - self.width - 10px;
+                        y: 10px;
+                        border-radius: 12px;
+                        background: #0d1a2acc;
+                        border-width: 1px;
+                        border-color: #0a84ff44;
+
+                        // Zoom-in button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 3px;
+                            border-radius: 10px;
+                            background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+                            Text {
+                                text: "+";
+                                font-size: 26px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            btn-plus-ta := TouchArea {
+                                clicked => {
+                                    root.map_zoom_in(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            width: 28px;
+                            height: 1px;
+                            x: (parent.width - self.width) / 2;
+                            y: 44px;
+                            background: #0a84ff33;
+                        }
+
+                        // Zoom-out button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 46px;
+                            border-radius: 10px;
+                            background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+                            Text {
+                                text: "\u{2212}";
+                                font-size: 26px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            btn-minus-ta := TouchArea {
+                                clicked => {
+                                    root.map_zoom_out(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            width: 28px;
+                            height: 1px;
+                            x: (parent.width - self.width) / 2;
+                            y: 87px;
+                            background: #0a84ff33;
+                        }
+
+                        // Center / locate button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 89px;
+                            border-radius: 10px;
+                            background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+
+                            // Crosshair ring
+                            Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-width: 2px;
+                                border-color: #ffffff;
+                                border-radius: 8px;
+                                background: #00000000;
+                            }
+                            // Center dot
+                            Rectangle {
+                                width: 4px;
+                                height: 4px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 2px;
+                                background: #ffffff;
+                            }
+                            // Crosshair top
+                            Rectangle {
+                                width: 2px;
+                                height: 5px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - 16px) / 2 - self.height;
+                                background: #ffffff;
+                            }
+                            // Crosshair bottom
+                            Rectangle {
+                                width: 2px;
+                                height: 5px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height + 16px) / 2;
+                                background: #ffffff;
+                            }
+                            // Crosshair left
+                            Rectangle {
+                                width: 5px;
+                                height: 2px;
+                                x: (parent.width - 16px) / 2 - self.width;
+                                y: (parent.height - self.height) / 2;
+                                background: #ffffff;
+                            }
+                            // Crosshair right
+                            Rectangle {
+                                width: 5px;
+                                height: 2px;
+                                x: (parent.width + 16px) / 2;
+                                y: (parent.height - self.height) / 2;
+                                background: #ffffff;
+                            }
+
+                            btn-center-ta := TouchArea {
+                                clicked => {
+                                    root.center_map_on_pin(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Scale legend \u{2013} bottom-right
+                    Rectangle {
+                        width: 148px;
+                        height: 30px;
+                        x: parent.width - self.width - 14px;
+                        y: parent.height - self.height - 14px;
+                        border-radius: 6px;
+                        background: #0d1a2acc;
+                        border-width: 1px;
+                        border-color: #0a84ff44;
+
+                        // Scale line
+                        Rectangle {
+                            width: root.scale_bar_width;
+                            height: 2px;
+                            x: (parent.width - self.width) / 2;
+                            y: 6px;
+                            background: #ffffff;
+                        }
+                        // Left tick
+                        Rectangle {
+                            width: 2px;
+                            height: 8px;
+                            x: (parent.width - root.scale_bar_width) / 2;
+                            y: 3px;
+                            background: #ffffff;
+                        }
+                        // Right tick
+                        Rectangle {
+                            width: 2px;
+                            height: 8px;
+                            x: (parent.width + root.scale_bar_width) / 2 - 1px;
+                            y: 3px;
+                            background: #ffffff;
+                        }
+                        // Scale label
+                        Text {
+                            text: root.scale_bar_text;
+                            font-size: 11px;
+                            color: #ffffff;
+                            width: parent.width;
+                            y: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -707,364 +738,7 @@ fn default_rov_udp_bind_host() -> String {
     parse_host_from_http_base(DEFAULT_ROV_HTTP_BASE).unwrap_or_else(|| "0.0.0.0".to_owned())
 }
 
-#[derive(Default)]
-struct MapState {
-    lat: Option<f64>,
-    lon: Option<f64>,
-    zoom: u32,
-    status: String,
-    #[cfg(target_os = "macos")]
-    corelocation_manager: Option<Retained<CLLocationManager>>,
-    #[cfg(target_os = "macos")]
-    corelocation_permission_requested: bool,
-}
 
-struct DetectedLocation {
-    lat: f64,
-    lon: f64,
-    source: String,
-}
-
-#[cfg(target_os = "macos")]
-enum CoreLocationDetectionOutcome {
-    Located(f64, f64),
-    PendingPermission(String),
-    PendingFix(String),
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-struct TileCoordinate {
-    z: u32,
-    x: isize,
-    y: isize,
-}
-
-struct TileLoadResult {
-    coord: TileCoordinate,
-    frame: Option<RgbaFrame>,
-    error: Option<String>,
-}
-
-struct MapTilesState {
-    client: Client,
-    loaded_tiles: BTreeMap<TileCoordinate, Image>,
-    loading_tiles: BTreeSet<TileCoordinate>,
-    tile_cache: BTreeMap<TileCoordinate, Image>,
-    fallback_zoom: Option<u32>,
-    tile_result_tx: mpsc::Sender<TileLoadResult>,
-    tile_result_rx: Receiver<TileLoadResult>,
-    visible_width: f64,
-    visible_height: f64,
-    offset_x: f64,
-    offset_y: f64,
-}
-
-impl MapTilesState {
-    fn new() -> Self {
-        let (tile_result_tx, tile_result_rx) = mpsc::channel();
-        Self {
-            client: Client::new(),
-            loaded_tiles: BTreeMap::new(),
-            loading_tiles: BTreeSet::new(),
-            tile_cache: BTreeMap::new(),
-            fallback_zoom: None,
-            tile_result_tx,
-            tile_result_rx,
-            visible_width: MAP_IMAGE_SIZE_PX as f64,
-            visible_height: MAP_IMAGE_SIZE_PX as f64,
-            offset_x: 0.0,
-            offset_y: 0.0,
-        }
-    }
-
-    fn world_size_px(zoom_level: u32) -> f64 {
-        (MAP_TILE_SIZE_PX as f64) * f64::exp2(zoom_level as f64)
-    }
-
-    fn clamp_offset_to_world(&mut self, zoom_level: u32) {
-        let world_size = Self::world_size_px(zoom_level);
-        let min_x = (world_size - self.visible_width).min(0.0);
-        let max_x = (world_size - self.visible_width).max(0.0);
-        let min_y = (world_size - self.visible_height).min(0.0);
-        let max_y = (world_size - self.visible_height).max(0.0);
-        self.offset_x = self.offset_x.clamp(min_x, max_x);
-        self.offset_y = self.offset_y.clamp(min_y, max_y);
-    }
-
-    fn update_visible_size(&mut self, width: f64, height: f64, zoom_level: u32) -> bool {
-        let width = width.clamp(32.0, 4096.0);
-        let height = height.clamp(32.0, 4096.0);
-        let changed = (self.visible_width - width).abs() > f64::EPSILON
-            || (self.visible_height - height).abs() > f64::EPSILON;
-        if changed {
-            self.visible_width = width;
-            self.visible_height = height;
-            self.clamp_offset_to_world(zoom_level);
-        }
-        changed
-    }
-
-    fn center_on_location(&mut self, lat: f64, lon: f64, zoom_level: u32) {
-        let world_size = Self::world_size_px(zoom_level);
-        let x_world = ((lon + 180.0) / 360.0) * world_size;
-        let lat_rad = lat.to_radians();
-        let y_world =
-            ((1.0 - (lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / PI) / 2.0) * world_size;
-        self.offset_x = x_world - (self.visible_width / 2.0);
-        self.offset_y = y_world - (self.visible_height / 2.0);
-        self.clamp_offset_to_world(zoom_level);
-    }
-
-    fn set_offset_from_viewport(&mut self, viewport_x: f64, viewport_y: f64, zoom_level: u32) {
-        self.offset_x = -viewport_x;
-        self.offset_y = -viewport_y;
-        self.clamp_offset_to_world(zoom_level);
-    }
-
-    fn set_zoom_level(&mut self, current_zoom: u32, new_zoom: u32, focus_x: f64, focus_y: f64) {
-        if current_zoom == new_zoom {
-            return;
-        }
-        let old_world_size = Self::world_size_px(current_zoom);
-        let new_world_size = Self::world_size_px(new_zoom);
-        let focus_x = focus_x.clamp(0.0, self.visible_width);
-        let focus_y = focus_y.clamp(0.0, self.visible_height);
-        let old_anchor_x = (self.offset_x + focus_x).clamp(0.0, old_world_size);
-        let old_anchor_y = (self.offset_y + focus_y).clamp(0.0, old_world_size);
-        let anchor_u = if old_world_size > 0.0 {
-            old_anchor_x / old_world_size
-        } else {
-            0.5
-        };
-        let anchor_v = if old_world_size > 0.0 {
-            old_anchor_y / old_world_size
-        } else {
-            0.5
-        };
-        self.offset_x = anchor_u * new_world_size - focus_x;
-        self.offset_y = anchor_v * new_world_size - focus_y;
-        self.loading_tiles.clear();
-        self.fallback_zoom = Some(current_zoom);
-        self.clamp_offset_to_world(new_zoom);
-    }
-
-    fn zoom_focus_center(&self) -> (f64, f64) {
-        (self.visible_width / 2.0, self.visible_height / 2.0)
-    }
-
-    fn center_lat_lon(&self, zoom_level: u32) -> Option<(f64, f64)> {
-        let world_size = Self::world_size_px(zoom_level);
-        if world_size <= 0.0 {
-            return None;
-        }
-        let x_world = (self.offset_x + (self.visible_width / 2.0)).clamp(0.0, world_size);
-        let y_world = (self.offset_y + (self.visible_height / 2.0)).clamp(0.0, world_size);
-        let lon = (x_world / world_size) * 360.0 - 180.0;
-        let n = PI - (2.0 * PI * y_world / world_size);
-        let lat = n.sinh().atan().to_degrees();
-        Some((lat, lon))
-    }
-
-    fn viewport_for_slint(&self, zoom_level: u32) -> (f32, f32, f32, f32) {
-        let world_size = Self::world_size_px(zoom_level) as f32;
-        (
-            -(self.offset_x as f32),
-            -(self.offset_y as f32),
-            world_size,
-            world_size,
-        )
-    }
-    fn visible_tile_bounds(
-        &self,
-        current_zoom: u32,
-        target_zoom: u32,
-    ) -> (isize, isize, isize, isize, isize) {
-        let scale = f64::exp2((target_zoom as i32 - current_zoom as i32) as f64);
-        let world_tiles = 1_isize << target_zoom;
-        let offset_x = self.offset_x * scale;
-        let offset_y = self.offset_y * scale;
-        let visible_width = self.visible_width * scale;
-        let visible_height = self.visible_height * scale;
-        let min_x = (offset_x / MAP_TILE_SIZE_PX as f64).floor() as isize;
-        let min_y = (offset_y / MAP_TILE_SIZE_PX as f64).floor() as isize;
-        let max_x = (((offset_x + visible_width) / MAP_TILE_SIZE_PX as f64).ceil() as isize + 1)
-            .min(world_tiles);
-        let max_y = (((offset_y + visible_height) / MAP_TILE_SIZE_PX as f64).ceil() as isize + 1)
-            .min(world_tiles);
-        (min_x, min_y, max_x, max_y, world_tiles)
-    }
-
-    fn coord_in_bounds(
-        coord: &TileCoordinate,
-        min_x: isize,
-        min_y: isize,
-        max_x: isize,
-        max_y: isize,
-        world_tiles: isize,
-    ) -> bool {
-        coord.x >= 0
-            && coord.x < world_tiles
-            && coord.y >= 0
-            && coord.y < world_tiles
-            && coord.x > min_x - MAP_TILE_CACHE_MARGIN
-            && coord.x < max_x + MAP_TILE_CACHE_MARGIN
-            && coord.y > min_y - MAP_TILE_CACHE_MARGIN
-            && coord.y < max_y + MAP_TILE_CACHE_MARGIN
-    }
-
-    fn request_visible_tiles(&mut self, zoom_level: u32, user_agent: &str) {
-        const MAX_TILE_CACHE: usize = 500;
-        if self.tile_cache.len() > MAX_TILE_CACHE {
-            self.tile_cache.retain(|c, _| {
-                (c.z as i32 - zoom_level as i32).unsigned_abs() <= 2
-            });
-        }
-        let (min_x, min_y, max_x, max_y, world_tiles) =
-            self.visible_tile_bounds(zoom_level, zoom_level);
-        let fallback_bounds = self.fallback_zoom.map(|fallback_zoom| {
-            let (fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles) =
-                self.visible_tile_bounds(zoom_level, fallback_zoom);
-            (fallback_zoom, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)
-        });
-        let keep = |coord: &TileCoordinate| {
-            if coord.z == zoom_level {
-                Self::coord_in_bounds(coord, min_x, min_y, max_x, max_y, world_tiles)
-            } else if let Some((fallback_zoom, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)) =
-                fallback_bounds
-            {
-                coord.z == fallback_zoom
-                    && Self::coord_in_bounds(coord, fmin_x, fmin_y, fmax_x, fmax_y, fworld_tiles)
-            } else {
-                false
-            }
-        };
-        self.loaded_tiles.retain(|coord, _| keep(coord));
-        self.loading_tiles.retain(keep);
-
-        let user_agent = if user_agent.trim().is_empty() {
-            DEFAULT_OSM_TILE_USER_AGENT.to_owned()
-        } else {
-            user_agent.trim().to_owned()
-        };
-        for x in min_x..max_x {
-            for y in min_y..max_y {
-                if !(0..world_tiles).contains(&x) || !(0..world_tiles).contains(&y) {
-                    continue;
-                }
-                let coord = TileCoordinate {
-                    z: zoom_level,
-                    x,
-                    y,
-                };
-                if self.loaded_tiles.contains_key(&coord) || self.loading_tiles.contains(&coord) {
-                    continue;
-                }
-                if let Some(cached) = self.tile_cache.get(&coord).cloned() {
-                    self.loaded_tiles.insert(coord, cached);
-                    continue;
-                }
-                self.loading_tiles.insert(coord);
-                let client = self.client.clone();
-                let tx = self.tile_result_tx.clone();
-                let user_agent = user_agent.clone();
-                let tx_for_thread = tx.clone();
-                let spawn_result = thread::Builder::new()
-                    .name(format!("osm-tile-{}-{}-{}", coord.z, coord.x, coord.y))
-                    .spawn(move || {
-                        let outcome = load_osm_tile(client, coord, &user_agent)
-                            .map(|frame| TileLoadResult {
-                                coord,
-                                frame: Some(frame),
-                                error: None,
-                            })
-                            .unwrap_or_else(|err| TileLoadResult {
-                                coord,
-                                frame: None,
-                                error: Some(format!(
-                                    "Failed loading tile z{} x{} y{}: {err:#}",
-                                    coord.z, coord.x, coord.y
-                                )),
-                            });
-                        let _ = tx_for_thread.send(outcome);
-                    });
-                if let Err(err) = spawn_result {
-                    self.loading_tiles.remove(&coord);
-                    let _ = tx.send(TileLoadResult {
-                        coord,
-                        frame: None,
-                        error: Some(format!(
-                            "Failed spawning tile loader z{} x{} y{}: {err}",
-                            coord.z, coord.x, coord.y
-                        )),
-                    });
-                }
-            }
-        }
-    }
-
-    fn poll_loaded_tiles(&mut self, zoom_level: u32) -> (bool, Option<String>) {
-        let mut changed = false;
-        let mut latest_error = None;
-        while let Ok(result) = self.tile_result_rx.try_recv() {
-            self.loading_tiles.remove(&result.coord);
-            if let Some(frame) = result.frame {
-                let image = rgba_frame_to_slint_image(&frame);
-                self.tile_cache.insert(result.coord, image.clone());
-                if result.coord.z == zoom_level {
-                    self.loaded_tiles.insert(result.coord, image);
-                    changed = true;
-                }
-            } else if result.coord.z == zoom_level
-                && let Some(error) = result.error
-            {
-                latest_error = Some(error);
-            }
-        }
-        if let Some(fallback_zoom) = self.fallback_zoom {
-            if fallback_zoom == zoom_level {
-                self.fallback_zoom = None;
-            } else {
-                let current_loaded_count = self
-                    .loaded_tiles
-                    .keys()
-                    .filter(|coord| coord.z == zoom_level)
-                    .count();
-                if current_loaded_count >= 8 {
-                    self.fallback_zoom = None;
-                    self.loaded_tiles.retain(|coord, _| coord.z == zoom_level);
-                    self.loading_tiles.retain(|coord| coord.z == zoom_level);
-                }
-            }
-        }
-        (changed, latest_error)
-    }
-
-    fn tile_model(&self, render_zoom: u32) -> ModelRc<MapTile> {
-        let model = VecModel::from(
-            self.loaded_tiles
-                .iter()
-                .filter(|(coord, _)| {
-                    coord.z == render_zoom
-                        || self
-                            .fallback_zoom
-                            .is_some_and(|fallback_zoom| coord.z == fallback_zoom)
-                })
-                .map(|(coord, image)| MapTile {
-                    x: (coord.x as f32)
-                        * (MAP_TILE_SIZE_PX as f32)
-                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
-                    y: (coord.y as f32)
-                        * (MAP_TILE_SIZE_PX as f32)
-                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
-                    size: (MAP_TILE_SIZE_PX as f32)
-                        * 2.0_f32.powi(render_zoom as i32 - coord.z as i32),
-                    tile: image.clone(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        ModelRc::new(model)
-    }
-}
 
 struct ThirdEyeState {
     active_screen: Screen,
@@ -1076,6 +750,7 @@ struct ThirdEyeState {
     rov_info: String,
     stream: StreamState,
     rov_status: UdpStatusState,
+    viewport_anim: Option<ViewportAnimation>,
 }
 
 impl ThirdEyeState {
@@ -1093,6 +768,7 @@ impl ThirdEyeState {
             rov_info: String::new(),
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
+            viewport_anim: None,
         }
     }
 
@@ -1190,12 +866,6 @@ impl ThirdEyeState {
     }
 }
 
-#[derive(Clone)]
-struct RgbaFrame {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
 
 #[derive(Default)]
 struct StreamState {
@@ -1323,6 +993,11 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
         _ => "n/a".to_owned(),
     };
     ui.set_lat_lon_text(lat_lon.into());
+    let pin_short = match (state.map.lat, state.map.lon) {
+        (Some(lat), Some(lon)) => format!("{lat:.4}, {lon:.4}"),
+        _ => String::new(),
+    };
+    ui.set_pin_lat_lon_short(pin_short.into());
     match (state.map.lat, state.map.lon) {
         (Some(lat), Some(lon)) => {
             let (pin_x, pin_y) = lat_lon_to_world_px(lat, lon, state.map.zoom);
@@ -1338,23 +1013,38 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_corelocation_debug(corelocation_debug_status(&state.map).into());
     #[cfg(not(target_os = "macos"))]
     ui.set_corelocation_debug("CoreLocation debug: not available on this platform.".into());
-    let (viewport_x, viewport_y, viewport_width, viewport_height) =
+    let (target_vp_x, target_vp_y, viewport_width, viewport_height) =
         state.map_tiles.viewport_for_slint(state.map.zoom);
-    ui.invoke_set_map_viewport(viewport_x, viewport_y, viewport_width, viewport_height);
-    ui.set_map_tiles(state.map_tiles.tile_model(state.map.zoom));
+    let (display_vp_x, display_vp_y) = if let Some(anim) = &state.viewport_anim {
+        let t = ease_out_cubic((anim.elapsed_ms / anim.duration_ms).clamp(0.0, 1.0)) as f32;
+        (
+            anim.start_vp_x + (anim.target_vp_x - anim.start_vp_x) * t,
+            anim.start_vp_y + (anim.target_vp_y - anim.start_vp_y) * t,
+        )
+    } else {
+        (target_vp_x, target_vp_y)
+    };
+    ui.invoke_set_map_viewport(display_vp_x, display_vp_y, viewport_width, viewport_height);
+    let tiles = state.map_tiles.visible_tiles(state.map.zoom);
+    let tile_model = VecModel::from(
+        tiles
+            .into_iter()
+            .map(|t| MapTile {
+                x: t.x,
+                y: t.y,
+                size: t.size,
+                tile: t.image,
+            })
+            .collect::<Vec<_>>(),
+    );
+    ui.set_map_tiles(ModelRc::new(tile_model));
+    let scale_lat = state.map.lat.unwrap_or(45.0);
+    let (bar_px, bar_text) = compute_scale_bar(state.map.zoom, scale_lat);
+    ui.set_scale_bar_width(bar_px);
+    ui.set_scale_bar_text(bar_text.into());
     apply_stream_and_rov_runtime_to_ui(ui, state);
 }
 
-fn lat_lon_to_world_px(lat: f64, lon: f64, zoom_level: u32) -> (f32, f32) {
-    let world_size = MapTilesState::world_size_px(zoom_level);
-    let lon = lon.clamp(-180.0, 180.0);
-    let lat = lat.clamp(-85.051_128_78, 85.051_128_78);
-    let x_world = (((lon + 180.0) / 360.0) * world_size).clamp(0.0, world_size);
-    let lat_rad = lat.to_radians();
-    let y_world = ((1.0 - (lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / PI) / 2.0) * world_size;
-    let y_world = y_world.clamp(0.0, world_size);
-    (x_world as f32, y_world as f32)
-}
 fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_stream_status(state.stream.status.clone().into());
     ui.set_frames_received_text(state.stream.frames_received.to_string().into());
@@ -1423,15 +1113,6 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState) {
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
 }
 
-fn rgba_frame_to_slint_image(frame: &RgbaFrame) -> Image {
-    let shared_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-        frame.rgba.as_slice(),
-        frame.width,
-        frame.height,
-    );
-    Image::from_rgba8(shared_buffer)
-}
-
 fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
     let ui_weak = ui.as_weak();
     let state_for_configuration = Rc::clone(&state);
@@ -1464,6 +1145,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
                 state.suppress_next_map_flick = false;
                 return;
             }
+            state.viewport_anim = None;
             state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
             state.set_map_viewport(viewport_x as f64, viewport_y as f64);
             apply_map_runtime_to_ui(&ui, &state);
@@ -1483,6 +1165,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             };
             state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
             state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            state.viewport_anim = None;
             let next_zoom = state.map.zoom.saturating_add(1).min(MAX_ZOOM);
             let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
             state.set_map_zoom(next_zoom, focus_x, focus_y);
@@ -1505,6 +1188,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             };
             state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
             state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            state.viewport_anim = None;
             let next_zoom = state.map.zoom.saturating_sub(1).max(MIN_ZOOM);
             let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
             state.set_map_zoom(next_zoom, focus_x, focus_y);
@@ -1527,6 +1211,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             };
             state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
             state.map_tiles.fallback_zoom = None;
+            let (old_vp_x, old_vp_y, _, _) = state.map_tiles.viewport_for_slint(state.map.zoom);
             match detect_location(&mut state.map) {
                 Ok(location) => {
                     state.map.lat = Some(location.lat);
@@ -1547,6 +1232,17 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
                     }
                 }
             }
+            let (target_vp_x, target_vp_y, _, _) = state.map_tiles.viewport_for_slint(state.map.zoom);
+            if (old_vp_x - target_vp_x).abs() > 1.0 || (old_vp_y - target_vp_y).abs() > 1.0 {
+                state.viewport_anim = Some(ViewportAnimation {
+                    start_vp_x: old_vp_x,
+                    start_vp_y: old_vp_y,
+                    target_vp_x,
+                    target_vp_y,
+                    elapsed_ms: 0.0,
+                    duration_ms: 300.0,
+                });
+            }
             state.suppress_next_map_flick = true;
             apply_map_runtime_to_ui(&ui, &state);
         },
@@ -1564,9 +1260,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
         };
         pull_configuration_from_ui(&ui, &mut state);
         state.active_screen = Screen::Map;
-        // Estimate map canvas size from content panel (minus padding/header)
-        let est_width = (content_width as f64 - 30.0).max(320.0);
-        let est_height = (content_height as f64 - 180.0).max(320.0);
+        // Map fills the entire content panel
+        let est_width = (content_width as f64).max(320.0);
+        let est_height = (content_height as f64).max(320.0);
         state.set_map_visible_size(est_width, est_height);
         state.map_tiles.fallback_zoom = None;
         state.auto_refresh_map_on_tab_enter();
@@ -2138,217 +1834,6 @@ fn extract_media_names(payload: &Value) -> Vec<String> {
     }
 }
 
-fn detect_location_from_ip() -> Result<(f64, f64)> {
-    let response = Client::new()
-        .get("http://ip-api.com/json")
-        .send()
-        .context("IP geolocation request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("IP geolocation failed with HTTP {status}");
-    }
-    let payload: Value = response.json().context("invalid location payload")?;
-    let lat = payload
-        .get("lat")
-        .and_then(Value::as_f64)
-        .context("missing lat in location payload")?;
-    let lon = payload
-        .get("lon")
-        .and_then(Value::as_f64)
-        .context("missing lon in location payload")?;
-    Ok((lat, lon))
-}
-
-fn detect_location(map: &mut MapState) -> Result<DetectedLocation> {
-    #[cfg(target_os = "macos")]
-    {
-        match detect_location_from_corelocation(map) {
-            Ok(CoreLocationDetectionOutcome::Located(lat, lon)) => Ok(DetectedLocation {
-                lat,
-                lon,
-                source: "macOS CoreLocation (native)".to_owned(),
-            }),
-            Ok(CoreLocationDetectionOutcome::PendingPermission(message)) => {
-                let (lat, lon) = detect_location_from_ip().with_context(|| {
-                    format!("CoreLocation permission is pending ({message}) and IP fallback failed")
-                })?;
-                Ok(DetectedLocation {
-                    lat,
-                    lon,
-                    source: format!("IP geolocation fallback ({message})"),
-                })
-            }
-            Ok(CoreLocationDetectionOutcome::PendingFix(message)) => anyhow::bail!(
-                "Native CoreLocation is authorized but still acquiring a fix ({message}). Try Detect location again in a moment."
-            ),
-            Err(native_err) => {
-                let (lat, lon) = detect_location_from_ip().with_context(|| {
-                    format!("CoreLocation failed ({native_err:#}) and IP fallback also failed")
-                })?;
-                Ok(DetectedLocation {
-                    lat,
-                    lon,
-                    source: format!("IP geolocation fallback ({native_err:#})"),
-                })
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = map;
-        let (lat, lon) = detect_location_from_ip()?;
-        Ok(DetectedLocation {
-            lat,
-            lon,
-            source: "IP geolocation".to_owned(),
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn corelocation_status_label(status: CLAuthorizationStatus) -> &'static str {
-    if status == CLAuthorizationStatus::kCLAuthorizationStatusNotDetermined {
-        "NotDetermined"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusDenied {
-        "Denied"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusRestricted {
-        "Restricted"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedWhenInUse {
-        "AuthorizedWhenInUse"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedAlways {
-        "AuthorizedAlways"
-    } else {
-        "Unknown"
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn corelocation_debug_status(map: &MapState) -> String {
-    unsafe {
-        let services_enabled = CLLocationManager::locationServicesEnabled_class();
-        let (status_raw, status_label) = if let Some(manager) = map.corelocation_manager.as_ref() {
-            let status = manager.authorizationStatus();
-            (status.0, corelocation_status_label(status))
-        } else {
-            (-1, "ManagerNotInitialized")
-        };
-        format!(
-            "CoreLocation debug: services_enabled={services_enabled}, manager_initialized={}, permission_requested={}, auth_status={status_label} ({status_raw})",
-            map.corelocation_manager.is_some(),
-            map.corelocation_permission_requested
-        )
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationDetectionOutcome> {
-    fn valid_coordinate(lat: f64, lon: f64) -> bool {
-        lat.is_finite()
-            && lon.is_finite()
-            && (-90.0..=90.0).contains(&lat)
-            && (-180.0..=180.0).contains(&lon)
-    }
-
-    unsafe {
-        if !CLLocationManager::locationServicesEnabled_class() {
-            anyhow::bail!("CoreLocation services are disabled");
-        }
-        if map.corelocation_manager.is_none() {
-            map.corelocation_manager = Some(CLLocationManager::new());
-        }
-        let manager = map
-            .corelocation_manager
-            .as_ref()
-            .context("failed to initialize CoreLocation manager")?;
-        manager.setDesiredAccuracy(kCLLocationAccuracyBest);
-        let status = manager.authorizationStatus();
-
-        if status == CLAuthorizationStatus::kCLAuthorizationStatusNotDetermined {
-            if !map.corelocation_permission_requested {
-                manager.requestWhenInUseAuthorization();
-                map.corelocation_permission_requested = true;
-                return Ok(CoreLocationDetectionOutcome::PendingPermission(
-                    "Requested native location permission. Approve the macOS prompt, then click Detect location again.".to_owned(),
-                ));
-            }
-            return Ok(CoreLocationDetectionOutcome::PendingPermission(
-                "Waiting for native location permission response. If no prompt appears, focus the app and click Detect location again.".to_owned(),
-            ));
-        }
-        map.corelocation_permission_requested = false;
-
-        if status == CLAuthorizationStatus::kCLAuthorizationStatusDenied
-            || status == CLAuthorizationStatus::kCLAuthorizationStatusRestricted
-        {
-            anyhow::bail!("CoreLocation permission is denied or restricted");
-        }
-
-        if let Some(location) = manager.location() {
-            let coordinate = location.coordinate();
-            if valid_coordinate(coordinate.latitude, coordinate.longitude) {
-                manager.stopUpdatingLocation();
-                return Ok(CoreLocationDetectionOutcome::Located(
-                    coordinate.latitude,
-                    coordinate.longitude,
-                ));
-            }
-        }
-
-        if status != CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedAlways
-            && status != CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedWhenInUse
-        {
-            anyhow::bail!("CoreLocation is not authorized for this app");
-        }
-
-        manager.startUpdatingLocation();
-        manager.requestLocation();
-        for _ in 0..CORELOCATION_FIX_POLL_ATTEMPTS {
-            if let Some(location) = manager.location() {
-                let coordinate = location.coordinate();
-                if valid_coordinate(coordinate.latitude, coordinate.longitude) {
-                    manager.stopUpdatingLocation();
-                    return Ok(CoreLocationDetectionOutcome::Located(
-                        coordinate.latitude,
-                        coordinate.longitude,
-                    ));
-                }
-            }
-            thread::sleep(Duration::from_millis(CORELOCATION_FIX_POLL_INTERVAL_MS));
-        }
-    }
-
-    Ok(CoreLocationDetectionOutcome::PendingFix(
-        "Waiting for native location fix. Click Detect location again in a moment.".to_owned(),
-    ))
-}
-
-fn load_osm_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Result<RgbaFrame> {
-    let tile_base_url =
-        std::env::var("OSM_TILES_URL").unwrap_or_else(|_| "https://tile.openstreetmap.org".into());
-    let url = format!("{tile_base_url}/{}/{}/{}.png", coord.z, coord.x, coord.y);
-    let response = client
-        .get(&url)
-        .header("User-Agent", user_agent)
-        .send()
-        .with_context(|| format!("tile request failed for {url}"))?
-        .error_for_status()
-        .with_context(|| format!("tile request returned non-success for {url}"))?;
-    let bytes = response.bytes().context("tile bytes missing")?;
-    let image = image::load_from_memory(&bytes)
-        .with_context(|| format!("tile decode failed for {url}"))?
-        .resize_exact(
-            MAP_TILE_SIZE_PX as u32,
-            MAP_TILE_SIZE_PX as u32,
-            image::imageops::FilterType::Triangle,
-        )
-        .to_rgba8();
-    Ok(RgbaFrame {
-        width: image.width(),
-        height: image.height(),
-        rgba: image.into_raw(),
-    })
-}
 
 fn configure_slint_style() {
     if std::env::var_os("SLINT_STYLE").is_none() {
@@ -2397,7 +1882,14 @@ fn main() -> Result<()> {
                 state.map.status = error;
                 state.request_visible_map_tiles();
             }
-            if map_changed || has_map_error {
+            let anim_active = state.viewport_anim.is_some();
+            if let Some(anim) = &mut state.viewport_anim {
+                anim.elapsed_ms += 16.0;
+                if anim.elapsed_ms >= anim.duration_ms {
+                    state.viewport_anim = None;
+                }
+            }
+            if map_changed || has_map_error || anim_active {
                 apply_map_runtime_to_ui(&ui, &state);
             }
             state.rov_status.poll_events();
