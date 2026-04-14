@@ -26,6 +26,10 @@ const CORELOCATION_FIX_POLL_INTERVAL_MS: u64 = 250;
 pub const DEFAULT_OSM_TILE_USER_AGENT: &str =
     "third-eye-client/0.1 (desktop map viewer; set contact URL/email for production use)";
 
+const MAPBOX_URL_TEMPLATE: &str = env!("PUBLIC_MAP_PROVIDER_URL");
+const MAPBOX_ACCESS_TOKEN: &str = env!("PUBLIC_MAPBOX_ACCESS_TOKEN");
+const MAPBOX_STYLE_ID: &str = env!("PUBLIC_MAPBOX_STYLE_ID");
+
 // ---------------------------------------------------------------------------
 // Shared frame type
 // ---------------------------------------------------------------------------
@@ -338,9 +342,9 @@ impl MapTilesState {
                 let user_agent = user_agent.clone();
                 let tx_for_thread = tx.clone();
                 let spawn_result = thread::Builder::new()
-                    .name(format!("osm-tile-{}-{}-{}", coord.z, coord.x, coord.y))
+                    .name(format!("map-tile-{}-{}-{}", coord.z, coord.x, coord.y))
                     .spawn(move || {
-                        let outcome = load_osm_tile(client, coord, &user_agent)
+                        let outcome = load_map_tile(client, coord, &user_agent)
                             .map(|frame| TileLoadResult {
                                 coord,
                                 frame: Some(frame),
@@ -689,23 +693,27 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
 }
 
 // ---------------------------------------------------------------------------
-// OSM tile loading
+// Mapbox tile loading
 // ---------------------------------------------------------------------------
 
-fn load_osm_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Result<RgbaFrame> {
-    let tile_base_url =
-        std::env::var("OSM_TILES_URL").unwrap_or_else(|_| "https://tile.openstreetmap.org".into());
-    let url = format!("{tile_base_url}/{}/{}/{}.png", coord.z, coord.x, coord.y);
+fn load_map_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Result<RgbaFrame> {
+    let url = MAPBOX_URL_TEMPLATE
+        .replace("{id}", MAPBOX_STYLE_ID)
+        .replace("{z}", &coord.z.to_string())
+        .replace("{x}", &coord.x.to_string())
+        .replace("{y}", &coord.y.to_string())
+        .replace("{r}", "")
+        .replace("{accessToken}", MAPBOX_ACCESS_TOKEN);
     let response = client
         .get(&url)
         .header("User-Agent", user_agent)
         .send()
-        .with_context(|| format!("tile request failed for {url}"))?
+        .with_context(|| format!("tile request failed for z{} x{} y{}", coord.z, coord.x, coord.y))?
         .error_for_status()
-        .with_context(|| format!("tile request returned non-success for {url}"))?;
+        .with_context(|| format!("tile request returned non-success for z{} x{} y{}", coord.z, coord.x, coord.y))?;
     let bytes = response.bytes().context("tile bytes missing")?;
     let image = image::load_from_memory(&bytes)
-        .with_context(|| format!("tile decode failed for {url}"))?
+        .with_context(|| format!("tile decode failed for z{} x{} y{}", coord.z, coord.x, coord.y))?
         .resize_exact(
             MAP_TILE_SIZE_PX as u32,
             MAP_TILE_SIZE_PX as u32,

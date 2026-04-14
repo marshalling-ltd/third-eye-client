@@ -12,6 +12,9 @@ name = "test_udp_server"
 path = "src/bin/test_udp_server.rs"
 required-features = ["test-tools"]
 
+[build-dependencies]
+dotenvy = "0.15"
+
 [dependencies]
 anyhow = "1.0.100"
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
