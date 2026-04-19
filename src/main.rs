@@ -20,9 +20,8 @@ use map::{
     DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM,
 };
 use reqwest::Url;
-use reqwest::blocking::Client;
-use serde_json::Value;
 use slint::{ComponentHandle, ModelRc, VecModel};
+use third_eye_client::camera::{CameraApiClient, MediaScene, PhotoFormat};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
@@ -1387,13 +1386,22 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state);
-        let client = RovApiClient::new(state.config.rov_http_base.clone());
-        state.rov_info = match client.list_medias() {
-            Ok(names) => {
-                if names.is_empty() {
-                    "No media names detected in response.".to_owned()
+        let client = CameraApiClient::new(state.config.rov_http_base.clone());
+        state.rov_info = match client.list_medias(None::<MediaScene>) {
+            Ok(items) => {
+                if items.is_empty() {
+                    "No media files on camera.".to_owned()
                 } else {
-                    format!("Media files:\n{}", names.join("\n"))
+                    let mut lines = vec![format!("Media files ({}):", items.len())];
+                    for item in &items {
+                        lines.push(format!(
+                            "- {} ({} bytes){}",
+                            item.name,
+                            item.size,
+                            if item.canplayback { " [video]" } else { "" }
+                        ));
+                    }
+                    lines.join("\n")
                 }
             }
             Err(err) => format!("List medias failed: {err:#}"),
@@ -1412,9 +1420,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state);
-        let client = RovApiClient::new(state.config.rov_http_base.clone());
-        state.rov_info = match client.capture() {
-            Ok(()) => "Capture request sent successfully (HTTP 2xx).".to_owned(),
+        let client = CameraApiClient::new(state.config.rov_http_base.clone());
+        state.rov_info = match client.capture(PhotoFormat::Jpeg, 1) {
+            Ok(resp) => {
+                let msg = resp.msg.as_deref().unwrap_or("success");
+                format!("Capture request sent successfully: {msg}")
+            }
             Err(err) => format!("Capture failed: {err:#}"),
         };
         apply_state_to_ui(&ui, &state);
@@ -1757,83 +1768,6 @@ fn locate_ffmpeg_binary() -> Option<PathBuf> {
         .find(|path| path.exists())
         .or_else(|| Some(PathBuf::from("ffmpeg")))
 }
-
-struct RovApiClient {
-    base_url: String,
-    http: Client,
-}
-
-impl RovApiClient {
-    fn new(base_url: String) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            http: Client::new(),
-        }
-    }
-
-    fn capture(&self) -> Result<()> {
-        let url = format!("{}/v1/capture", self.base_url);
-        let response = self
-            .http
-            .post(url)
-            .send()
-            .context("capture request failed")?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            anyhow::bail!("capture failed with HTTP {}", response.status())
-        }
-    }
-
-    fn list_medias(&self) -> Result<Vec<String>> {
-        let url = format!("{}/v1/medias", self.base_url);
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .context("list medias request failed")?;
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("list medias failed with HTTP {status}");
-        }
-        let payload: Value = response.json().context("invalid medias JSON payload")?;
-        Ok(extract_media_names(&payload))
-    }
-}
-
-fn extract_media_names(payload: &Value) -> Vec<String> {
-    fn from_obj(value: &Value) -> Option<String> {
-        value
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                value
-                    .get("file_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .or_else(|| {
-                value
-                    .get("filename")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-    }
-
-    match payload {
-        Value::Array(items) => items.iter().filter_map(from_obj).collect(),
-        Value::Object(obj) => {
-            if let Some(Value::Array(items)) = obj.get("data") {
-                items.iter().filter_map(from_obj).collect()
-            } else {
-                Vec::new()
-            }
-        }
-        _ => Vec::new(),
-    }
-}
-
 
 fn configure_slint_style() {
     if std::env::var_os("SLINT_STYLE").is_none() {
