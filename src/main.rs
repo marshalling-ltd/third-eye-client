@@ -25,6 +25,9 @@ use third_eye_client::camera::{CameraApiClient, MediaScene, PhotoFormat};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
+use third_eye_client::storage::media::{
+    CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, download_to_local,
+};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
@@ -39,6 +42,18 @@ export struct MapTile {
     y: length,
     size: length,
     tile: image,
+}
+
+export struct MediaRow {
+    media_id: string,
+    name: string,
+    size_text: string,
+    seen_text: string,
+    state_text: string,
+    origin_text: string,
+    has_local: bool,
+    deleted_on_rov: bool,
+    selected: bool,
 }
 
 export component AppWindow inherits Window {
@@ -68,6 +83,17 @@ export component AppWindow inherits Window {
 
     // Per-capture ROV telemetry summary surfaced after a successful capture.
     in-out property <string> attached_metadata_text;
+
+    // Media screen bindings.
+    in property <[MediaRow]> media_rows;
+    in-out property <string> media_status;
+    in-out property <string> media_selected_id;
+    in-out property <string> media_selected_name;
+    in-out property <string> media_selected_details;
+    in-out property <string> media_selected_capture_text;
+    in-out property <string> media_selected_local_path;
+    in-out property <bool> media_selected_has_capture_meta: false;
+    in-out property <bool> media_download_in_progress: false;
 
     in-out property <string> map_status;
     in-out property <string> corelocation_debug;
@@ -102,6 +128,7 @@ export component AppWindow inherits Window {
     callback navigate_configuration();
     callback navigate_map(length, length);
     callback navigate_stream();
+    callback navigate_media();
 
     callback use_default_test_rtsp();
     callback use_default_rov_rtsp();
@@ -112,6 +139,11 @@ export component AppWindow inherits Window {
 
     callback list_medias();
     callback capture_photo();
+
+    callback refresh_media();
+    callback select_media(string, string);
+    callback download_selected_media();
+    callback open_selected_local_media();
 
     callback sign_in();
     callback sign_out();
@@ -181,6 +213,10 @@ export component AppWindow inherits Window {
                 Button {
                     text: "Live Stream";
                     clicked => { root.navigate_stream(); }
+                }
+                Button {
+                    text: "Media";
+                    clicked => { root.navigate_media(); }
                 }
                 Rectangle {
                     vertical-stretch: 1;
@@ -418,6 +454,154 @@ export component AppWindow inherits Window {
                             text: "No frames rendered yet.";
                             horizontal-alignment: center;
                             vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if root.active_screen == 3 : VerticalBox {
+                    spacing: 10px;
+                    Text {
+                        text: "Media library (ROV + local)";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "Camera HTTP base: " + root.rov_http_base;
+                        wrap: word-wrap;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Refresh from ROV";
+                            clicked => { root.refresh_media(); }
+                        }
+                    }
+                    Text { text: root.media_status; wrap: word-wrap; }
+
+                    HorizontalBox {
+                        spacing: 12px;
+
+                        // --- Left column: list of media rows. ---
+                        Rectangle {
+                            min-width: 340px;
+                            max-width: 420px;
+                            horizontal-stretch: 0;
+                            vertical-stretch: 1;
+                            border-width: 1px;
+                            border-color: #3f4148;
+                            background: #1a1c22;
+
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 4px;
+                                if root.media_rows.length == 0 : Text {
+                                    text: "No media recorded yet. Click \"Refresh from ROV\" to populate the list.";
+                                    wrap: word-wrap;
+                                    color: #8f96a3;
+                                }
+                                for row in root.media_rows : Rectangle {
+                                    height: 56px;
+                                    border-radius: 6px;
+                                    border-width: row.selected ? 2px : 1px;
+                                    border-color: row.selected ? #0a84ff : #2b2d34;
+                                    background: row.selected ? #0a84ff22 :
+                                        (row.deleted_on_rov ? #30181888 : #262931);
+                                    VerticalBox {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        spacing: 2px;
+                                        Text {
+                                            text: row.name;
+                                            font-size: 14px;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: row.size_text + " \u{2022} " + row.state_text + " \u{2022} " + row.seen_text;
+                                            font-size: 11px;
+                                            color: #8f96a3;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    TouchArea {
+                                        clicked => {
+                                            root.select_media(row.media_id, row.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // --- Right column: details of the selected row. ---
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            border-width: 1px;
+                            border-color: #3f4148;
+                            background: #1a1c22;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 6px;
+                                if root.media_selected_name == "" : Text {
+                                    text: "Select a media entry on the left to see its metadata.";
+                                    color: #8f96a3;
+                                    wrap: word-wrap;
+                                }
+                                if root.media_selected_name != "" : VerticalBox {
+                                    spacing: 6px;
+                                    Text {
+                                        text: root.media_selected_name;
+                                        font-size: 18px;
+                                    }
+                                    Text {
+                                        text: "media_id: " + root.media_selected_id;
+                                        font-size: 11px;
+                                        color: #8f96a3;
+                                    }
+                                    Text {
+                                        text: root.media_selected_details;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.media_selected_local_path != "" : Text {
+                                        text: "Local copy: " + root.media_selected_local_path;
+                                        wrap: word-wrap;
+                                        color: #8fbf7f;
+                                    }
+                                    Rectangle { height: 1px; background: #3f4148; }
+                                    Text { text: "Capture metadata"; font-size: 16px; }
+                                    if root.media_selected_has_capture_meta : Text {
+                                        text: root.media_selected_capture_text;
+                                        wrap: word-wrap;
+                                    }
+                                    if !root.media_selected_has_capture_meta : Text {
+                                        text: "No ROV telemetry was attached for this media. Captures taken while the UDP status listener is running have full metadata.";
+                                        wrap: word-wrap;
+                                        color: #8f96a3;
+                                    }
+                                    Rectangle { height: 1px; background: #3f4148; }
+                                    HorizontalBox {
+                                        spacing: 8px;
+                                        Button {
+                                            horizontal-stretch: 1;
+                                            text: root.media_download_in_progress
+                                                ? "Downloading..."
+                                                : (root.media_selected_local_path == ""
+                                                    ? "Download from ROV"
+                                                    : "Re-download from ROV");
+                                            enabled: !root.media_download_in_progress;
+                                            clicked => { root.download_selected_media(); }
+                                        }
+                                        Button {
+                                            horizontal-stretch: 1;
+                                            text: "Open locally";
+                                            enabled: root.media_selected_local_path != "";
+                                            clicked => { root.open_selected_local_media(); }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -737,6 +921,7 @@ enum Screen {
     Configuration,
     Map,
     Stream,
+    Media,
 }
 
 impl Screen {
@@ -745,6 +930,7 @@ impl Screen {
             Self::Configuration => 0,
             Self::Map => 1,
             Self::Stream => 2,
+            Self::Media => 3,
         }
     }
 }
@@ -856,6 +1042,33 @@ struct AuthUiState {
     is_signed_in: bool,
 }
 
+/// View-model backing the Media screen. Lives in `ThirdEyeState`.
+#[derive(Default)]
+struct MediaUiState {
+    rows: Vec<LocalMediaRecord>,
+    status_text: String,
+    /// `(media_id, name)` of the currently-selected row, if any.
+    selected: Option<(String, String)>,
+    /// Pre-rendered detail strings for the right-hand panel.
+    details_text: String,
+    capture_text: String,
+    has_capture_meta: bool,
+    local_path: String,
+    /// True while a background download is in flight.
+    download_in_progress: bool,
+    /// Receiver for download worker completions.
+    download_rx: Option<Receiver<DownloadEvent>>,
+}
+
+/// Message sent from the download worker thread back to the UI loop.
+enum DownloadEvent {
+    Finished {
+        media_id: String,
+        name: String,
+        result: Result<std::path::PathBuf, String>,
+    },
+}
+
 struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
@@ -869,6 +1082,7 @@ struct ThirdEyeState {
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
+    media: MediaUiState,
 }
 
 impl ThirdEyeState {
@@ -902,6 +1116,25 @@ impl ThirdEyeState {
             }
         }
 
+        let mut media = MediaUiState::default();
+        // Hydrate the Media screen with whatever we already know about ROV
+        // media (previous sessions may have populated the table already).
+        match store.media().list_all() {
+            Ok(rows) => {
+                media.rows = rows;
+                if media.rows.is_empty() {
+                    media.status_text =
+                        "No media recorded yet. Click \"Refresh from ROV\" to populate.".to_owned();
+                } else {
+                    media.status_text =
+                        format!("{} media record(s) in local library.", media.rows.len());
+                }
+            }
+            Err(err) => {
+                media.status_text = format!("Failed to load local media registry: {err:#}");
+            }
+        }
+
         Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
@@ -918,6 +1151,7 @@ impl ThirdEyeState {
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
+            media,
         }
     }
 
@@ -1138,6 +1372,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_attached_metadata_text(state.attached_metadata_text.clone().into());
     apply_map_runtime_to_ui(ui, state);
     apply_stream_and_rov_runtime_to_ui(ui, state);
+    apply_media_runtime_to_ui(ui, state);
 }
 
 fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
@@ -1278,6 +1513,272 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
         eprintln!("failed to persist configuration: {err:#}");
     }
+}
+
+// -------------------------------------------------------------------------
+// Media screen helpers
+// -------------------------------------------------------------------------
+
+fn format_bytes(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes as i64, units[unit])
+    } else {
+        format!("{:.1} {}", value, units[unit])
+    }
+}
+
+fn format_relative_age(ts_ms: i64) -> String {
+    let now = current_unix_ms();
+    let diff_secs = ((now - ts_ms).max(0) / 1000) as u64;
+    if diff_secs < 10 {
+        "just now".to_owned()
+    } else if diff_secs < 60 {
+        format!("{diff_secs}s ago")
+    } else if diff_secs < 3600 {
+        format!("{}m ago", diff_secs / 60)
+    } else if diff_secs < 86_400 {
+        format!("{}h ago", diff_secs / 3600)
+    } else {
+        format!("{}d ago", diff_secs / 86_400)
+    }
+}
+
+fn origin_label(record: &LocalMediaRecord) -> &'static str {
+    match record.mime.as_deref() {
+        Some(mime) if mime.starts_with("image/") => "image",
+        Some(mime) if mime.starts_with("video/") => "video",
+        _ => "other",
+    }
+}
+
+fn state_label(record: &LocalMediaRecord) -> &'static str {
+    if record.deleted_on_rov {
+        "deleted on ROV"
+    } else if record.local_path.is_some() {
+        "local"
+    } else {
+        "remote only"
+    }
+}
+
+fn scene_label(scene: Option<i32>) -> &'static str {
+    match scene {
+        Some(0) => "Normal",
+        Some(1) => "Vessel inspection",
+        Some(2) => "Fishing net",
+        Some(_) => "Other",
+        None => "-",
+    }
+}
+
+fn rov_stat_label(code: Option<i32>) -> &'static str {
+    match code {
+        Some(0) => "Normal",
+        Some(1) => "Needs repair",
+        Some(2) => "Repairing",
+        Some(3) => "Repair failed",
+        Some(_) => "Other",
+        None => "-",
+    }
+}
+
+fn build_details_text(record: &LocalMediaRecord) -> String {
+    let mut lines = Vec::<String>::new();
+    lines.push(format!("Size: {}", format_bytes(record.size_bytes)));
+    if let (Some(w), Some(h)) = (record.width, record.height)
+        && w > 0
+        && h > 0
+    {
+        lines.push(format!("Dimensions: {w} \u{00d7} {h}"));
+    }
+    if let Some(dur) = record.duration_s
+        && dur > 0
+    {
+        lines.push(format!("Duration: {dur} s"));
+    }
+    if let Some(mime) = &record.mime {
+        lines.push(format!("Type: {mime}"));
+    }
+    lines.push(format!("Scene: {}", scene_label(record.scene)));
+    lines.push(format!(
+        "ROV file status: {}",
+        rov_stat_label(record.rov_stat)
+    ));
+    lines.push(format!(
+        "First seen: {}",
+        format_relative_age(record.first_seen_ms)
+    ));
+    lines.push(format!(
+        "Last seen: {}",
+        format_relative_age(record.last_seen_ms)
+    ));
+    if record.deleted_on_rov {
+        lines.push("Flagged as deleted on the ROV since last refresh.".to_owned());
+    }
+    if let Some(hash) = &record.local_sha256 {
+        lines.push(format!("Local SHA-256: {hash}"));
+    }
+    lines.join("\n")
+}
+
+fn build_capture_text(meta: &StoredCaptureMetadata) -> String {
+    fn opt_num<T: std::fmt::Display>(
+        prefix: &str,
+        value: Option<T>,
+        suffix: &str,
+    ) -> Option<String> {
+        value.map(|v| format!("{prefix}{v}{suffix}"))
+    }
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "Captured at: {} ({})",
+        format_relative_age(meta.captured_at_ms),
+        meta.captured_at_ms
+    ));
+    if let (Some(pitch), Some(roll), Some(yaw)) = (meta.pitch, meta.roll, meta.yaw) {
+        lines.push(format!(
+            "Attitude [rad]: pitch={pitch:.3}, roll={roll:.3}, yaw={yaw:.3}"
+        ));
+    }
+    if let Some(depth) = meta.depth_m {
+        lines.push(format!("Depth: {depth:.2} m"));
+    }
+    if let Some(temp) = meta.temperature_c {
+        lines.push(format!("Temperature: {temp:.1} \u{00b0}C"));
+    }
+    match (meta.lat_e7, meta.lon_e7) {
+        (Some(lat), Some(lon)) => {
+            let lat_deg = lat as f64 / 1e7;
+            let lon_deg = lon as f64 / 1e7;
+            lines.push(format!(
+                "Coordinates: {lat_deg:.6}, {lon_deg:.6} (lat_e7={lat}, lon_e7={lon})"
+            ));
+        }
+        _ => {
+            if let Some(line) = opt_num("lat_e7=", meta.lat_e7, "") {
+                lines.push(line);
+            }
+            if let Some(line) = opt_num("lon_e7=", meta.lon_e7, "") {
+                lines.push(line);
+            }
+        }
+    }
+    if let Some(imu) = &meta.imu_json {
+        lines.push(format!("IMU: {imu}"));
+    }
+    if let Some(batts) = &meta.batteries_json
+        && batts != "[]"
+        && !batts.is_empty()
+    {
+        lines.push(format!("Batteries: {batts}"));
+    }
+    if let Some(note) = &meta.note
+        && !note.is_empty()
+    {
+        lines.push(format!("Note: {note}"));
+    }
+    if let Some(tags) = &meta.tags_json
+        && tags != "[]"
+        && !tags.is_empty()
+    {
+        lines.push(format!("Tags: {tags}"));
+    }
+    lines.join("\n")
+}
+
+fn refresh_media_rows(state: &mut ThirdEyeState, store: &AppStore) {
+    match store.media().list_all() {
+        Ok(rows) => {
+            state.media.rows = rows;
+        }
+        Err(err) => {
+            state.media.status_text = format!("Failed to list local media: {err:#}");
+        }
+    }
+    // Refresh the detail panel too, so any background update is reflected.
+    recompute_media_selection_details(state, store);
+}
+
+fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore) {
+    let Some((media_id, name)) = state.media.selected.clone() else {
+        state.media.details_text.clear();
+        state.media.capture_text.clear();
+        state.media.has_capture_meta = false;
+        state.media.local_path.clear();
+        return;
+    };
+    let record = state
+        .media
+        .rows
+        .iter()
+        .find(|r| r.media_id == media_id && r.name == name);
+    match record {
+        Some(record) => {
+            state.media.details_text = build_details_text(record);
+            state.media.local_path = record.local_path.clone().unwrap_or_default();
+        }
+        None => {
+            // Row was pruned (e.g. DB reset); clear selection.
+            state.media.selected = None;
+            state.media.details_text.clear();
+            state.media.local_path.clear();
+        }
+    }
+    match store.media().get_capture_metadata(&media_id, &name) {
+        Ok(Some(meta)) => {
+            state.media.capture_text = build_capture_text(&meta);
+            state.media.has_capture_meta = true;
+        }
+        Ok(None) => {
+            state.media.capture_text.clear();
+            state.media.has_capture_meta = false;
+        }
+        Err(err) => {
+            state.media.capture_text = format!("Failed to load capture metadata: {err:#}");
+            state.media.has_capture_meta = true;
+        }
+    }
+}
+
+fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
+    let selected = state.media.selected.clone();
+    let rows: Vec<MediaRow> = state
+        .media
+        .rows
+        .iter()
+        .map(|r| MediaRow {
+            media_id: r.media_id.clone().into(),
+            name: r.name.clone().into(),
+            size_text: format_bytes(r.size_bytes).into(),
+            seen_text: format!("seen {}", format_relative_age(r.last_seen_ms)).into(),
+            state_text: state_label(r).into(),
+            origin_text: origin_label(r).into(),
+            has_local: r.local_path.is_some(),
+            deleted_on_rov: r.deleted_on_rov,
+            selected: matches!(
+                &selected,
+                Some((id, name)) if id == &r.media_id && name == &r.name
+            ),
+        })
+        .collect();
+    ui.set_media_rows(ModelRc::new(VecModel::from(rows)));
+    ui.set_media_status(state.media.status_text.clone().into());
+    let (sel_id, sel_name) = selected.clone().unwrap_or_default();
+    ui.set_media_selected_id(sel_id.into());
+    ui.set_media_selected_name(sel_name.into());
+    ui.set_media_selected_details(state.media.details_text.clone().into());
+    ui.set_media_selected_capture_text(state.media.capture_text.clone().into());
+    ui.set_media_selected_local_path(state.media.local_path.clone().into());
+    ui.set_media_selected_has_capture_meta(state.media.has_capture_meta);
+    ui.set_media_download_in_progress(state.media.download_in_progress);
 }
 
 fn current_unix_ms() -> i64 {
@@ -1659,6 +2160,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             }
             Err(err) => format!("List medias failed: {err:#}"),
         };
+        refresh_media_rows(&mut state, &store_for_list_medias);
         apply_state_to_ui(&ui, &state);
     });
 
@@ -1700,6 +2202,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     Ok(None) => String::new(),
                     Err(err) => format!("Capture metadata attach failed: {err:#}"),
                 };
+                refresh_media_rows(&mut state, &store_for_capture);
             }
             Err(err) => {
                 state.rov_info = format!("Capture failed: {err:#}");
@@ -1939,6 +2442,210 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.rov_status.stop();
         apply_state_to_ui(&ui, &state);
     });
+
+    // --- Media screen callbacks ---
+
+    let ui_weak = ui.as_weak();
+    let state_for_nav_media = Rc::clone(&state);
+    let store_for_nav_media = Rc::clone(&store);
+    ui.on_navigate_media(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_nav_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_nav_media);
+        refresh_media_rows(&mut state, &store_for_nav_media);
+        if state.media.status_text.is_empty() {
+            state.media.status_text = if state.media.rows.is_empty() {
+                "No media recorded yet. Click \"Refresh from ROV\" to populate.".to_owned()
+            } else {
+                format!(
+                    "{} media record(s) in local library.",
+                    state.media.rows.len()
+                )
+            };
+        }
+        state.active_screen = Screen::Media;
+        state.last_screen = Screen::Media;
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_refresh_media = Rc::clone(&state);
+    let store_for_refresh_media = Rc::clone(&store);
+    ui.on_refresh_media(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_refresh_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_refresh_media);
+        let client = CameraApiClient::new(state.config.rov_http_base.clone());
+        state.media.status_text = match client.list_medias(None::<MediaScene>) {
+            Ok(items) => {
+                match store_for_refresh_media
+                    .media()
+                    .apply_rov_listing(&items, None)
+                {
+                    Ok(report) => format!(
+                        "Refreshed. {} on ROV (new {}, updated {}, newly vanished {}).",
+                        report.total_on_rov,
+                        report.new_media,
+                        report.updated_media,
+                        report.disappeared_media
+                    ),
+                    Err(err) => format!("Refresh succeeded but local update failed: {err:#}"),
+                }
+            }
+            Err(err) => format!("Refresh failed: {err:#}"),
+        };
+        refresh_media_rows(&mut state, &store_for_refresh_media);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_select_media = Rc::clone(&state);
+    let store_for_select_media = Rc::clone(&store);
+    ui.on_select_media(move |media_id, name| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_select_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.media.selected = Some((media_id.to_string(), name.to_string()));
+        recompute_media_selection_details(&mut state, &store_for_select_media);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_download_media = Rc::clone(&state);
+    let store_for_download_media = Rc::clone(&store);
+    ui.on_download_selected_media(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_download_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.media.download_in_progress {
+            return;
+        }
+        let Some((media_id, name)) = state.media.selected.clone() else {
+            state.media.status_text = "Select a media entry first.".to_owned();
+            apply_state_to_ui(&ui, &state);
+            return;
+        };
+        let data_root = match store_for_download_media
+            .data_path()
+            .and_then(|p| p.parent())
+        {
+            Some(dir) => dir.to_path_buf(),
+            None => std::env::temp_dir().join("third-eye-client"),
+        };
+        let camera = CameraApiClient::new(state.config.rov_http_base.clone());
+        let (tx, rx) = mpsc::channel();
+        state.media.download_rx = Some(rx);
+        state.media.download_in_progress = true;
+        state.media.status_text = format!("Downloading {name} from ROV...");
+        // `Rc<AppStore>` isn't `Send`, so hand the worker a cloned
+        // `MediaStore` (which is `Arc<Mutex<...>>`-backed and `Send`).
+        let media_store = store_for_download_media.media().clone();
+        let media_id_thread = media_id.clone();
+        let name_thread = name.clone();
+        thread::spawn(move || {
+            let result = download_to_local(
+                &media_store,
+                &camera,
+                &data_root,
+                &media_id_thread,
+                &name_thread,
+            )
+            .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(DownloadEvent::Finished {
+                media_id: media_id_thread,
+                name: name_thread,
+                result,
+            });
+        });
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_open_media = Rc::clone(&state);
+    ui.on_open_selected_local_media(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_open_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.media.local_path.is_empty() {
+            state.media.status_text = "No local copy for this media yet.".to_owned();
+        } else {
+            match webbrowser::open(&state.media.local_path) {
+                Ok(()) => {
+                    state.media.status_text = format!("Opened {}", state.media.local_path);
+                }
+                Err(err) => {
+                    state.media.status_text = format!("Failed to open local file: {err:#}");
+                }
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+}
+
+/// Polls outstanding download completions and updates the Media screen.
+/// Returns `true` if the UI needs a refresh.
+fn poll_media_downloads(state: &mut ThirdEyeState, store: &AppStore) -> bool {
+    let Some(rx) = state.media.download_rx.as_ref() else {
+        return false;
+    };
+    let mut finished = Vec::new();
+    let mut disconnected = false;
+    loop {
+        match rx.try_recv() {
+            Ok(DownloadEvent::Finished {
+                media_id,
+                name,
+                result,
+            }) => finished.push((media_id, name, result)),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if disconnected {
+        state.media.download_rx = None;
+    }
+    if finished.is_empty() {
+        return false;
+    }
+    state.media.download_in_progress = false;
+    state.media.download_rx = None;
+    for (_id, name, result) in finished {
+        match result {
+            Ok(path) => {
+                state.media.status_text = format!("Downloaded {name} to {}.", path.display());
+            }
+            Err(err) => {
+                state.media.status_text = format!("Download of {name} failed: {err}");
+            }
+        }
+    }
+    refresh_media_rows(state, store);
+    true
 }
 
 fn stream_stderr_loop(
@@ -2155,6 +2862,7 @@ fn main() -> Result<()> {
 
     let ui_weak = ui.as_weak();
     let poll_state = Rc::clone(&state);
+    let poll_store = Rc::clone(&store);
     let stream_poll_timer = slint::Timer::default();
     stream_poll_timer.start(
         slint::TimerMode::Repeated,
@@ -2190,6 +2898,9 @@ fn main() -> Result<()> {
             }
             state.rov_status.poll_events();
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
+            if poll_media_downloads(&mut state, &poll_store) {
+                apply_media_runtime_to_ui(&ui, &state);
+            }
         },
     );
 

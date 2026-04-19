@@ -6,13 +6,15 @@
 //! same ROV, track whether we've downloaded them locally, and annotate them
 //! with capture-time ROV telemetry.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use super::db::SharedDb;
-use crate::camera::{CameraApiClient, MediaInfo, MediaScene};
+use crate::camera::{CameraApiClient, MediaInfo, MediaScene, MediaWhich};
 use crate::rov_status::Status as RovStatus;
 
 /// Outcome of a single reconciliation pass.
@@ -24,15 +26,44 @@ pub struct MediaSyncReport {
     pub total_on_rov: usize,
 }
 
-/// Minimal local projection of a `media_sync` row for UI consumption.
+/// Local projection of a `media_sync` row for UI consumption.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalMediaRecord {
     pub media_id: String,
     pub name: String,
     pub size_bytes: i64,
+    pub duration_s: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub mime: Option<String>,
+    pub scene: Option<i32>,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
     pub local_path: Option<String>,
+    pub local_sha256: Option<String>,
     pub rov_stat: Option<i32>,
     pub deleted_on_rov: bool,
+}
+
+/// Projection of a `capture_metadata` row. All numeric fields are optional
+/// because early captures (before UDP telemetry is running) may not have a
+/// full snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureMetadata {
+    pub media_id: String,
+    pub name: String,
+    pub captured_at_ms: i64,
+    pub pitch: Option<f64>,
+    pub roll: Option<f64>,
+    pub yaw: Option<f64>,
+    pub depth_m: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub lat_e7: Option<i64>,
+    pub lon_e7: Option<i64>,
+    pub batteries_json: Option<String>,
+    pub imu_json: Option<String>,
+    pub note: Option<String>,
+    pub tags_json: Option<String>,
 }
 
 /// Handle onto the media-related tables.
@@ -228,28 +259,160 @@ impl MediaStore {
     /// Returns up to `limit` media records. Most recently seen first.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<LocalMediaRecord>> {
         let conn = self.db.lock().expect("media_sync mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT media_id, name, size_bytes, local_path, rov_stat, deleted_on_rov
-             FROM media_sync
-             ORDER BY last_seen_ms DESC, name ASC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(LocalMediaRecord {
-                media_id: row.get(0)?,
-                name: row.get(1)?,
-                size_bytes: row.get(2)?,
-                local_path: row.get(3)?,
-                rov_stat: row.get(4)?,
-                deleted_on_rov: row.get::<_, i64>(5)? != 0,
-            })
-        })?;
+        let mut stmt = conn.prepare(LIST_QUERY_RECENT)?;
+        let rows = stmt.query_map(params![limit as i64], map_local_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(out)
     }
+
+    /// Returns every row - including `deleted_on_rov` - newest-first. Used by
+    /// the Media screen to render the full library.
+    pub fn list_all(&self) -> Result<Vec<LocalMediaRecord>> {
+        let conn = self.db.lock().expect("media_sync mutex poisoned");
+        let mut stmt = conn.prepare(LIST_QUERY_ALL)?;
+        let rows = stmt.query_map([], map_local_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Reads the capture metadata row for a given media, if any.
+    pub fn get_capture_metadata(
+        &self,
+        media_id: &str,
+        name: &str,
+    ) -> Result<Option<CaptureMetadata>> {
+        let conn = self.db.lock().expect("capture_metadata mutex poisoned");
+        conn.query_row(
+            "SELECT media_id, name, captured_at_ms, pitch, roll, yaw,
+                    depth_m, temperature_c, lat_e7, lon_e7,
+                    batteries_json, imu_json, note, tags_json
+             FROM capture_metadata
+             WHERE media_id = ?1 AND name = ?2",
+            params![media_id, name],
+            |row| {
+                Ok(CaptureMetadata {
+                    media_id: row.get(0)?,
+                    name: row.get(1)?,
+                    captured_at_ms: row.get(2)?,
+                    pitch: row.get(3)?,
+                    roll: row.get(4)?,
+                    yaw: row.get(5)?,
+                    depth_m: row.get(6)?,
+                    temperature_c: row.get(7)?,
+                    lat_e7: row.get(8)?,
+                    lon_e7: row.get(9)?,
+                    batteries_json: row.get(10)?,
+                    imu_json: row.get(11)?,
+                    note: row.get(12)?,
+                    tags_json: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading capture_metadata")
+    }
+
+    /// Marks a media as downloaded and stamps the absolute local path + hash.
+    pub fn set_local_path(
+        &self,
+        media_id: &str,
+        name: &str,
+        local_path: &Path,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.db.lock().expect("media_sync mutex poisoned");
+        let path_str = local_path.to_string_lossy().to_string();
+        let affected = conn
+            .execute(
+                "UPDATE media_sync
+                    SET local_path = ?3, local_sha256 = ?4
+                  WHERE media_id = ?1 AND name = ?2",
+                params![media_id, name, path_str, sha256],
+            )
+            .context("updating media_sync local_path")?;
+        if affected == 0 {
+            anyhow::bail!("no media_sync row for ({media_id}, {name})");
+        }
+        Ok(())
+    }
+
+    /// Clears `local_path` / `local_sha256` when the local copy is gone.
+    pub fn forget_local(&self, media_id: &str, name: &str) -> Result<()> {
+        let conn = self.db.lock().expect("media_sync mutex poisoned");
+        conn.execute(
+            "UPDATE media_sync
+                SET local_path = NULL, local_sha256 = NULL
+              WHERE media_id = ?1 AND name = ?2",
+            params![media_id, name],
+        )
+        .context("clearing media_sync local_path")?;
+        Ok(())
+    }
+}
+
+const LIST_SELECT: &str =
+    "SELECT media_id, name, size_bytes, duration_s, width, height, mime, scene,
+            first_seen_ms, last_seen_ms, local_path, local_sha256, rov_stat, deleted_on_rov
+     FROM media_sync
+     ORDER BY last_seen_ms DESC, name ASC";
+
+const LIST_QUERY_RECENT: &str = concat!(
+    "SELECT media_id, name, size_bytes, duration_s, width, height, mime, scene,\n",
+    "       first_seen_ms, last_seen_ms, local_path, local_sha256, rov_stat, deleted_on_rov\n",
+    "FROM media_sync\n",
+    "ORDER BY last_seen_ms DESC, name ASC\n",
+    "LIMIT ?1",
+);
+
+const LIST_QUERY_ALL: &str = LIST_SELECT;
+
+fn map_local_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMediaRecord> {
+    Ok(LocalMediaRecord {
+        media_id: row.get(0)?,
+        name: row.get(1)?,
+        size_bytes: row.get(2)?,
+        duration_s: row.get(3)?,
+        width: row.get(4)?,
+        height: row.get(5)?,
+        mime: row.get(6)?,
+        scene: row.get(7)?,
+        first_seen_ms: row.get(8)?,
+        last_seen_ms: row.get(9)?,
+        local_path: row.get(10)?,
+        local_sha256: row.get(11)?,
+        rov_stat: row.get(12)?,
+        deleted_on_rov: row.get::<_, i64>(13)? != 0,
+    })
+}
+
+/// Downloads `name` (original variant) from the ROV camera and stores it at
+/// `<data_root>/media/<media_id>/<name>`. Returns the absolute on-disk path.
+pub fn download_to_local(
+    store: &MediaStore,
+    camera: &CameraApiClient,
+    data_root: &Path,
+    media_id: &str,
+    name: &str,
+) -> Result<PathBuf> {
+    let payload = camera
+        .download_media(name, MediaWhich::Original)
+        .with_context(|| format!("downloading {name} from camera"))?;
+    let dir = data_root.join("media").join(media_id);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let target = dir.join(name);
+    std::fs::write(&target, &payload.bytes)
+        .with_context(|| format!("writing {}", target.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&payload.bytes);
+    let sha_hex = format!("{:x}", hasher.finalize());
+    store.set_local_path(media_id, name, &target, Some(&sha_hex))?;
+    Ok(target)
 }
 
 fn guess_mime(name: &str) -> Option<String> {
@@ -377,6 +540,109 @@ mod tests {
                 Some("n"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn set_local_path_roundtrip() {
+        let db = open_in_memory().unwrap();
+        let store = MediaStore::new(Arc::clone(&db));
+        store
+            .apply_rov_listing(&[info("id-a", "a.jpeg", 100)], None)
+            .unwrap();
+        let path = std::path::Path::new("/tmp/a.jpeg");
+        store
+            .set_local_path("id-a", "a.jpeg", path, Some("deadbeef"))
+            .unwrap();
+        let rec = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.media_id == "id-a")
+            .unwrap();
+        assert_eq!(rec.local_path.as_deref(), Some("/tmp/a.jpeg"));
+        assert_eq!(rec.local_sha256.as_deref(), Some("deadbeef"));
+        store.forget_local("id-a", "a.jpeg").unwrap();
+        let rec = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.media_id == "id-a")
+            .unwrap();
+        assert!(rec.local_path.is_none());
+        assert!(rec.local_sha256.is_none());
+    }
+
+    #[test]
+    fn set_local_path_errors_on_missing_row() {
+        let db = open_in_memory().unwrap();
+        let store = MediaStore::new(db);
+        let err = store
+            .set_local_path(
+                "missing",
+                "missing.jpeg",
+                std::path::Path::new("/tmp/x"),
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("no media_sync row"));
+    }
+
+    #[test]
+    fn get_capture_metadata_returns_row() {
+        let db = open_in_memory().unwrap();
+        let store = MediaStore::new(Arc::clone(&db));
+        store
+            .apply_rov_listing(&[info("id-a", "a.jpeg", 100)], None)
+            .unwrap();
+        let status = sample_status();
+        store
+            .attach_capture_metadata(
+                "id-a",
+                "a.jpeg",
+                1_700_000_000_000,
+                Some(&status),
+                Some("initial"),
+            )
+            .unwrap();
+        let meta = store
+            .get_capture_metadata("id-a", "a.jpeg")
+            .unwrap()
+            .unwrap();
+        // `Status.depth` is stored as f32 then widened to f64, so check with
+        // an epsilon rather than a strict equality.
+        let depth = meta.depth_m.unwrap();
+        assert!((depth - 12.34).abs() < 1e-3, "got depth {depth}");
+        assert_eq!(meta.lat_e7, Some(455_012_345));
+        assert_eq!(meta.note.as_deref(), Some("initial"));
+        assert!(meta.imu_json.is_some());
+
+        // Unknown media returns None.
+        assert!(
+            store
+                .get_capture_metadata("id-missing", "x.jpeg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_all_includes_deleted_rows() {
+        let db = open_in_memory().unwrap();
+        let store = MediaStore::new(Arc::clone(&db));
+        store
+            .apply_rov_listing(
+                &[info("id-a", "a.jpeg", 1), info("id-b", "b.jpeg", 2)],
+                None,
+            )
+            .unwrap();
+        // Second pass without `id-b` flags it as deleted_on_rov.
+        store
+            .apply_rov_listing(&[info("id-a", "a.jpeg", 3)], None)
+            .unwrap();
+        let rows = store.list_all().unwrap();
+        assert_eq!(rows.len(), 2);
+        let b = rows.iter().find(|r| r.media_id == "id-b").unwrap();
+        assert!(b.deleted_on_rov);
     }
 
     #[test]
