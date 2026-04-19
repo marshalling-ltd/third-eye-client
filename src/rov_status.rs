@@ -6,14 +6,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const ROV_STATUS_UDP_PORT: u16 = 8500;
 const ROV_STATUS_PACKET_ID: u8 = 0x03;
 const ROV_STATUS_PACKET_TYPE: u8 = 0x01;
 const ROV_STATUS_PACKET_HEADER_SIZE: usize = 12;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Status {
     #[serde(rename = "pitch")]
     pub pitch: f32,
@@ -35,7 +35,7 @@ pub struct Status {
     pub imu: Imu,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Battery {
     #[serde(rename = "id")]
     pub id: u8,
@@ -47,7 +47,7 @@ pub struct Battery {
     pub remaining: u8,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Imu {
     #[serde(rename = "gx")]
     pub gyro_x: i16,

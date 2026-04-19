@@ -172,24 +172,13 @@ impl MapTilesState {
         self.clamp_offset_to_world(zoom_level);
     }
 
-    pub fn set_offset_from_viewport(
-        &mut self,
-        viewport_x: f64,
-        viewport_y: f64,
-        zoom_level: u32,
-    ) {
+    pub fn set_offset_from_viewport(&mut self, viewport_x: f64, viewport_y: f64, zoom_level: u32) {
         self.offset_x = -viewport_x;
         self.offset_y = -viewport_y;
         self.clamp_offset_to_world(zoom_level);
     }
 
-    pub fn set_zoom_level(
-        &mut self,
-        current_zoom: u32,
-        new_zoom: u32,
-        focus_x: f64,
-        focus_y: f64,
-    ) {
+    pub fn set_zoom_level(&mut self, current_zoom: u32, new_zoom: u32, focus_x: f64, focus_y: f64) {
         if current_zoom == new_zoom {
             return;
         }
@@ -284,9 +273,8 @@ impl MapTilesState {
     pub fn request_visible_tiles(&mut self, zoom_level: u32, user_agent: &str) {
         const MAX_TILE_CACHE: usize = 500;
         if self.tile_cache.len() > MAX_TILE_CACHE {
-            self.tile_cache.retain(|c, _| {
-                (c.z as i32 - zoom_level as i32).unsigned_abs() <= 2
-            });
+            self.tile_cache
+                .retain(|c, _| (c.z as i32 - zoom_level as i32).unsigned_abs() <= 2);
         }
         let (min_x, min_y, max_x, max_y, world_tiles) =
             self.visible_tile_bounds(zoom_level, zoom_level);
@@ -430,7 +418,6 @@ impl MapTilesState {
             })
             .collect()
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -461,8 +448,26 @@ pub fn compute_scale_bar(zoom: u32, lat: f64) -> (f32, String) {
     let exact_meters = BAR_PX as f64 * meters_per_pixel;
 
     const NICE_DISTANCES: &[f64] = &[
-        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0,
-        10_000.0, 20_000.0, 50_000.0, 100_000.0, 200_000.0, 500_000.0, 1_000_000.0, 2_000_000.0,
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        20.0,
+        50.0,
+        100.0,
+        200.0,
+        500.0,
+        1_000.0,
+        2_000.0,
+        5_000.0,
+        10_000.0,
+        20_000.0,
+        50_000.0,
+        100_000.0,
+        200_000.0,
+        500_000.0,
+        1_000_000.0,
+        2_000_000.0,
     ];
 
     let scale_meters = NICE_DISTANCES

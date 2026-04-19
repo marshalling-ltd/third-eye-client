@@ -15,18 +15,21 @@ use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
 use map::corelocation_debug_status;
 use map::{
-    MapState, MapTilesState, RgbaFrame, ViewportAnimation, compute_scale_bar, detect_location,
-    ease_out_cubic, lat_lon_to_world_px, rgba_frame_to_slint_image, DEFAULT_OSM_TILE_USER_AGENT,
-    DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM,
+    DEFAULT_OSM_TILE_USER_AGENT, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, MapState, MapTilesState,
+    RgbaFrame, ViewportAnimation, compute_scale_bar, detect_location, ease_out_cubic,
+    lat_lon_to_world_px, rgba_frame_to_slint_image,
 };
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaScene, PhotoFormat};
-use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, UdpStatusState};
+use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
+use third_eye_client::storage::AppStore;
+use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
+const DEFAULT_SERVER_BASE_URL: &str = "https://third-eye.marshalling.eu";
 
 slint::slint! {
 import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
@@ -54,6 +57,17 @@ export component AppWindow inherits Window {
     in-out property <string> rov_status_udp_port;
     in-out property <string> osm_tile_user_agent;
     in-out property <string> rov_info;
+
+    // Server account (third-eye backend).
+    in-out property <string> server_base_url;
+    in-out property <string> auth_email;
+    in-out property <string> auth_password;
+    in-out property <string> auth_status_text;
+    in-out property <string> auth_signed_in_as;
+    in-out property <bool> auth_is_signed_in: false;
+
+    // Per-capture ROV telemetry summary surfaced after a successful capture.
+    in-out property <string> attached_metadata_text;
 
     in-out property <string> map_status;
     in-out property <string> corelocation_debug;
@@ -98,6 +112,10 @@ export component AppWindow inherits Window {
 
     callback list_medias();
     callback capture_photo();
+
+    callback sign_in();
+    callback sign_out();
+    callback use_default_server_base_url();
 
     callback detect_location(length, length);
     callback load_map_tile(length, length);
@@ -280,6 +298,49 @@ export component AppWindow inherits Window {
                     }
 
                     Text { text: root.rov_info; wrap: word-wrap; }
+                    if root.attached_metadata_text != "" : Text {
+                        text: root.attached_metadata_text;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Server account"; font-size: 18px; }
+                    Text {
+                        text: "Sign in to https://third-eye.marshalling.eu for media syncing and status uploads.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "Server base URL:"; }
+                    LineEdit { text <=> root.server_base_url; }
+                    Button {
+                        text: "Use default server URL";
+                        clicked => { root.use_default_server_base_url(); }
+                    }
+                    Text { text: "Email:"; }
+                    LineEdit { text <=> root.auth_email; }
+                    Text { text: "Password:"; }
+                    LineEdit {
+                        text <=> root.auth_password;
+                        input-type: password;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Sign in";
+                            enabled: !root.auth_is_signed_in;
+                            clicked => { root.sign_in(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Sign out";
+                            enabled: root.auth_is_signed_in;
+                            clicked => { root.sign_out(); }
+                        }
+                    }
+                    if root.auth_is_signed_in : Text {
+                        text: "Signed in as " + root.auth_signed_in_as;
+                    }
+                    Text { text: root.auth_status_text; wrap: word-wrap; }
                 }
 
                 if root.active_screen == 2 : VerticalBox {
@@ -695,6 +756,7 @@ struct AppConfig {
     rov_status_udp_bind_host: String,
     rov_status_udp_port: String,
     osm_tile_user_agent: String,
+    server_base_url: String,
 }
 
 impl Default for AppConfig {
@@ -705,6 +767,7 @@ impl Default for AppConfig {
             rov_status_udp_bind_host: default_rov_udp_bind_host(),
             rov_status_udp_port: ROV_STATUS_UDP_PORT.to_string(),
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
+            server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
         }
     }
 }
@@ -720,7 +783,54 @@ impl AppConfig {
         }
         Ok(port)
     }
+
+    fn to_client_config(&self) -> ClientConfig {
+        ClientConfig {
+            rtsp_url: self.rtsp_url.clone(),
+            rov_http_base: self.rov_http_base.clone(),
+            rov_udp_bind_host: self.rov_status_udp_bind_host.clone(),
+            rov_udp_port: self.rov_status_udp_port.clone(),
+            osm_tile_user_agent: self.osm_tile_user_agent.clone(),
+            server_base_url: self.server_base_url.clone(),
+        }
+    }
+
+    fn from_client_config(config: ClientConfig) -> Self {
+        Self {
+            rtsp_url: config.rtsp_url,
+            rov_http_base: config.rov_http_base,
+            rov_status_udp_bind_host: config.rov_udp_bind_host,
+            rov_status_udp_port: config.rov_udp_port,
+            osm_tile_user_agent: config.osm_tile_user_agent,
+            server_base_url: config.server_base_url,
+        }
+    }
 }
+
+fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
+    let udp_bind_host = default_rov_udp_bind_host();
+    // Leak the default bind host so we can hand out a `&'static str` into
+    // `ClientConfigDefaults`. This is called once at startup.
+    let udp_bind_static: &'static str = Box::leak(udp_bind_host.into_boxed_str());
+    let defaults = ClientConfigDefaults {
+        rtsp_url: DEFAULT_TEST_RTSP,
+        rov_http_base: DEFAULT_ROV_HTTP_BASE,
+        rov_udp_bind_host: udp_bind_static,
+        rov_udp_port: UDP_PORT_DEFAULT_STR,
+        osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT,
+        server_base_url: DEFAULT_SERVER_BASE_URL,
+    };
+    (udp_bind_static.to_owned(), defaults)
+}
+
+// String form of `ROV_STATUS_UDP_PORT` known at compile time for use with
+// `ClientConfigDefaults` (which stores `&'static str`).
+const UDP_PORT_DEFAULT_STR: &str = "8500";
+const _: () = {
+    // Compile-time check that the string matches the real constant. If the
+    // constant ever changes, this will prevent a silent drift.
+    assert!(ROV_STATUS_UDP_PORT == 8500);
+};
 
 fn parse_host_from_http_base(base: &str) -> Option<String> {
     let normalized = if base.contains("://") {
@@ -737,7 +847,14 @@ fn default_rov_udp_bind_host() -> String {
     parse_host_from_http_base(DEFAULT_ROV_HTTP_BASE).unwrap_or_else(|| "0.0.0.0".to_owned())
 }
 
-
+#[derive(Default)]
+struct AuthUiState {
+    email: String,
+    password: String,
+    status_text: String,
+    signed_in_as: String,
+    is_signed_in: bool,
+}
 
 struct ThirdEyeState {
     active_screen: Screen,
@@ -750,15 +867,46 @@ struct ThirdEyeState {
     stream: StreamState,
     rov_status: UdpStatusState,
     viewport_anim: Option<ViewportAnimation>,
+    auth: AuthUiState,
+    attached_metadata_text: String,
 }
 
 impl ThirdEyeState {
-    fn new() -> Self {
+    fn new(store: &AppStore) -> Self {
+        let (_bind_owned, defaults) = client_config_defaults();
+        let client_config = store.config().load_client(&defaults).unwrap_or_else(|err| {
+            eprintln!("failed to load persisted config, falling back to defaults: {err:#}");
+            ClientConfig {
+                rtsp_url: defaults.rtsp_url.to_owned(),
+                rov_http_base: defaults.rov_http_base.to_owned(),
+                rov_udp_bind_host: defaults.rov_udp_bind_host.to_owned(),
+                rov_udp_port: defaults.rov_udp_port.to_owned(),
+                osm_tile_user_agent: defaults.osm_tile_user_agent.to_owned(),
+                server_base_url: defaults.server_base_url.to_owned(),
+            }
+        });
+
+        let mut auth = AuthUiState::default();
+        match store.auth().current_session() {
+            Ok(Some(session)) => {
+                auth.is_signed_in = true;
+                auth.signed_in_as = session.email.unwrap_or_default();
+                auth.email = auth.signed_in_as.clone();
+                auth.status_text = "Signed in. Session restored from storage.".to_owned();
+            }
+            Ok(None) => {
+                auth.status_text = "Not signed in. Enter credentials to authenticate.".to_owned();
+            }
+            Err(err) => {
+                auth.status_text = format!("Failed to read auth session: {err:#}");
+            }
+        }
+
         Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
             suppress_next_map_flick: false,
-            config: AppConfig::default(),
+            config: AppConfig::from_client_config(client_config),
             map: MapState {
                 zoom: DEFAULT_ZOOM,
                 ..MapState::default()
@@ -768,6 +916,8 @@ impl ThirdEyeState {
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
             viewport_anim: None,
+            auth,
+            attached_metadata_text: String::new(),
         }
     }
 
@@ -864,7 +1014,6 @@ impl ThirdEyeState {
         self.request_visible_map_tiles();
     }
 }
-
 
 #[derive(Default)]
 struct StreamState {
@@ -979,7 +1128,14 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_rov_status_udp_bind_host(state.config.rov_status_udp_bind_host.clone().into());
     ui.set_rov_status_udp_port(state.config.rov_status_udp_port.clone().into());
     ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
+    ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
+    ui.set_auth_email(state.auth.email.clone().into());
+    ui.set_auth_password(state.auth.password.clone().into());
+    ui.set_auth_status_text(state.auth.status_text.clone().into());
+    ui.set_auth_signed_in_as(state.auth.signed_in_as.clone().into());
+    ui.set_auth_is_signed_in(state.auth.is_signed_in);
+    ui.set_attached_metadata_text(state.attached_metadata_text.clone().into());
     apply_map_runtime_to_ui(ui, state);
     apply_stream_and_rov_runtime_to_ui(ui, state);
 }
@@ -1104,17 +1260,70 @@ fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     }
 }
 
-fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState) {
+fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: &AppStore) {
     state.config.rtsp_url = ui.get_rtsp_url().to_string();
     state.config.rov_http_base = ui.get_rov_http_base().to_string();
     state.config.rov_status_udp_bind_host = ui.get_rov_status_udp_bind_host().to_string();
     state.config.rov_status_udp_port = ui.get_rov_status_udp_port().to_string();
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
+    state.config.server_base_url = ui.get_server_base_url().to_string();
+    state.auth.email = ui.get_auth_email().to_string();
+    state.auth.password = ui.get_auth_password().to_string();
+    if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
+        eprintln!("failed to persist configuration: {err:#}");
+    }
 }
 
-fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
+fn persist_config(state: &ThirdEyeState, store: &AppStore) {
+    if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
+        eprintln!("failed to persist configuration: {err:#}");
+    }
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Reconciles the ROV media list and writes a `capture_metadata` row for the
+/// file that was most recently seen. Returns the summary text the UI should
+/// render, or `None` if nothing could be attached.
+fn attach_capture_metadata_to_latest(
+    client: &CameraApiClient,
+    store: &AppStore,
+    status: Option<&RovUdpStatus>,
+    captured_at_ms: i64,
+) -> Result<Option<String>> {
+    let items = client.list_medias(None::<MediaScene>)?;
+    store.media().apply_rov_listing(&items, None)?;
+    let Some(latest) = store.media().list_recent(1)?.into_iter().next() else {
+        return Ok(None);
+    };
+    store.media().attach_capture_metadata(
+        &latest.media_id,
+        &latest.name,
+        captured_at_ms,
+        status,
+        None,
+    )?;
+    let mut line = format!("Attached capture metadata to {}.", latest.name);
+    if let Some(status) = status {
+        line.push_str(&format!(
+            " depth {:.2} m, yaw {:.2} rad, lat_e7={}, lon_e7={}",
+            status.depth, status.yaw, status.lat, status.lon
+        ));
+    } else {
+        line.push_str(" (no ROV telemetry snapshot was available - start the UDP listener to capture depth/yaw/coords)");
+    }
+    Ok(Some(line))
+}
+
+fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: Rc<AppStore>) {
     let ui_weak = ui.as_weak();
     let state_for_configuration = Rc::clone(&state);
+    let store_for_configuration = Rc::clone(&store);
     ui.on_navigate_configuration(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1123,7 +1332,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_configuration);
         state.active_screen = Screen::Configuration;
         state.last_screen = Screen::Configuration;
         apply_state_to_ui(&ui, &state);
@@ -1231,7 +1440,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
                     }
                 }
             }
-            let (target_vp_x, target_vp_y, _, _) = state.map_tiles.viewport_for_slint(state.map.zoom);
+            let (target_vp_x, target_vp_y, _, _) =
+                state.map_tiles.viewport_for_slint(state.map.zoom);
             if (old_vp_x - target_vp_x).abs() > 1.0 || (old_vp_y - target_vp_y).abs() > 1.0 {
                 state.viewport_anim = Some(ViewportAnimation {
                     start_vp_x: old_vp_x,
@@ -1249,6 +1459,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_map_navigation = Rc::clone(&state);
+    let store_for_map_navigation = Rc::clone(&store);
     ui.on_navigate_map(move |content_width, content_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1257,7 +1468,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_map_navigation);
         state.active_screen = Screen::Map;
         // Map fills the entire content panel
         let est_width = (content_width as f64).max(320.0);
@@ -1271,6 +1482,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_stream_navigation = Rc::clone(&state);
+    let store_for_stream_navigation = Rc::clone(&store);
     ui.on_navigate_stream(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1279,7 +1491,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_stream_navigation);
         state.active_screen = Screen::Stream;
         state.last_screen = Screen::Stream;
         apply_state_to_ui(&ui, &state);
@@ -1287,6 +1499,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_default_test_rtsp = Rc::clone(&state);
+    let store_for_default_test_rtsp = Rc::clone(&store);
     ui.on_use_default_test_rtsp(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1296,11 +1509,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         state.config.rtsp_url = DEFAULT_TEST_RTSP.to_owned();
+        persist_config(&state, &store_for_default_test_rtsp);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_default_rov_rtsp = Rc::clone(&state);
+    let store_for_default_rov_rtsp = Rc::clone(&store);
     ui.on_use_default_rov_rtsp(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1310,11 +1525,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         state.config.rtsp_url = DEFAULT_ROV_RTSP.to_owned();
+        persist_config(&state, &store_for_default_rov_rtsp);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_default_rov_http = Rc::clone(&state);
+    let store_for_default_rov_http = Rc::clone(&store);
     ui.on_use_default_rov_http_base(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1325,11 +1542,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
         };
         state.config.rov_http_base = DEFAULT_ROV_HTTP_BASE.to_owned();
         state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
+        persist_config(&state, &store_for_default_rov_http);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_use_host_from_base = Rc::clone(&state);
+    let store_for_use_host_from_base = Rc::clone(&store);
     ui.on_use_host_from_rov_http_base(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1338,17 +1557,19 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_use_host_from_base);
         if let Some(host) = parse_host_from_http_base(&state.config.rov_http_base) {
             state.config.rov_status_udp_bind_host = host;
         } else {
             state.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
         }
+        persist_config(&state, &store_for_use_host_from_base);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_default_rov_udp_port = Rc::clone(&state);
+    let store_for_default_rov_udp_port = Rc::clone(&store);
     ui.on_use_default_rov_status_udp_port(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1358,11 +1579,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         state.config.rov_status_udp_port = ROV_STATUS_UDP_PORT.to_string();
+        persist_config(&state, &store_for_default_rov_udp_port);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_default_osm_ua = Rc::clone(&state);
+    let store_for_default_osm_ua = Rc::clone(&store);
     ui.on_use_default_osm_tile_user_agent(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1372,11 +1595,29 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Err(_) => return,
         };
         state.config.osm_tile_user_agent = DEFAULT_OSM_TILE_USER_AGENT.to_owned();
+        persist_config(&state, &store_for_default_osm_ua);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_server_url = Rc::clone(&state);
+    let store_for_default_server_url = Rc::clone(&store);
+    ui.on_use_default_server_base_url(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_server_url.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.server_base_url = DEFAULT_SERVER_BASE_URL.to_owned();
+        persist_config(&state, &store_for_default_server_url);
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_list_medias = Rc::clone(&state);
+    let store_for_list_medias = Rc::clone(&store);
     ui.on_list_medias(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1385,11 +1626,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_list_medias);
         let client = CameraApiClient::new(state.config.rov_http_base.clone());
         state.rov_info = match client.list_medias(None::<MediaScene>) {
             Ok(items) => {
-                if items.is_empty() {
+                let rendered = if items.is_empty() {
                     "No media files on camera.".to_owned()
                 } else {
                     let mut lines = vec![format!("Media files ({}):", items.len())];
@@ -1402,6 +1643,18 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
                         ));
                     }
                     lines.join("\n")
+                };
+                match store_for_list_medias
+                    .media()
+                    .apply_rov_listing(&items, None)
+                {
+                    Ok(report) => format!(
+                        "{rendered}\n[sync] new={}, updated={}, disappeared_now={}",
+                        report.new_media, report.updated_media, report.disappeared_media
+                    ),
+                    Err(err) => {
+                        format!("{rendered}\n[sync] failed to update local registry: {err:#}")
+                    }
                 }
             }
             Err(err) => format!("List medias failed: {err:#}"),
@@ -1411,6 +1664,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_capture = Rc::clone(&state);
+    let store_for_capture = Rc::clone(&store);
     ui.on_capture_photo(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1419,20 +1673,116 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_capture);
+
+        // Snapshot the latest ROV telemetry *before* the capture call so we
+        // attribute the correct depth/attitude/coords to the image.
+        let status_snapshot: Option<RovUdpStatus> = state.rov_status.latest_status().cloned();
+        let captured_at_ms = current_unix_ms();
+
         let client = CameraApiClient::new(state.config.rov_http_base.clone());
-        state.rov_info = match client.capture(PhotoFormat::Jpeg, 1) {
+        match client.capture(PhotoFormat::Jpeg, 1) {
             Ok(resp) => {
                 let msg = resp.msg.as_deref().unwrap_or("success");
-                format!("Capture request sent successfully: {msg}")
+                state.rov_info = format!("Capture request sent successfully: {msg}");
+                // Give the camera a brief moment to materialise the file, then
+                // reconcile the media list and attach the telemetry snapshot
+                // to the newest row.
+                std::thread::sleep(Duration::from_millis(400));
+                let attach_result = attach_capture_metadata_to_latest(
+                    &client,
+                    &store_for_capture,
+                    status_snapshot.as_ref(),
+                    captured_at_ms,
+                );
+                state.attached_metadata_text = match attach_result {
+                    Ok(Some(line)) => line,
+                    Ok(None) => String::new(),
+                    Err(err) => format!("Capture metadata attach failed: {err:#}"),
+                };
             }
-            Err(err) => format!("Capture failed: {err:#}"),
+            Err(err) => {
+                state.rov_info = format!("Capture failed: {err:#}");
+                state.attached_metadata_text = String::new();
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_sign_in = Rc::clone(&state);
+    let store_for_sign_in = Rc::clone(&store);
+    ui.on_sign_in(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
         };
+        let mut state = match state_for_sign_in.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_sign_in);
+        let email = state.auth.email.trim().to_owned();
+        let password = state.auth.password.clone();
+        let server_base = state.config.server_base_url.trim().to_owned();
+        if email.is_empty() || password.is_empty() {
+            state.auth.status_text = "Email and password are required to sign in.".to_owned();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        match store_for_sign_in
+            .auth()
+            .login(&server_base, &email, &password)
+        {
+            Ok(outcome) => {
+                state.auth.is_signed_in = true;
+                state.auth.signed_in_as = outcome.email.clone();
+                // The "Signed in as <email>" line is rendered from
+                // `auth_signed_in_as`; keep the status line complementary so
+                // the UI doesn't print the email twice.
+                state.auth.status_text = "Signed in successfully.".to_owned();
+                // Do NOT keep the plaintext password in the state or UI.
+                state.auth.password.clear();
+            }
+            Err(err) => {
+                state.auth.is_signed_in = false;
+                state.auth.status_text = format!("Sign in failed: {err}");
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_sign_out = Rc::clone(&state);
+    let store_for_sign_out = Rc::clone(&store);
+    ui.on_sign_out(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_sign_out.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_sign_out);
+        let server_base = state.config.server_base_url.trim().to_owned();
+        match store_for_sign_out.auth().logout(&server_base) {
+            Ok(()) => {
+                state.auth.is_signed_in = false;
+                state.auth.signed_in_as.clear();
+                state.auth.status_text = "Signed out.".to_owned();
+            }
+            Err(err) => {
+                // Local session is cleared inside `logout` even on error.
+                state.auth.is_signed_in = false;
+                state.auth.signed_in_as.clear();
+                state.auth.status_text = format!("Signed out locally (server: {err}).");
+            }
+        }
         apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
     let state_for_detect_location = Rc::clone(&state);
+    let store_for_detect_location = Rc::clone(&store);
     ui.on_detect_location(move |viewport_width, viewport_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1441,7 +1791,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_detect_location);
         state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
         match detect_location(&mut state.map) {
             Ok(location) => {
@@ -1464,6 +1814,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_load_map_tile = Rc::clone(&state);
+    let store_for_load_map_tile = Rc::clone(&store);
     ui.on_load_map_tile(move |viewport_width, viewport_height| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1472,7 +1823,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_load_map_tile);
         state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
         state.load_map_tile_for_current_location(
             "Loaded OpenStreetMap tile for detected location.".to_owned(),
@@ -1508,6 +1859,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_start_stream = Rc::clone(&state);
+    let store_for_start_stream = Rc::clone(&store);
     ui.on_start_stream(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1516,7 +1868,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_start_stream);
         state.stream.stop();
         let rtsp_url = state.config.rtsp_url.clone();
         state.stream.status = match state.stream.start(rtsp_url) {
@@ -1544,6 +1896,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
 
     let ui_weak = ui.as_weak();
     let state_for_start_rov_listener = Rc::clone(&state);
+    let store_for_start_rov_listener = Rc::clone(&store);
     ui.on_start_rov_status_listener(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -1552,7 +1905,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>) {
             Ok(state) => state,
             Err(_) => return,
         };
-        pull_configuration_from_ui(&ui, &mut state);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_start_rov_listener);
         state.rov_status.stop();
         let port = match state.config.parse_rov_status_udp_port() {
             Ok(port) => port,
@@ -1781,7 +2134,16 @@ fn configure_slint_style() {
 fn main() -> Result<()> {
     configure_slint_style();
     let ui = AppWindow::new().context("failed to initialize Slint window")?;
-    let state = Rc::new(RefCell::new(ThirdEyeState::new()));
+    let store = Rc::new(match AppStore::open() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "third-eye-client: failed to open persistent storage ({err:#}); falling back to in-memory store"
+            );
+            AppStore::open_in_memory().context("opening in-memory fallback AppStore")?
+        }
+    });
+    let state = Rc::new(RefCell::new(ThirdEyeState::new(&store)));
     state.borrow_mut().initialize_location_on_startup();
 
     {
@@ -1789,7 +2151,7 @@ fn main() -> Result<()> {
         apply_state_to_ui(&ui, &state);
     }
 
-    register_callbacks(&ui, Rc::clone(&state));
+    register_callbacks(&ui, Rc::clone(&state), Rc::clone(&store));
 
     let ui_weak = ui.as_weak();
     let poll_state = Rc::clone(&state);
@@ -1838,6 +2200,7 @@ fn main() -> Result<()> {
         state.stream.stop();
         state.rov_status.stop();
     }
+    store.shutdown();
 
     Ok(())
 }
