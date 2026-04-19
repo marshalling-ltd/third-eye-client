@@ -511,9 +511,8 @@ impl CameraApiClient {
             let body = response.text().unwrap_or_default();
             anyhow::bail!(format_legacy_error("set lamp brightness", status, &body));
         }
-        let envelope: LampEnvelope<serde_json::Value> = response
-            .json()
-            .context("invalid lamp JSON payload")?;
+        let envelope: LampEnvelope<serde_json::Value> =
+            response.json().context("invalid lamp JSON payload")?;
         check_lamp_status("set lamp brightness", &envelope)?;
         Ok(())
     }
