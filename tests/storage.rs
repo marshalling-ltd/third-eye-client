@@ -5,8 +5,10 @@
 
 use std::path::PathBuf;
 
+use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaOrigin};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
+use third_eye_client::storage::media::download_to_local;
 use third_eye_client::storage::outbox::OutboxRequest;
 
 const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
@@ -103,4 +105,75 @@ fn media_sync_is_idempotent_across_reopens() {
     assert_eq!(report.updated_media, 1);
     assert_eq!(store.media().list_recent(10).unwrap().len(), 1);
     let _ = std::fs::remove_file(&path);
+}
+
+fn media_info(name: &str, id: &str, size: u64) -> MediaInfo {
+    MediaInfo {
+        name: name.into(),
+        size,
+        canplayback: false,
+        origin: MediaOrigin {
+            width: 0,
+            height: 0,
+            duration: 0,
+            fps: 0,
+            br: 0,
+            multi: 0,
+            with_osd: false,
+            id: id.into(),
+            stat: 0,
+        },
+        play: None,
+        osd: None,
+    }
+}
+
+#[test]
+fn download_to_local_writes_file_and_updates_row() {
+    let mut server = mockito::Server::new();
+    let payload = b"fake-jpeg-bytes".to_vec();
+    let download = server
+        .mock("GET", "/v1/medias/a.jpeg/download")
+        .with_status(200)
+        .with_header("content-type", "image/jpeg")
+        .with_body(payload.clone())
+        .create();
+
+    let db_path = make_db_path("download-to-local");
+    let data_root = db_path.parent().unwrap().to_path_buf();
+    let store = AppStore::open_at(&db_path).unwrap();
+    // Seed the media_sync row that `download_to_local` will update.
+    store
+        .media()
+        .apply_rov_listing(&[media_info("a.jpeg", "id-a", payload.len() as u64)], None)
+        .unwrap();
+
+    let camera = CameraApiClient::new(server.url());
+    let local = download_to_local(store.media(), &camera, &data_root, "id-a", "a.jpeg")
+        .expect("download succeeds");
+    download.assert();
+
+    // File exists with the exact bytes mockito served.
+    assert_eq!(std::fs::read(&local).unwrap(), payload);
+    assert!(local.to_string_lossy().contains("/media/id-a/a.jpeg"));
+
+    // media_sync row was updated with the local path and SHA.
+    let rec = store
+        .media()
+        .list_recent(10)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.media_id == "id-a")
+        .unwrap();
+    assert_eq!(
+        rec.local_path.as_deref(),
+        Some(local.to_string_lossy().as_ref())
+    );
+    assert!(rec.local_sha256.as_ref().is_some_and(|h| h.len() == 64));
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_dir(local.parent().unwrap());
+    let _ = std::fs::remove_dir(data_root.join("media"));
+    let _ = std::fs::remove_file(&db_path);
 }
