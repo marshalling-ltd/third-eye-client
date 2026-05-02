@@ -18,6 +18,7 @@ pub mod keys {
     pub const ROV_UDP_PORT: &str = "client.rov_udp_port";
     pub const OSM_TILE_USER_AGENT: &str = "client.osm_tile_user_agent";
     pub const SERVER_BASE_URL: &str = "server.base_url";
+    pub const ROV_NETWORK_INTERFACE: &str = "client.rov_network_interface";
 }
 
 /// Persisted configuration accessor.
@@ -81,6 +82,8 @@ impl ConfigStore {
             osm_tile_user_agent: self
                 .get_or(keys::OSM_TILE_USER_AGENT, defaults.osm_tile_user_agent)?,
             server_base_url: self.get_or(keys::SERVER_BASE_URL, defaults.server_base_url)?,
+            rov_network_interface: self
+                .get_or(keys::ROV_NETWORK_INTERFACE, defaults.rov_network_interface)?,
         })
     }
 
@@ -98,6 +101,10 @@ impl ConfigStore {
                 config.osm_tile_user_agent.as_str(),
             ),
             (keys::SERVER_BASE_URL, config.server_base_url.as_str()),
+            (
+                keys::ROV_NETWORK_INTERFACE,
+                config.rov_network_interface.as_str(),
+            ),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -119,6 +126,10 @@ pub struct ClientConfig {
     pub rov_udp_port: String,
     pub osm_tile_user_agent: String,
     pub server_base_url: String,
+    /// Optional network interface name (e.g. `en10`) to bind all ROV
+    /// connections to. Uses `IP_BOUND_IF` on macOS and `SO_BINDTODEVICE` on
+    /// Linux. Empty means the OS chooses the interface.
+    pub rov_network_interface: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -130,6 +141,7 @@ pub struct ClientConfigDefaults<'a> {
     pub rov_udp_port: &'a str,
     pub osm_tile_user_agent: &'a str,
     pub server_base_url: &'a str,
+    pub rov_network_interface: &'a str,
 }
 
 #[cfg(test)]
@@ -144,6 +156,7 @@ mod tests {
         rov_udp_port: "8500",
         osm_tile_user_agent: "ua/0",
         server_base_url: "https://third-eye.marshalling.eu",
+        rov_network_interface: "",
     };
 
     #[test]
@@ -179,6 +192,7 @@ mod tests {
             rov_udp_port: "9000".into(),
             osm_tile_user_agent: "ua/2".into(),
             server_base_url: "https://api.example".into(),
+            rov_network_interface: "en10".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();

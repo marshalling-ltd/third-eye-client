@@ -18,6 +18,7 @@ const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
     rov_udp_port: "8500",
     osm_tile_user_agent: "ua/0",
     server_base_url: "https://third-eye.marshalling.eu",
+    rov_network_interface: "",
 };
 
 fn make_db_path(name: &str) -> PathBuf {
@@ -43,6 +44,7 @@ fn config_and_outbox_survive_reopen() {
             rov_udp_port: "9000".into(),
             osm_tile_user_agent: "ua/persisted".into(),
             server_base_url: "https://api.test".into(),
+            rov_network_interface: "en10".into(),
         };
         store.config().save_client(&cfg).unwrap();
 

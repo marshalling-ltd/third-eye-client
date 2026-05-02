@@ -281,6 +281,22 @@ impl CameraApiClient {
         }
     }
 
+    /// Constructor that binds outgoing connections to a specific network
+    /// interface (e.g. `"en10"` for a USB ethernet adapter).
+    ///
+    /// On macOS this uses `IP_BOUND_IF`; on Linux `SO_BINDTODEVICE`.
+    /// Pass `None` for default OS routing (equivalent to [`Self::new`]).
+    pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
+        let mut builder = Client::builder();
+        if let Some(iface) = interface {
+            builder = builder.interface(iface);
+        }
+        Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            http: builder.build().unwrap_or_else(|_| Client::new()),
+        }
+    }
+
     /// Convenience constructor that accepts a pre-built `reqwest` blocking client.
     pub fn with_http(base_url: String, http: Client) -> Self {
         Self {
