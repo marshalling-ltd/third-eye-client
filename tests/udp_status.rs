@@ -98,7 +98,7 @@ fn udp_listener_receives_and_deserializes_status() {
     let port = reserve_udp_port();
     let mut listener = UdpStatusState::default();
     listener
-        .start("127.0.0.1", port)
+        .start("127.0.0.1", port, None)
         .expect("listener should start on reserved port");
 
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender should bind");
