@@ -342,6 +342,17 @@ impl MediaStore {
         Ok(())
     }
 
+    /// Removes a media row and its capture metadata from the local DB.
+    pub fn remove_by_name(&self, name: &str) -> Result<()> {
+        let conn = self.db.lock().expect("media_sync mutex poisoned");
+        conn.execute(
+            "DELETE FROM capture_metadata WHERE name = ?1",
+            params![name],
+        )?;
+        conn.execute("DELETE FROM media_sync WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
     /// Clears `local_path` / `local_sha256` when the local copy is gone.
     pub fn forget_local(&self, media_id: &str, name: &str) -> Result<()> {
         let conn = self.db.lock().expect("media_sync mutex poisoned");

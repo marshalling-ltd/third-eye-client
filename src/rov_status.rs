@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 
 pub const ROV_STATUS_UDP_PORT: u16 = 8500;
 const ROV_STATUS_PACKET_ID: u8 = 0x03;
@@ -73,13 +74,18 @@ pub struct UdpStatusState {
 }
 
 impl UdpStatusState {
-    pub fn start(&mut self, bind_host: &str, port: u16) -> Result<String> {
+    pub fn start(
+        &mut self,
+        bind_host: &str,
+        port: u16,
+        interface: Option<&str>,
+    ) -> Result<String> {
         let bind_host = bind_host.trim();
         if bind_host.is_empty() {
             anyhow::bail!("UDP bind host cannot be empty");
         }
         let bind_addr = format!("{bind_host}:{port}");
-        let socket = UdpSocket::bind((bind_host, port))
+        let socket = create_bound_udp_socket(bind_host, port, interface)
             .with_context(|| format!("failed to bind UDP {bind_addr}"))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -226,6 +232,77 @@ fn udp_status_worker_loop(
         }
     }
     let _ = tx.send(UdpStatusEvent::Ended);
+}
+
+/// Creates a UDP socket optionally bound to a specific network interface.
+///
+/// On macOS this sets `IP_BOUND_IF` via `socket2` so the socket only sends
+/// and receives on the named interface — no host routes or ARP hacks needed.
+fn create_bound_udp_socket(
+    bind_host: &str,
+    port: u16,
+    interface: Option<&str>,
+) -> Result<UdpSocket> {
+    let addr: std::net::SocketAddr = format!("{bind_host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid bind address {bind_host}:{port}"))?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("failed to create UDP socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("failed to set SO_REUSEADDR")?;
+
+    if let Some(iface) = interface {
+        bind_socket_to_interface(&socket, iface)?;
+    }
+
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("failed to bind UDP {addr}"))?;
+    Ok(socket.into())
+}
+
+/// Binds a `socket2::Socket` to a named network interface.
+///
+/// On macOS/iOS this uses `IP_BOUND_IF` (via `bind_device_by_index_v4`).
+/// On Linux this uses `SO_BINDTODEVICE` (via `bind_device`).
+#[allow(unused_variables)] // `iface` unused on unsupported platforms
+fn bind_socket_to_interface(socket: &Socket, iface: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let index = interface_name_to_index(iface)?;
+        socket
+            .bind_device_by_index_v4(Some(index))
+            .with_context(|| format!("IP_BOUND_IF failed for interface {iface} (index {index})"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        socket
+            .bind_device(Some(iface.as_bytes()))
+            .with_context(|| format!("SO_BINDTODEVICE failed for interface {iface}"))?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("interface binding is not supported on this platform");
+    }
+    Ok(())
+}
+
+/// Resolves a network interface name (e.g. `"en10"`) to its OS index.
+#[cfg(target_os = "macos")]
+pub fn interface_name_to_index(name: &str) -> Result<std::num::NonZeroU32> {
+    let c_name =
+        std::ffi::CString::new(name).context("interface name contains interior NUL byte")?;
+    // SAFETY: `if_nametoindex` is a POSIX function that accepts a C string.
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if index == 0 {
+        anyhow::bail!(
+            "interface {name:?} not found (if_nametoindex returned 0, errno={})",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(std::num::NonZeroU32::new(index)
+        .expect("if_nametoindex returned non-zero but NonZeroU32::new failed"))
 }
 
 pub fn parse_status_packet(datagram: &[u8]) -> Result<Status> {
