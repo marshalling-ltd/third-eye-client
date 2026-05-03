@@ -21,12 +21,12 @@ use map::{
 };
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
-use third_eye_client::camera::{CameraApiClient, MediaScene, PhotoFormat};
+use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
 use third_eye_client::storage::media::{
-    CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, download_to_local,
+    CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, download_to_local,
 };
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
@@ -1285,7 +1285,6 @@ struct AuthUiState {
 }
 
 /// View-model backing the Media screen. Lives in `ThirdEyeState`.
-#[derive(Default)]
 struct MediaUiState {
     rows: Vec<LocalMediaRecord>,
     status_text: String,
@@ -1298,20 +1297,61 @@ struct MediaUiState {
     local_path: String,
     /// True while a background download is in flight.
     download_in_progress: bool,
-    /// Receiver for download worker completions.
-    download_rx: Option<Receiver<DownloadEvent>>,
+    /// True while a ROV refresh HTTP request is in flight.
+    refresh_in_progress: bool,
+    /// True while a capture + metadata-attach is in flight.
+    capture_in_progress: bool,
+    /// Sender half of the persistent media-event channel.  Cloned into
+    /// background threads so they can post results back to the UI loop.
+    event_tx: mpsc::Sender<MediaEvent>,
+    /// Receiver polled every frame by the timer callback.
+    event_rx: mpsc::Receiver<MediaEvent>,
     /// Loaded preview image for the selected media (images only).
     preview_image: Option<slint::Image>,
     /// Cache of thumbnail images keyed by media name.
     thumbnail_cache: std::collections::HashMap<String, slint::Image>,
 }
 
-/// Message sent from the download worker thread back to the UI loop.
-enum DownloadEvent {
-    Finished {
-        media_id: String,
+impl MediaUiState {
+    fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        Self {
+            rows: Vec::new(),
+            status_text: String::new(),
+            selected: None,
+            details_text: String::new(),
+            capture_text: String::new(),
+            has_capture_meta: false,
+            local_path: String::new(),
+            download_in_progress: false,
+            refresh_in_progress: false,
+            capture_in_progress: false,
+            event_tx,
+            event_rx,
+            preview_image: None,
+            thumbnail_cache: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Messages sent from background worker threads back to the UI loop.
+enum MediaEvent {
+    Download {
         name: String,
         result: Result<std::path::PathBuf, String>,
+    },
+    Refresh {
+        status_text: String,
+    },
+    Capture {
+        capture_msg: String,
+        attached_text: String,
+    },
+    Delete {
+        status_text: String,
+    },
+    ListMedias {
+        rov_info: String,
     },
 }
 
@@ -1368,7 +1408,7 @@ impl ThirdEyeState {
             }
         }
 
-        let mut media = MediaUiState::default();
+        let mut media = MediaUiState::new();
         // Hydrate the Media screen with whatever we already know about ROV
         // media (previous sessions may have populated the table already).
         match store.media().list_all() {
@@ -2149,23 +2189,53 @@ fn current_unix_ms() -> i64 {
 /// render, or `None` if nothing could be attached.
 fn attach_capture_metadata_to_latest(
     client: &CameraApiClient,
-    store: &AppStore,
+    media_store: &MediaStore,
     status: Option<&RovUdpStatus>,
     captured_at_ms: i64,
 ) -> Result<Option<String>> {
+    // Snapshot existing media names so we can detect the newly captured file
+    // after the ROV listing is applied (apply_rov_listing sets all rows'
+    // last_seen_ms to the same value, breaking list_recent ordering).
+    let known_names: std::collections::HashSet<String> = media_store
+        .list_all()?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+
     let items = client.list_medias(None::<MediaScene>)?;
-    store.media().apply_rov_listing(&items, None)?;
-    let Some(latest) = store.media().list_recent(1)?.into_iter().next() else {
+    media_store.apply_rov_listing(&items, None)?;
+
+    // Identify the new item(s) that appeared on the ROV since our last sync.
+    let mut new_items: Vec<&MediaInfo> = items
+        .iter()
+        .filter(|item| !known_names.contains(&item.name))
+        .collect();
+    // Sort by name descending: timestamp-based names sort newest-first.
+    new_items.sort_by(|a, b| b.name.cmp(&a.name));
+
+    let target = if let Some(newest) = new_items.first() {
+        Some((newest.origin.id.clone(), newest.name.clone()))
+    } else {
+        // No new items — fall back to the item with the newest name
+        // (timestamp-based names, so alphabetically last = most recent).
+        items
+            .iter()
+            .max_by(|a, b| a.name.cmp(&b.name))
+            .map(|item| (item.origin.id.clone(), item.name.clone()))
+    };
+
+    let Some((media_id, name)) = target else {
         return Ok(None);
     };
-    store.media().attach_capture_metadata(
-        &latest.media_id,
-        &latest.name,
+
+    media_store.attach_capture_metadata(
+        &media_id,
+        &name,
         captured_at_ms,
         status,
         None,
     )?;
-    let mut line = format!("Attached capture metadata to {}.", latest.name);
+    let mut line = format!("Attached capture metadata to {name}.");
     if let Some(status) = status {
         line.push_str(&format!(
             " depth {:.2} m, yaw {:.2} rad, lat_e7={}, lon_e7={}",
@@ -2571,38 +2641,40 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.config.rov_http_base.clone(),
             state.config.rov_interface(),
         );
-        state.rov_info = match client.list_medias(None::<MediaScene>) {
-            Ok(items) => {
-                let rendered = if items.is_empty() {
-                    "No media files on camera.".to_owned()
-                } else {
-                    let mut lines = vec![format!("Media files ({}):", items.len())];
-                    for item in &items {
-                        lines.push(format!(
-                            "- {} ({} bytes){}",
-                            item.name,
-                            item.size,
-                            if item.canplayback { " [video]" } else { "" }
-                        ));
-                    }
-                    lines.join("\n")
-                };
-                match store_for_list_medias
-                    .media()
-                    .apply_rov_listing(&items, None)
-                {
-                    Ok(report) => format!(
-                        "{rendered}\n[sync] new={}, updated={}, disappeared_now={}",
-                        report.new_media, report.updated_media, report.disappeared_media
-                    ),
-                    Err(err) => {
-                        format!("{rendered}\n[sync] failed to update local registry: {err:#}")
+        let media_store = store_for_list_medias.media().clone();
+        let tx = state.media.event_tx.clone();
+        state.rov_info = "Listing media on ROV...".to_owned();
+        thread::spawn(move || {
+            let rov_info = match client.list_medias(None::<MediaScene>) {
+                Ok(items) => {
+                    let rendered = if items.is_empty() {
+                        "No media files on camera.".to_owned()
+                    } else {
+                        let mut lines = vec![format!("Media files ({}):", items.len())];
+                        for item in &items {
+                            lines.push(format!(
+                                "- {} ({} bytes){}",
+                                item.name,
+                                item.size,
+                                if item.canplayback { " [video]" } else { "" }
+                            ));
+                        }
+                        lines.join("\n")
+                    };
+                    match media_store.apply_rov_listing(&items, None) {
+                        Ok(report) => format!(
+                            "{rendered}\n[sync] new={}, updated={}, disappeared_now={}",
+                            report.new_media, report.updated_media, report.disappeared_media
+                        ),
+                        Err(err) => {
+                            format!("{rendered}\n[sync] failed to update local registry: {err:#}")
+                        }
                     }
                 }
-            }
-            Err(err) => format!("List medias failed: {err:#}"),
-        };
-        refresh_media_rows(&mut state, &store_for_list_medias);
+                Err(err) => format!("List medias failed: {err:#}"),
+            };
+            let _ = tx.send(MediaEvent::ListMedias { rov_info });
+        });
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2617,6 +2689,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Ok(state) => state,
             Err(_) => return,
         };
+        if state.media.capture_in_progress {
+            return;
+        }
         pull_configuration_from_ui(&ui, &mut state, &store_for_capture);
 
         // Snapshot the latest ROV telemetry *before* the capture call so we
@@ -2640,41 +2715,43 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.config.rov_http_base.clone(),
             state.config.rov_interface(),
         );
-        match client.capture(PhotoFormat::Jpeg, 1) {
-            Ok(resp) => {
-                let msg = resp.msg.as_deref().unwrap_or("success");
-                let capture_msg = format!("Capture OK: {msg}");
-                state.rov_info = capture_msg.clone();
-                // Show in stream status when on the stream screen.
-                if state.active_screen == Screen::Stream {
-                    state.stream.status = capture_msg;
-                }
-                // Give the camera a brief moment to materialise the file, then
-                // reconcile the media list and attach the telemetry snapshot
-                // to the newest row.
-                std::thread::sleep(Duration::from_millis(400));
-                let attach_result = attach_capture_metadata_to_latest(
-                    &client,
-                    &store_for_capture,
-                    status_snapshot.as_ref(),
-                    captured_at_ms,
-                );
-                state.attached_metadata_text = match attach_result {
-                    Ok(Some(line)) => line,
-                    Ok(None) => String::new(),
-                    Err(err) => format!("Capture metadata attach failed: {err:#}"),
-                };
-                refresh_media_rows(&mut state, &store_for_capture);
-            }
-            Err(err) => {
-                let err_msg = format!("Capture failed: {err:#}");
-                state.rov_info = err_msg.clone();
-                if state.active_screen == Screen::Stream {
-                    state.stream.status = err_msg;
-                }
-                state.attached_metadata_text = String::new();
-            }
+        let media_store = store_for_capture.media().clone();
+        let tx = state.media.event_tx.clone();
+        state.media.capture_in_progress = true;
+        state.rov_info = "Capturing photo...".to_owned();
+        if state.active_screen == Screen::Stream {
+            state.stream.status = "Capturing photo...".to_owned();
         }
+        thread::spawn(move || {
+            match client.capture(PhotoFormat::Jpeg, 1) {
+                Ok(resp) => {
+                    let msg = resp.msg.as_deref().unwrap_or("success");
+                    let capture_msg = format!("Capture OK: {msg}");
+                    // Give the camera a brief moment to materialise the file.
+                    std::thread::sleep(Duration::from_millis(400));
+                    let attached_text = match attach_capture_metadata_to_latest(
+                        &client,
+                        &media_store,
+                        status_snapshot.as_ref(),
+                        captured_at_ms,
+                    ) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => String::new(),
+                        Err(err) => format!("Capture metadata attach failed: {err:#}"),
+                    };
+                    let _ = tx.send(MediaEvent::Capture {
+                        capture_msg,
+                        attached_text,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(MediaEvent::Capture {
+                        capture_msg: format!("Capture failed: {err:#}"),
+                        attached_text: String::new(),
+                    });
+                }
+            }
+        });
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2955,30 +3032,36 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Ok(state) => state,
             Err(_) => return,
         };
+        if state.media.refresh_in_progress {
+            return;
+        }
         pull_configuration_from_ui(&ui, &mut state, &store_for_refresh_media);
         let client = CameraApiClient::new_bound(
             state.config.rov_http_base.clone(),
             state.config.rov_interface(),
         );
-        state.media.status_text = match client.list_medias(None::<MediaScene>) {
-            Ok(items) => {
-                match store_for_refresh_media
-                    .media()
-                    .apply_rov_listing(&items, None)
-                {
-                    Ok(report) => format!(
-                        "Refreshed. {} on ROV (new {}, updated {}, newly vanished {}).",
-                        report.total_on_rov,
-                        report.new_media,
-                        report.updated_media,
-                        report.disappeared_media
-                    ),
-                    Err(err) => format!("Refresh succeeded but local update failed: {err:#}"),
+        let media_store = store_for_refresh_media.media().clone();
+        let tx = state.media.event_tx.clone();
+        state.media.refresh_in_progress = true;
+        state.media.status_text = "Refreshing media from ROV...".to_owned();
+        thread::spawn(move || {
+            let status_text = match client.list_medias(None::<MediaScene>) {
+                Ok(items) => {
+                    match media_store.apply_rov_listing(&items, None) {
+                        Ok(report) => format!(
+                            "Refreshed. {} on ROV (new {}, updated {}, newly vanished {}).",
+                            report.total_on_rov,
+                            report.new_media,
+                            report.updated_media,
+                            report.disappeared_media
+                        ),
+                        Err(err) => format!("Refresh succeeded but local update failed: {err:#}"),
+                    }
                 }
-            }
-            Err(err) => format!("Refresh failed: {err:#}"),
-        };
-        refresh_media_rows(&mut state, &store_for_refresh_media);
+                Err(err) => format!("Refresh failed: {err:#}"),
+            };
+            let _ = tx.send(MediaEvent::Refresh { status_text });
+        });
         apply_state_to_ui(&ui, &state);
     });
 
@@ -3014,8 +3097,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 state.config.rov_http_base.clone(),
                 state.config.rov_interface(),
             );
-            let (tx, rx) = mpsc::channel();
-            state.media.download_rx = Some(rx);
+            let tx = state.media.event_tx.clone();
             state.media.download_in_progress = true;
             state.media.status_text = format!("Fetching preview for {name_str}...");
             let media_store = store_for_select_media.media().clone();
@@ -3024,8 +3106,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             thread::spawn(move || {
                 let result = download_to_local(&media_store, &camera, &data_root, &mid, &nm)
                     .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(DownloadEvent::Finished {
-                    media_id: mid,
+                let _ = tx.send(MediaEvent::Download {
                     name: nm,
                     result,
                 });
@@ -3065,12 +3146,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.config.rov_http_base.clone(),
             state.config.rov_interface(),
         );
-        let (tx, rx) = mpsc::channel();
-        state.media.download_rx = Some(rx);
+        let tx = state.media.event_tx.clone();
         state.media.download_in_progress = true;
         state.media.status_text = format!("Downloading {name} from ROV...");
-        // `Rc<AppStore>` isn't `Send`, so hand the worker a cloned
-        // `MediaStore` (which is `Arc<Mutex<...>>`-backed and `Send`).
         let media_store = store_for_download_media.media().clone();
         let media_id_thread = media_id.clone();
         let name_thread = name.clone();
@@ -3083,8 +3161,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 &name_thread,
             )
             .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(DownloadEvent::Finished {
-                media_id: media_id_thread,
+            let _ = tx.send(MediaEvent::Download {
                 name: name_thread,
                 result,
             });
@@ -3133,77 +3210,91 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         };
-        let client = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
-        );
-        // Delete local file if it exists.
+        // Immediate local cleanup (fast).
         if !state.media.local_path.is_empty() {
             let _ = std::fs::remove_file(&state.media.local_path);
         }
-        // Delete from ROV.
-        let rov_result = client.delete_media(&name);
-        // Always remove from local DB regardless of ROV result.
         let _ = store_for_delete_media.media().remove_by_name(&name);
         state.media.thumbnail_cache.remove(&name);
         state.media.selected = None;
         state.media.preview_image = None;
-        match rov_result {
-            Ok(()) => {
-                state.media.status_text = format!("Deleted {name}.");
-            }
-            Err(err) => {
-                state.media.status_text =
-                    format!("Deleted {name} locally (ROV delete failed: {err:#}).");
-            }
-        }
+        state.media.status_text = format!("Deleting {name} from ROV...");
         refresh_media_rows(&mut state, &store_for_delete_media);
+        // ROV HTTP delete in background.
+        let client = CameraApiClient::new_bound(
+            state.config.rov_http_base.clone(),
+            state.config.rov_interface(),
+        );
+        let tx = state.media.event_tx.clone();
+        let name_thread = name.clone();
+        thread::spawn(move || {
+            let status_text = match client.delete_media(&name_thread) {
+                Ok(()) => format!("Deleted {name_thread}."),
+                Err(err) => {
+                    format!("Deleted {name_thread} locally (ROV delete failed: {err:#}).")
+                }
+            };
+            let _ = tx.send(MediaEvent::Delete {
+                status_text,
+            });
+        });
         apply_state_to_ui(&ui, &state);
     });
 }
 
-/// Polls outstanding download completions and updates the Media screen.
+/// Polls background media events and updates state accordingly.
 /// Returns `true` if the UI needs a refresh.
-fn poll_media_downloads(state: &mut ThirdEyeState, store: &AppStore) -> bool {
-    let Some(rx) = state.media.download_rx.as_ref() else {
-        return false;
-    };
-    let mut finished = Vec::new();
-    let mut disconnected = false;
-    loop {
-        match rx.try_recv() {
-            Ok(DownloadEvent::Finished {
-                media_id,
+fn poll_media_events(state: &mut ThirdEyeState, store: &AppStore) -> bool {
+    let mut changed = false;
+    while let Ok(event) = state.media.event_rx.try_recv() {
+        changed = true;
+        match event {
+            MediaEvent::Download {
                 name,
                 result,
-            }) => finished.push((media_id, name, result)),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                disconnected = true;
-                break;
+            } => {
+                state.media.download_in_progress = false;
+                match result {
+                    Ok(path) => {
+                        state.media.status_text =
+                            format!("Downloaded {name} to {}.", path.display());
+                    }
+                    Err(err) => {
+                        state.media.status_text =
+                            format!("Download of {name} failed: {err}");
+                    }
+                }
+                refresh_media_rows(state, store);
+            }
+            MediaEvent::Refresh { status_text } => {
+                state.media.refresh_in_progress = false;
+                state.media.status_text = status_text;
+                refresh_media_rows(state, store);
+            }
+            MediaEvent::Capture {
+                capture_msg,
+                attached_text,
+            } => {
+                state.media.capture_in_progress = false;
+                state.rov_info = capture_msg.clone();
+                if state.active_screen == Screen::Stream {
+                    state.stream.status = capture_msg;
+                }
+                state.attached_metadata_text = attached_text;
+                refresh_media_rows(state, store);
+            }
+            MediaEvent::Delete {
+                status_text,
+            } => {
+                state.media.status_text = status_text;
+            }
+            MediaEvent::ListMedias { rov_info } => {
+                state.rov_info = rov_info;
+                refresh_media_rows(state, store);
             }
         }
     }
-    if disconnected {
-        state.media.download_rx = None;
-    }
-    if finished.is_empty() {
-        return false;
-    }
-    state.media.download_in_progress = false;
-    state.media.download_rx = None;
-    for (_id, name, result) in finished {
-        match result {
-            Ok(path) => {
-                state.media.status_text = format!("Downloaded {name} to {}.", path.display());
-            }
-            Err(err) => {
-                state.media.status_text = format!("Download of {name} failed: {err}");
-            }
-        }
-    }
-    refresh_media_rows(state, store);
-    true
+    changed
 }
 
 fn stream_stderr_loop(
@@ -3627,8 +3718,8 @@ fn main() -> Result<()> {
             }
             state.rov_status.poll_events();
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
-            if poll_media_downloads(&mut state, &poll_store) {
-                apply_media_runtime_to_ui(&ui, &state);
+            if poll_media_events(&mut state, &poll_store) {
+                apply_state_to_ui(&ui, &state);
             }
         },
     );
