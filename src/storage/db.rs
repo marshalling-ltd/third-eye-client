@@ -1,4 +1,4 @@
-//! SQLite connection management for [`AppStore`](super::AppStore).
+//! `SQLite` connection management for [`AppStore`](super::AppStore).
 //!
 //! A single connection is held under an `Arc<Mutex<_>>`; WAL mode is enabled
 //! so readers (the outbox worker, the media reconciliation job) do not block
@@ -15,11 +15,11 @@ use rusqlite_migration::{M, Migrations};
 /// is self-contained.
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
 
-/// Shared, thread-safe SQLite handle. Every storage submodule takes one of
+/// Shared, thread-safe `SQLite` handle. Every storage submodule takes one of
 /// these by `Arc::clone`.
 pub type SharedDb = Arc<Mutex<Connection>>;
 
-/// Opens (or creates) a persistent SQLite database at `path` and runs all
+/// Opens (or creates) a persistent `SQLite` database at `path` and runs all
 /// pending schema migrations.
 pub fn open_persistent(path: &Path) -> Result<SharedDb> {
     if let Some(parent) = path.parent() {

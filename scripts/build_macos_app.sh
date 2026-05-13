@@ -37,13 +37,24 @@ APP_BINARY_DEST="$MACOS_DIR/$EXECUTABLE_NAME"
 INSTALL_DEST_DIR="/Applications"
 INSTALL_DEST_APP="$INSTALL_DEST_DIR/$BUNDLE_NAME"
 
-echo "Building $EXECUTABLE_NAME ($BUILD_PROFILE)..."
-cargo build "${CARGO_BUILD_ARGS[@]}" --bin "$EXECUTABLE_NAME"
+TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
+ARCH_BINARIES=()
 
-if [[ ! -f "$APP_BINARY_SOURCE" ]]; then
-  echo "Error: expected binary not found at $APP_BINARY_SOURCE" >&2
-  exit 1
-fi
+for target in "${TARGETS[@]}"; do
+  echo "Building $EXECUTABLE_NAME ($BUILD_PROFILE) for $target..."
+  cargo build "${CARGO_BUILD_ARGS[@]}" --bin "$EXECUTABLE_NAME" --target "$target"
+  bin="$ROOT_DIR/target/$target/$PROFILE_DIR/$EXECUTABLE_NAME"
+  if [[ ! -f "$bin" ]]; then
+    echo "Error: expected binary not found at $bin" >&2
+    exit 1
+  fi
+  ARCH_BINARIES+=("$bin")
+done
+
+echo "Creating universal binary..."
+mkdir -p "$TARGET_DIR"
+lipo -create -output "$APP_BINARY_SOURCE" "${ARCH_BINARIES[@]}"
+lipo -info "$APP_BINARY_SOURCE"
 
 if [[ ! -f "$INFO_PLIST_SOURCE" ]]; then
   echo "Error: Info.plist not found at $INFO_PLIST_SOURCE" >&2
@@ -70,11 +81,20 @@ if [[ -z "$FFMPEG_SOURCE" ]]; then
   fi
 fi
 
+REQUIRED_ARCHS=("arm64" "x86_64")
+
 if [[ -n "$FFMPEG_SOURCE" ]]; then
   if [[ ! -x "$FFMPEG_SOURCE" ]]; then
     echo "Error: FFMPEG_SOURCE is not executable: $FFMPEG_SOURCE" >&2
     exit 1
   fi
+  FFMPEG_ARCHS="$(lipo -info "$FFMPEG_SOURCE" 2>/dev/null || true)"
+  for arch in "${REQUIRED_ARCHS[@]}"; do
+    if ! echo "$FFMPEG_ARCHS" | grep -q "$arch"; then
+      echo "Warning: bundled ffmpeg is missing $arch slice. It may run under Rosetta on Apple Silicon." >&2
+      echo "  lipo -info output: $FFMPEG_ARCHS" >&2
+    fi
+  done
   FFMPEG_DEST_DIR="$MACOS_DIR/bin"
   mkdir -p "$FFMPEG_DEST_DIR"
   cp "$FFMPEG_SOURCE" "$FFMPEG_DEST_DIR/ffmpeg"
@@ -85,7 +105,11 @@ else
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_BUNDLE_DIR" >/dev/null
+  if [[ -f "$MACOS_DIR/bin/ffmpeg" ]]; then
+    codesign --force --sign - "$MACOS_DIR/bin/ffmpeg" >/dev/null
+  fi
+  codesign --force --sign - "$APP_BINARY_DEST" >/dev/null
+  codesign --force --sign - "$APP_BUNDLE_DIR" >/dev/null
 fi
 
 echo "Installing bundle to $INSTALL_DEST_DIR..."

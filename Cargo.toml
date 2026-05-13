@@ -1,7 +1,9 @@
 [package]
+authors = ["marshalling"]
 name = "third-eye-client"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
 
 [features]
 default = []
@@ -13,26 +15,29 @@ path = "src/bin/test_udp_server.rs"
 required-features = ["test-tools"]
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.102"
 base64 = "0.22"
 cookie = "0.18"
-directories = "5"
-image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+directories = "6"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies", "json", "rustls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-rusqlite_migration = "1"
+rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite_migration = "2"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-sha2 = "0.10"
-slint = { version = "1.13.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
-socket2 = { version = "0.5", features = ["all"] }
+serde_json = "1.0.149"
+sha2 = "0.11"
+slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+socket2 = { version = "0.6", features = ["all"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-webbrowser = "1.0.6"
+webbrowser = "1.2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-location = { version = "0.2.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }
-objc2 = "0.5.2"
+objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }
+objc2 = "0.6.4"
+
+[build-dependencies]
+slint-build = "1.16.1"
 
 [dev-dependencies]
 mockito = "1"

@@ -1,3 +1,22 @@
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::module_name_repetitions,
+    clippy::doc_markdown,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools,
+    clippy::struct_field_names,
+    clippy::items_after_statements,
+    clippy::unreadable_literal
+)]
+
 mod map;
 
 use std::cell::RefCell;
@@ -22,6 +41,7 @@ use map::{
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
+use third_eye_client::nmea::{DEFAULT_NMEA_GPS_PORT, NmeaGpsState};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -35,1112 +55,7 @@ const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
 const DEFAULT_SERVER_BASE_URL: &str = "https://third-eye.marshalling.eu";
 const DEFAULT_ROV_INTERFACE: &str = "en10";
 
-slint::slint! {
-import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
-
-export struct MapTile {
-    x: length,
-    y: length,
-    size: length,
-    tile: image,
-}
-
-export struct MediaRow {
-    media_id: string,
-    name: string,
-    size_text: string,
-    seen_text: string,
-    state_text: string,
-    origin_text: string,
-    has_local: bool,
-    deleted_on_rov: bool,
-    selected: bool,
-    thumbnail: image,
-    has_thumbnail: bool,
-}
-
-export component AppWindow inherits Window {
-    title: "Third Eye Client";
-    icon: @image-url("../assets/logo.png");
-    preferred-width: 1520px;
-    preferred-height: 960px;
-    min-width: 680px;
-    min-height: 400px;
-
-    in-out property <int> active_screen: 0;
-
-    in-out property <string> rtsp_url;
-    in-out property <string> rov_http_base;
-    in-out property <string> rov_status_udp_bind_host;
-    in-out property <string> rov_status_udp_port;
-    in-out property <string> osm_tile_user_agent;
-    in-out property <string> rov_network_interface;
-    in-out property <string> rov_info;
-
-    // Server account (third-eye backend).
-    in-out property <string> server_base_url;
-    in-out property <string> auth_email;
-    in-out property <string> auth_password;
-    in-out property <string> auth_status_text;
-    in-out property <string> auth_signed_in_as;
-    in-out property <bool> auth_is_signed_in: false;
-
-    // Per-capture ROV telemetry summary surfaced after a successful capture.
-    in-out property <string> attached_metadata_text;
-
-    // Media screen bindings.
-    in property <[MediaRow]> media_rows;
-    in-out property <string> media_status;
-    in-out property <string> media_selected_id;
-    in-out property <string> media_selected_name;
-    in-out property <string> media_selected_details;
-    in-out property <string> media_selected_capture_text;
-    in-out property <string> media_selected_local_path;
-    in-out property <bool> media_selected_has_capture_meta: false;
-    in-out property <bool> media_download_in_progress: false;
-    in-out property <image> media_preview_image;
-    in-out property <bool> has_media_preview: false;
-
-    in-out property <string> map_status;
-    in-out property <string> corelocation_debug;
-    in-out property <string> lat_lon_text;
-    in-out property <string> zoom_text;
-    in property <[MapTile]> map_tiles;
-    in-out property <length> map_pin_world_x: 0px;
-    in-out property <length> map_pin_world_y: 0px;
-    in-out property <bool> map_has_pin: false;
-    in-out property <length> map_viewport_x: 0px;
-    in-out property <length> map_viewport_y: 0px;
-    in-out property <length> map_viewport_width: 0px;
-    in-out property <length> map_viewport_height: 0px;
-    in-out property <string> pin_lat_lon_short;
-    in property <length> scale_bar_width: 100px;
-    in-out property <string> scale_bar_text;
-
-    in-out property <string> stream_status;
-    in-out property <string> frames_received_text;
-    in-out property <image> stream_image;
-    in-out property <bool> has_stream_image: false;
-
-    in-out property <string> rov_status_text;
-    in-out property <string> rov_packets_received_text;
-    in-out property <bool> has_rov_status: false;
-    in-out property <string> rov_attitude_text;
-    in-out property <string> rov_depth_temp_text;
-    in-out property <string> rov_coordinates_text;
-    in-out property <string> rov_imu_text;
-    in-out property <string> rov_batteries_text;
-
-    // Compact overlay telemetry for the full-bleed stream screen.
-    in-out property <string> rov_depth_short;
-    in-out property <string> rov_temp_short;
-    in-out property <string> rov_heading_short;
-    in-out property <string> rov_attitude_short;
-    in-out property <string> rov_coords_short;
-    in-out property <string> rov_battery_short;
-
-    callback navigate_configuration();
-    callback navigate_map(length, length);
-    callback navigate_stream();
-    callback navigate_media();
-
-    callback use_default_test_rtsp();
-    callback use_default_rov_rtsp();
-    callback use_default_rov_http_base();
-    callback use_host_from_rov_http_base();
-    callback use_default_rov_status_udp_port();
-    callback use_default_osm_tile_user_agent();
-    callback use_default_rov_network_interface();
-    callback clear_rov_network_interface();
-
-    callback list_medias();
-    callback capture_photo();
-
-    callback refresh_media();
-    callback select_media(string, string);
-    callback download_selected_media();
-    callback open_selected_local_media();
-    callback delete_selected_media_from_rov();
-
-    callback sign_in();
-    callback sign_out();
-    callback use_default_server_base_url();
-
-    callback detect_location(length, length);
-    callback load_map_tile(length, length);
-    callback open_interactive_map();
-    callback map_flicked(length, length, length, length);
-    callback map_zoom_in(length, length, length, length);
-    callback map_zoom_out(length, length, length, length);
-    callback center_map_on_pin(length, length, length, length);
-
-    callback start_stream();
-    callback stop_stream();
-    callback start_rov_status_listener();
-    callback stop_rov_status_listener();
-
-    public function set_map_viewport(ox: length, oy: length, width: length, height: length) {
-        root.map_viewport_x = ox;
-        root.map_viewport_y = oy;
-        root.map_viewport_width = width;
-        root.map_viewport_height = height;
-    }
-    HorizontalBox {
-        padding: 10px;
-        spacing: 10px;
-
-        Rectangle {
-            min-width: 240px;
-            max-width: 240px;
-            border-width: 1px;
-            border-color: #3f4148;
-            background: #1f2127;
-
-            VerticalBox {
-                padding: 12px;
-                spacing: 8px;
-                Image {
-                    width: 90px;
-                    height: 70px;
-                    source: @image-url("../assets/logo.png");
-                    image-fit: contain;
-                }
-
-                Text {
-                    text: "Third Eye Client";
-                    font-size: 26px;
-                }
-                Text {
-                    text: "Navigation";
-                    color: #8f96a3;
-                }
-                Rectangle {
-                    height: 1px;
-                    background: #3f4148;
-                }
-
-                Button {
-                    text: "Configuration";
-                    clicked => { root.navigate_configuration(); }
-                }
-                Button {
-                    text: "Device Map";
-                    clicked => { root.navigate_map(content_panel.width, content_panel.height); }
-                }
-                Button {
-                    text: "Live Stream";
-                    clicked => { root.navigate_stream(); }
-                }
-                Button {
-                    text: "Media";
-                    clicked => { root.navigate_media(); }
-                }
-                Rectangle {
-                    vertical-stretch: 1;
-                }
-            }
-        }
-
-        content_panel := Rectangle {
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
-            border-width: 1px;
-            border-color: #3f4148;
-            background: #202328;
-
-            if root.active_screen != 1 && root.active_screen != 2 : ScrollView {
-                viewport-width: self.visible-width;
-
-                VerticalBox {
-                    padding: 14px;
-                    spacing: 10px;
-
-                if root.active_screen == 0 : VerticalBox {
-                    spacing: 8px;
-                    Text {
-                        text: "RTSP + ROV Configuration";
-                        font-size: 24px;
-                    }
-                    Text {
-                        text: "Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.";
-                        wrap: word-wrap;
-                    }
-
-                    Text { text: "RTSP URL:"; }
-                    LineEdit { text <=> root.rtsp_url; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default test RTSP URL";
-                            clicked => { root.use_default_test_rtsp(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV RTSP URL";
-                            clicked => { root.use_default_rov_rtsp(); }
-                        }
-                    }
-
-                    Text { text: "ROV HTTP API Base URL:"; }
-                    LineEdit { text <=> root.rov_http_base; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV HTTP API URL";
-                            clicked => { root.use_default_rov_http_base(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use host from ROV HTTP API URL for telemetry UDP bind";
-                            clicked => { root.use_host_from_rov_http_base(); }
-                        }
-                    }
-
-                    Text { text: "ROV telemetry UDP bind host:"; }
-                    LineEdit { text <=> root.rov_status_udp_bind_host; }
-                    Text { text: "ROV telemetry UDP port:"; }
-                    LineEdit { text <=> root.rov_status_udp_port; }
-                    Button {
-                        text: "Use default ROV telemetry UDP port (8500)";
-                        clicked => { root.use_default_rov_status_udp_port(); }
-                    }
-
-                    Text { text: "OpenStreetMap tile User-Agent:"; }
-                    LineEdit { text <=> root.osm_tile_user_agent; }
-                    Button {
-                        text: "Use default OSM tile User-Agent";
-                        clicked => { root.use_default_osm_tile_user_agent(); }
-                    }
-                    Text {
-                        text: "Include an app identifier and contact URL/email for OSM tile policy compliance.";
-                        wrap: word-wrap;
-                    }
-
-                    Text { text: "ROV network interface (bind all connections to this adapter):"; }
-                    LineEdit { text <=> root.rov_network_interface; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV interface (en10)";
-                            clicked => { root.use_default_rov_network_interface(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Clear (use OS routing)";
-                            clicked => { root.clear_rov_network_interface(); }
-                        }
-                    }
-                    Text {
-                        text: "Enter the name of the USB ethernet adapter (e.g. en10). Find it with 'ifconfig'. When set, all ROV HTTP and UDP traffic is bound to this interface via IP_BOUND_IF. Leave empty for default OS routing.";
-                        wrap: word-wrap;
-                    }
-
-                    Text { text: "ROV API notes:"; }
-                    Text {
-                        text: "• RTSP stream example: rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• HTTP API server example: http://192.168.1.88:80";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• Capture endpoint: POST /v1/capture";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• Media list endpoint: GET /v1/medias";
-                        wrap: word-wrap;
-                    }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "List medias (GET /v1/medias)";
-                            clicked => { root.list_medias(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Capture photo (POST /v1/capture)";
-                            clicked => { root.capture_photo(); }
-                        }
-                    }
-
-                    Text { text: root.rov_info; wrap: word-wrap; }
-                    if root.attached_metadata_text != "" : Text {
-                        text: root.attached_metadata_text;
-                        wrap: word-wrap;
-                    }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Server account"; font-size: 18px; }
-                    Text {
-                        text: "Sign in to https://third-eye.marshalling.eu for media syncing and status uploads.";
-                        wrap: word-wrap;
-                    }
-                    Text { text: "Server base URL:"; }
-                    LineEdit { text <=> root.server_base_url; }
-                    Button {
-                        text: "Use default server URL";
-                        clicked => { root.use_default_server_base_url(); }
-                    }
-                    Text { text: "Email:"; }
-                    LineEdit { text <=> root.auth_email; }
-                    Text { text: "Password:"; }
-                    LineEdit {
-                        text <=> root.auth_password;
-                        input-type: password;
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Sign in";
-                            enabled: !root.auth_is_signed_in;
-                            clicked => { root.sign_in(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Sign out";
-                            enabled: root.auth_is_signed_in;
-                            clicked => { root.sign_out(); }
-                        }
-                    }
-                    if root.auth_is_signed_in : Text {
-                        text: "Signed in as " + root.auth_signed_in_as;
-                    }
-                    Text { text: root.auth_status_text; wrap: word-wrap; }
-                }
-
-                if root.active_screen == 3 : VerticalBox {
-                    spacing: 10px;
-                    Text {
-                        text: "Media library (ROV + local)";
-                        font-size: 24px;
-                    }
-                    Text {
-                        text: "Camera HTTP base: " + root.rov_http_base;
-                        wrap: word-wrap;
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Refresh from ROV";
-                            clicked => { root.refresh_media(); }
-                        }
-                    }
-                    Text { text: root.media_status; wrap: word-wrap; }
-
-                    HorizontalBox {
-                        spacing: 12px;
-
-                        // --- Left column: scrollable tile list of media. ---
-                        Rectangle {
-                            min-width: 340px;
-                            max-width: 480px;
-                            horizontal-stretch: 0;
-                            vertical-stretch: 1;
-                            border-width: 1px;
-                            border-color: #3f4148;
-                            background: #1a1c22;
-
-                            ScrollView {
-                                viewport-width: self.visible-width;
-                                VerticalBox {
-                                    padding: 6px;
-                                    spacing: 4px;
-                                    if root.media_rows.length == 0 : Text {
-                                        text: "No media recorded yet. Click \"Refresh from ROV\" to populate the list.";
-                                        wrap: word-wrap;
-                                        color: #8f96a3;
-                                    }
-                                    for row in root.media_rows : Rectangle {
-                                        height: row.has_thumbnail ? 100px : 52px;
-                                        border-radius: 6px;
-                                        border-width: row.selected ? 2px : 1px;
-                                        border-color: row.selected ? #0a84ff : #2b2d34;
-                                        background: row.selected ? #0a84ff22 :
-                                            (row.deleted_on_rov ? #30181888 : #262931);
-                                        HorizontalBox {
-                                            padding: 4px;
-                                            spacing: 8px;
-                                            if row.has_thumbnail : Rectangle {
-                                                width: 88px;
-                                                border-radius: 4px;
-                                                clip: true;
-                                                background: #111318;
-                                                Image {
-                                                    width: parent.width;
-                                                    height: parent.height;
-                                                    source: row.thumbnail;
-                                                    image-fit: contain;
-                                                }
-                                            }
-                                            VerticalBox {
-                                                spacing: 2px;
-                                                Text {
-                                                    text: row.name;
-                                                    font-size: 13px;
-                                                    overflow: elide;
-                                                }
-                                                Text {
-                                                    text: row.size_text + " \u{2022} " + row.state_text;
-                                                    font-size: 11px;
-                                                    color: #8f96a3;
-                                                    overflow: elide;
-                                                }
-                                                Text {
-                                                    text: row.seen_text;
-                                                    font-size: 10px;
-                                                    color: #666666;
-                                                }
-                                            }
-                                        }
-                                        TouchArea {
-                                            clicked => {
-                                                root.select_media(row.media_id, row.name);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // --- Right column: scrollable detail panel. ---
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            vertical-stretch: 1;
-                            border-width: 1px;
-                            border-color: #3f4148;
-                            background: #1a1c22;
-
-                            ScrollView {
-                                viewport-width: self.visible-width;
-                                VerticalBox {
-                                    padding: 10px;
-                                    spacing: 6px;
-                                    if root.media_selected_name == "" : Text {
-                                        text: "Select a media entry on the left to see its metadata.";
-                                        color: #8f96a3;
-                                        wrap: word-wrap;
-                                    }
-                                    if root.media_selected_name != "" : VerticalBox {
-                                        spacing: 6px;
-                                        Text {
-                                            text: root.media_selected_name;
-                                            font-size: 18px;
-                                        }
-                                        Text {
-                                            text: "media_id: " + root.media_selected_id;
-                                            font-size: 11px;
-                                            color: #8f96a3;
-                                        }
-                                        if root.has_media_preview : Rectangle {
-                                            min-height: 200px;
-                                            max-height: 400px;
-                                            horizontal-stretch: 1;
-                                            border-radius: 6px;
-                                            clip: true;
-                                            background: #111318;
-                                            Image {
-                                                width: parent.width;
-                                                height: parent.height;
-                                                source: root.media_preview_image;
-                                                image-fit: contain;
-                                            }
-                                        }
-                                        Text {
-                                            text: root.media_selected_details;
-                                            wrap: word-wrap;
-                                        }
-                                        if root.media_selected_local_path != "" : Text {
-                                            text: "Local copy: " + root.media_selected_local_path;
-                                            wrap: word-wrap;
-                                            color: #8fbf7f;
-                                        }
-                                        Rectangle { height: 1px; background: #3f4148; }
-                                        Text { text: "Capture metadata"; font-size: 16px; }
-                                        if root.media_selected_has_capture_meta : Text {
-                                            text: root.media_selected_capture_text;
-                                            wrap: word-wrap;
-                                        }
-                                        if !root.media_selected_has_capture_meta : Text {
-                                            text: "No capture telemetry attached.";
-                                            wrap: word-wrap;
-                                            color: #8f96a3;
-                                        }
-                                        Rectangle { height: 1px; background: #3f4148; }
-                                        HorizontalBox {
-                                            spacing: 8px;
-                                            Button {
-                                                horizontal-stretch: 1;
-                                                text: root.media_download_in_progress
-                                                    ? "Downloading..."
-                                                    : (root.media_selected_local_path == ""
-                                                        ? "Download from ROV"
-                                                        : "Re-download from ROV");
-                                                enabled: !root.media_download_in_progress;
-                                                clicked => { root.download_selected_media(); }
-                                            }
-                                            Button {
-                                                horizontal-stretch: 1;
-                                                text: "Open locally";
-                                                enabled: root.media_selected_local_path != "";
-                                                clicked => { root.open_selected_local_media(); }
-                                            }
-                                        }
-                                        Button {
-                                            text: "Delete";
-                                            clicked => { root.delete_selected_media_from_rov(); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            }
-
-            // Full-bleed live stream screen
-            if root.active_screen == 2 : Rectangle {
-                width: parent.width;
-                height: parent.height;
-                background: #000000;
-                clip: true;
-
-                // Full-bleed video
-                if root.has_stream_image : Image {
-                    width: parent.width;
-                    height: parent.height;
-                    source: root.stream_image;
-                    image-fit: contain;
-                }
-                if !root.has_stream_image : Text {
-                    text: "No stream active. Press \u{25b6} Start to begin.";
-                    color: #555555;
-                    font-size: 18px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-
-                // Top-right: status info
-                Rectangle {
-                    width: 300px;
-                    height: 92px;
-                    x: parent.width - self.width - 10px;
-                    y: 10px;
-                    border-radius: 12px;
-                    background: #0d1a2acc;
-                    border-width: 1px;
-                    border-color: #0a84ff44;
-
-                    VerticalBox {
-                        padding: 10px;
-                        spacing: 4px;
-                        Text {
-                            text: root.stream_status;
-                            color: #ffffff;
-                            font-size: 12px;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: "Frames: " + root.frames_received_text;
-                            color: #aaaaaa;
-                            font-size: 11px;
-                        }
-                        Text {
-                            text: root.rov_status_text;
-                            color: #ffffff;
-                            font-size: 12px;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: "Packets: " + root.rov_packets_received_text;
-                            color: #aaaaaa;
-                            font-size: 11px;
-                        }
-                    }
-                }
-
-                // Right: capture photo button (camera icon)
-                Rectangle {
-                    width: 56px;
-                    height: 48px;
-                    x: parent.width - self.width - 16px;
-                    y: (parent.height - self.height) / 2;
-                    border-radius: 10px;
-                    background: btn-capture-ta.pressed ? #0a84ffcc : btn-capture-ta.has-hover ? #0a84ff88 : #0d1a2acc;
-                    border-width: 1px;
-                    border-color: #0a84ff44;
-                    animate background { duration: 120ms; }
-
-                    // Camera body
-                    Rectangle {
-                        width: 36px;
-                        height: 26px;
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2 + 2px;
-                        border-radius: 4px;
-                        border-width: 2px;
-                        border-color: #ffffffcc;
-                        background: #00000000;
-                    }
-                    // Lens circle
-                    Rectangle {
-                        width: 14px;
-                        height: 14px;
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2 + 2px;
-                        border-radius: 7px;
-                        border-width: 2px;
-                        border-color: #ffffffcc;
-                        background: #00000000;
-                    }
-                    // Viewfinder bump
-                    Rectangle {
-                        width: 14px;
-                        height: 6px;
-                        x: (parent.width - self.width) / 2 + 2px;
-                        y: (parent.height - self.height) / 2 - 4px;
-                        border-radius: 2px;
-                        background: #ffffffcc;
-                    }
-                    // Flash dot
-                    Rectangle {
-                        width: 4px;
-                        height: 4px;
-                        x: (parent.width - self.width) / 2 + 26px;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 2px;
-                        background: #ffffffaa;
-                    }
-                    btn-capture-ta := TouchArea {
-                        clicked => {
-                            root.capture_photo();
-                        }
-                    }
-                }
-
-                // Bottom: ROV telemetry overlay bar
-                if root.has_rov_status : Rectangle {
-                    width: parent.width;
-                    height: 80px;
-                    y: parent.height - self.height;
-                    background: #0d1a2add;
-
-                    HorizontalBox {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-top: 8px;
-                        padding-bottom: 8px;
-                        spacing: 24px;
-
-                        // Depth
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "DEPTH";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_depth_short;
-                                color: #ffffff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Temperature
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "TEMP";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_temp_short;
-                                color: #aaccff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Heading
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "HDG";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_heading_short;
-                                color: #ffffff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Attitude
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "ATT";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_attitude_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-
-                        // Coordinates
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "POS";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_coords_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-
-                        // Battery
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "BAT";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_battery_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Full-bleed map screen
-            if root.active_screen == 1 : Rectangle {
-                width: parent.width;
-                height: parent.height;
-
-                map_canvas := Rectangle {
-                    width: parent.width;
-                    height: parent.height;
-                    clip: true;
-                    background: #ffffff;
-
-                    map_fli := Flickable {
-                        viewport-x <=> root.map_viewport_x;
-                        viewport-y <=> root.map_viewport_y;
-                        viewport-width: root.map_viewport_width;
-                        viewport-height: root.map_viewport_height;
-
-                        for tile in root.map_tiles : Image {
-                            x: tile.x;
-                            y: tile.y;
-                            width: tile.size;
-                            height: tile.size;
-                            source: tile.tile;
-                            image-fit: fill;
-                        }
-
-                        if root.map_has_pin : Rectangle {
-                            width: 52px;
-                            height: 52px;
-                            x: root.map_pin_world_x - self.width / 2;
-                            y: root.map_pin_world_y - self.height / 2;
-                            background: #00000000;
-
-                            Rectangle {
-                                width: 52px;
-                                height: 52px;
-                                border-radius: 26px;
-                                background: #0a84ff15;
-                            }
-                            Rectangle {
-                                width: 42px;
-                                height: 42px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 21px;
-                                background: #0a84ff28;
-                            }
-                            Rectangle {
-                                width: 34px;
-                                height: 34px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 17px;
-                                background: #0a84ff40;
-                            }
-                            Image {
-                                width: 26px;
-                                height: 26px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                source: @image-url("../assets/macbook_pin.png");
-                                image-fit: contain;
-                            }
-                        }
-
-                        // Coordinate label below pin
-                        if root.map_has_pin : Rectangle {
-                            width: 140px;
-                            height: 20px;
-                            x: root.map_pin_world_x - self.width / 2;
-                            y: root.map_pin_world_y + 30px;
-                            border-radius: 4px;
-                            background: #000000aa;
-
-                            Text {
-                                text: root.pin_lat_lon_short;
-                                font-size: 11px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        flicked => {
-                            root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
-                        }
-                    }
-
-                    if root.map_tiles.length == 0 : Text {
-                        text: "Loading map tiles...";
-                        color: #888888;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    // Map control button group – top-right
-                    Rectangle {
-                        width: 46px;
-                        height: 132px;
-                        x: parent.width - self.width - 10px;
-                        y: 10px;
-                        border-radius: 12px;
-                        background: #0d1a2acc;
-                        border-width: 1px;
-                        border-color: #0a84ff44;
-
-                        // Zoom-in button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 3px;
-                            border-radius: 10px;
-                            background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-                            Text {
-                                text: "+";
-                                font-size: 26px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            btn-plus-ta := TouchArea {
-                                clicked => {
-                                    root.map_zoom_in(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-
-                        // Separator
-                        Rectangle {
-                            width: 28px;
-                            height: 1px;
-                            x: (parent.width - self.width) / 2;
-                            y: 44px;
-                            background: #0a84ff33;
-                        }
-
-                        // Zoom-out button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 46px;
-                            border-radius: 10px;
-                            background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-                            Text {
-                                text: "\u{2212}";
-                                font-size: 26px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            btn-minus-ta := TouchArea {
-                                clicked => {
-                                    root.map_zoom_out(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-
-                        // Separator
-                        Rectangle {
-                            width: 28px;
-                            height: 1px;
-                            x: (parent.width - self.width) / 2;
-                            y: 87px;
-                            background: #0a84ff33;
-                        }
-
-                        // Center / locate button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 89px;
-                            border-radius: 10px;
-                            background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-
-                            // Crosshair ring
-                            Rectangle {
-                                width: 16px;
-                                height: 16px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-width: 2px;
-                                border-color: #ffffff;
-                                border-radius: 8px;
-                                background: #00000000;
-                            }
-                            // Center dot
-                            Rectangle {
-                                width: 4px;
-                                height: 4px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 2px;
-                                background: #ffffff;
-                            }
-                            // Crosshair top
-                            Rectangle {
-                                width: 2px;
-                                height: 5px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - 16px) / 2 - self.height;
-                                background: #ffffff;
-                            }
-                            // Crosshair bottom
-                            Rectangle {
-                                width: 2px;
-                                height: 5px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height + 16px) / 2;
-                                background: #ffffff;
-                            }
-                            // Crosshair left
-                            Rectangle {
-                                width: 5px;
-                                height: 2px;
-                                x: (parent.width - 16px) / 2 - self.width;
-                                y: (parent.height - self.height) / 2;
-                                background: #ffffff;
-                            }
-                            // Crosshair right
-                            Rectangle {
-                                width: 5px;
-                                height: 2px;
-                                x: (parent.width + 16px) / 2;
-                                y: (parent.height - self.height) / 2;
-                                background: #ffffff;
-                            }
-
-                            btn-center-ta := TouchArea {
-                                clicked => {
-                                    root.center_map_on_pin(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Scale legend \u{2013} bottom-right
-                    Rectangle {
-                        width: 148px;
-                        height: 30px;
-                        x: parent.width - self.width - 14px;
-                        y: parent.height - self.height - 14px;
-                        border-radius: 6px;
-                        background: #0d1a2acc;
-                        border-width: 1px;
-                        border-color: #0a84ff44;
-
-                        // Scale line
-                        Rectangle {
-                            width: root.scale_bar_width;
-                            height: 2px;
-                            x: (parent.width - self.width) / 2;
-                            y: 6px;
-                            background: #ffffff;
-                        }
-                        // Left tick
-                        Rectangle {
-                            width: 2px;
-                            height: 8px;
-                            x: (parent.width - root.scale_bar_width) / 2;
-                            y: 3px;
-                            background: #ffffff;
-                        }
-                        // Right tick
-                        Rectangle {
-                            width: 2px;
-                            height: 8px;
-                            x: (parent.width + root.scale_bar_width) / 2 - 1px;
-                            y: 3px;
-                            background: #ffffff;
-                        }
-                        // Scale label
-                        Text {
-                            text: root.scale_bar_text;
-                            font-size: 11px;
-                            color: #ffffff;
-                            width: parent.width;
-                            y: 12px;
-                            horizontal-alignment: center;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-}
+slint::include_modules!();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -1170,6 +85,8 @@ struct AppConfig {
     osm_tile_user_agent: String,
     server_base_url: String,
     rov_network_interface: String,
+    nmea_gps_host: String,
+    nmea_gps_port: String,
 }
 
 impl Default for AppConfig {
@@ -1182,6 +99,8 @@ impl Default for AppConfig {
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
             server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
             rov_network_interface: String::new(),
+            nmea_gps_host: String::new(),
+            nmea_gps_port: DEFAULT_NMEA_GPS_PORT.to_string(),
         }
     }
 }
@@ -1207,6 +126,8 @@ impl AppConfig {
             osm_tile_user_agent: self.osm_tile_user_agent.clone(),
             server_base_url: self.server_base_url.clone(),
             rov_network_interface: self.rov_network_interface.clone(),
+            nmea_gps_host: self.nmea_gps_host.clone(),
+            nmea_gps_port: self.nmea_gps_port.clone(),
         }
     }
 
@@ -1219,7 +140,20 @@ impl AppConfig {
             osm_tile_user_agent: config.osm_tile_user_agent,
             server_base_url: config.server_base_url,
             rov_network_interface: config.rov_network_interface,
+            nmea_gps_host: config.nmea_gps_host,
+            nmea_gps_port: config.nmea_gps_port,
         }
+    }
+
+    fn parse_nmea_gps_port(&self) -> Result<u16> {
+        let port_text = self.nmea_gps_port.trim();
+        let port = port_text
+            .parse::<u16>()
+            .context("NMEA GPS port must be a number between 1 and 65535")?;
+        if port == 0 {
+            anyhow::bail!("NMEA GPS port must be between 1 and 65535");
+        }
+        Ok(port)
     }
 
     /// Returns the configured interface name if non-empty, or `None` to let
@@ -1247,6 +181,8 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT,
         server_base_url: DEFAULT_SERVER_BASE_URL,
         rov_network_interface: "",
+        nmea_gps_host: "",
+        nmea_gps_port: NMEA_GPS_PORT_DEFAULT_STR,
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -1258,6 +194,11 @@ const _: () = {
     // Compile-time check that the string matches the real constant. If the
     // constant ever changes, this will prevent a silent drift.
     assert!(ROV_STATUS_UDP_PORT == 8500);
+};
+
+const NMEA_GPS_PORT_DEFAULT_STR: &str = "11123";
+const _: () = {
+    assert!(DEFAULT_NMEA_GPS_PORT == 11123);
 };
 
 fn parse_host_from_http_base(base: &str) -> Option<String> {
@@ -1310,6 +251,20 @@ struct MediaUiState {
     preview_image: Option<slint::Image>,
     /// Cache of thumbnail images keyed by media name.
     thumbnail_cache: std::collections::HashMap<String, slint::Image>,
+    /// Active media playback stream (ffmpeg decoding an MP4 from the ROV).
+    media_stream_controller: Option<StreamController>,
+    media_stream_event_rx: Option<Receiver<StreamEvent>>,
+    media_stream_active: bool,
+    media_stream_frames: u64,
+    /// Structured capture-overlay short strings.
+    capture_depth: String,
+    capture_temp: String,
+    capture_heading: String,
+    capture_attitude: String,
+    capture_coords: String,
+    capture_battery: String,
+    /// Compact subtitle: "793 KB \u{2022} image/jpeg \u{2022} 1920\u{00d7}1080"
+    info_subtitle: String,
 }
 
 impl MediaUiState {
@@ -1330,7 +285,60 @@ impl MediaUiState {
             event_rx,
             preview_image: None,
             thumbnail_cache: std::collections::HashMap::new(),
+            media_stream_controller: None,
+            media_stream_event_rx: None,
+            media_stream_active: false,
+            media_stream_frames: 0,
+            capture_depth: String::new(),
+            capture_temp: String::new(),
+            capture_heading: String::new(),
+            capture_attitude: String::new(),
+            capture_coords: String::new(),
+            capture_battery: String::new(),
+            info_subtitle: String::new(),
         }
+    }
+
+    fn poll_media_stream(&mut self) -> Option<RgbaFrame> {
+        let mut disconnected = false;
+        let mut latest_frame = None;
+        if let Some(rx) = &self.media_stream_event_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(StreamEvent::Frame(frame)) => {
+                        latest_frame = Some(frame);
+                        self.media_stream_frames = self.media_stream_frames.saturating_add(1);
+                    }
+                    Ok(StreamEvent::Status(_) | StreamEvent::Error(_)) => {}
+                    Ok(StreamEvent::Ended) => {
+                        disconnected = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            if let Some(mut controller) = self.media_stream_controller.take() {
+                controller.stop();
+            }
+            self.media_stream_event_rx = None;
+            self.media_stream_active = false;
+        }
+        latest_frame
+    }
+
+    fn stop_media_stream(&mut self) {
+        if let Some(mut controller) = self.media_stream_controller.take() {
+            controller.stop();
+        }
+        self.media_stream_event_rx = None;
+        self.media_stream_active = false;
+        self.media_stream_frames = 0;
     }
 }
 
@@ -1365,11 +373,12 @@ struct ThirdEyeState {
     rov_info: String,
     stream: StreamState,
     rov_status: UdpStatusState,
+    nmea_gps: NmeaGpsState,
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
     media: MediaUiState,
-    /// Unix-ms timestamp of the last successful CoreLocation fix.
+    /// Unix-ms timestamp of the last successful location fix.
     location_detected_at_ms: i64,
     /// Unix-ms timestamp when the user left the stream screen.
     /// `0` means we are on the stream screen (or never were).
@@ -1389,6 +398,8 @@ impl ThirdEyeState {
                 osm_tile_user_agent: defaults.osm_tile_user_agent.to_owned(),
                 server_base_url: defaults.server_base_url.to_owned(),
                 rov_network_interface: defaults.rov_network_interface.to_owned(),
+                nmea_gps_host: defaults.nmea_gps_host.to_owned(),
+                nmea_gps_port: defaults.nmea_gps_port.to_owned(),
             }
         });
 
@@ -1440,6 +451,7 @@ impl ThirdEyeState {
             rov_info: String::new(),
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
+            nmea_gps: NmeaGpsState::default(),
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
@@ -1450,7 +462,7 @@ impl ThirdEyeState {
     }
 
     fn initialize_location_on_startup(&mut self) {
-        match detect_location(&mut self.map) {
+        match detect_location(&mut self.map, self.nmea_gps.latest_location()) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
                 self.map.lon = Some(location.lon);
@@ -1483,7 +495,7 @@ impl ThirdEyeState {
     }
 
     fn auto_refresh_map_on_tab_enter(&mut self) {
-        match detect_location(&mut self.map) {
+        match detect_location(&mut self.map, self.nmea_gps.latest_location()) {
             Ok(location) => {
                 self.map.lat = Some(location.lat);
                 self.map.lon = Some(location.lon);
@@ -1663,6 +675,10 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_rov_network_interface(state.config.rov_network_interface.clone().into());
     ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
+    ui.set_nmea_gps_host(state.config.nmea_gps_host.clone().into());
+    ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
+    ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
+    ui.set_nmea_gps_running(state.nmea_gps.is_running());
     ui.set_auth_email(state.auth.email.clone().into());
     ui.set_auth_password(state.auth.password.clone().into());
     ui.set_auth_status_text(state.auth.status_text.clone().into());
@@ -1845,6 +861,8 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
     state.config.rov_network_interface = ui.get_rov_network_interface().to_string();
     state.config.server_base_url = ui.get_server_base_url().to_string();
+    state.config.nmea_gps_host = ui.get_nmea_gps_host().to_string();
+    state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -1997,21 +1015,18 @@ fn build_capture_text(meta: &StoredCaptureMetadata) -> String {
     if let Some(temp) = meta.temperature_c {
         lines.push(format!("Temperature: {temp:.1} \u{00b0}C"));
     }
-    match (meta.lat_e7, meta.lon_e7) {
-        (Some(lat), Some(lon)) => {
-            let lat_deg = lat as f64 / 1e7;
-            let lon_deg = lon as f64 / 1e7;
-            lines.push(format!(
-                "Coordinates: {lat_deg:.6}, {lon_deg:.6} (lat_e7={lat}, lon_e7={lon})"
-            ));
+    if let (Some(lat), Some(lon)) = (meta.lat_e7, meta.lon_e7) {
+        let lat_deg = lat as f64 / 1e7;
+        let lon_deg = lon as f64 / 1e7;
+        lines.push(format!(
+            "Coordinates: {lat_deg:.6}, {lon_deg:.6} (lat_e7={lat}, lon_e7={lon})"
+        ));
+    } else {
+        if let Some(line) = opt_num("lat_e7=", meta.lat_e7, "") {
+            lines.push(line);
         }
-        _ => {
-            if let Some(line) = opt_num("lat_e7=", meta.lat_e7, "") {
-                lines.push(line);
-            }
-            if let Some(line) = opt_num("lon_e7=", meta.lon_e7, "") {
-                lines.push(line);
-            }
+        if let Some(line) = opt_num("lon_e7=", meta.lon_e7, "") {
+            lines.push(line);
         }
     }
     if let Some(imu) = &meta.imu_json {
@@ -2064,10 +1079,40 @@ fn refresh_media_rows(state: &mut ThirdEyeState, store: &AppStore) {
 
 fn is_image_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".png")
-        || lower.ends_with(".dng")
+    std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpeg"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
+}
+
+fn is_video_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+}
+
+fn build_media_download_url(rov_http_base: &str, name: &str) -> Result<String> {
+    let base = rov_http_base.trim_end_matches('/');
+    let mut url = Url::parse(base).with_context(|| format!("invalid ROV HTTP base URL: {base}"))?;
+    {
+        let mut segs = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("URL cannot be a base: {base}"))?;
+        segs.push("v1").push("medias").push(name).push("download");
+    }
+    Ok(url.to_string())
 }
 
 fn load_image_preview(path: &str, max_dim: u32) -> Option<slint::Image> {
@@ -2083,6 +1128,79 @@ fn load_image_preview(path: &str, max_dim: u32) -> Option<slint::Image> {
     Some(rgba_frame_to_slint_image(&frame))
 }
 
+fn build_info_subtitle(record: &LocalMediaRecord) -> String {
+    let mut parts = Vec::new();
+    parts.push(format_bytes(record.size_bytes));
+    if let Some(mime) = &record.mime {
+        parts.push(mime.clone());
+    }
+    if let (Some(w), Some(h)) = (record.width, record.height)
+        && w > 0
+        && h > 0
+    {
+        parts.push(format!("{w}\u{00d7}{h}"));
+    }
+    if let Some(dur) = record.duration_s
+        && dur > 0
+    {
+        parts.push(format!("{dur}s"));
+    }
+    parts.join(" \u{2022} ")
+}
+
+fn populate_capture_overlay(state: &mut ThirdEyeState, meta: &StoredCaptureMetadata) {
+    state.media.capture_depth = meta
+        .depth_m
+        .map(|d| format!("{d:.1} m"))
+        .unwrap_or_default();
+    state.media.capture_temp = meta
+        .temperature_c
+        .map(|t| format!("{t:.1} \u{00b0}C"))
+        .unwrap_or_default();
+    state.media.capture_heading = meta
+        .yaw
+        .map(|y| format!("{:.0}\u{00b0}", y.to_degrees().rem_euclid(360.0)))
+        .unwrap_or_default();
+    state.media.capture_attitude = match (meta.pitch, meta.roll) {
+        (Some(p), Some(r)) => format!(
+            "P {:.1}\u{00b0}  R {:.1}\u{00b0}",
+            p.to_degrees(),
+            r.to_degrees()
+        ),
+        _ => String::new(),
+    };
+    state.media.capture_coords = match (meta.lat_e7, meta.lon_e7) {
+        (Some(lat), Some(lon)) => {
+            let lat_deg = lat as f64 / 1e7;
+            let lon_deg = lon as f64 / 1e7;
+            format!("{lat_deg:.4}, {lon_deg:.4}")
+        }
+        _ => String::new(),
+    };
+    state.media.capture_battery = meta
+        .batteries_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+        .map(|batts| {
+            batts
+                .iter()
+                .filter_map(|b| b.get("remain").and_then(serde_json::Value::as_i64))
+                .map(|r| format!("{r}%"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default();
+}
+
+fn clear_capture_overlay(state: &mut ThirdEyeState) {
+    state.media.capture_depth.clear();
+    state.media.capture_temp.clear();
+    state.media.capture_heading.clear();
+    state.media.capture_attitude.clear();
+    state.media.capture_coords.clear();
+    state.media.capture_battery.clear();
+}
+
 fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore) {
     let Some((media_id, name)) = state.media.selected.clone() else {
         state.media.details_text.clear();
@@ -2090,6 +1208,8 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         state.media.has_capture_meta = false;
         state.media.local_path.clear();
         state.media.preview_image = None;
+        state.media.info_subtitle.clear();
+        clear_capture_overlay(state);
         return;
     };
     let record = state
@@ -2097,37 +1217,39 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         .rows
         .iter()
         .find(|r| r.media_id == media_id && r.name == name);
-    match record {
-        Some(record) => {
-            state.media.details_text = build_details_text(record);
-            state.media.local_path = record.local_path.clone().unwrap_or_default();
-            // Load preview from local file if it's an image.
-            if is_image_name(&name) && !state.media.local_path.is_empty() {
-                state.media.preview_image = load_image_preview(&state.media.local_path, 800);
-            } else {
-                state.media.preview_image = None;
-            }
-        }
-        None => {
-            // Row was pruned (e.g. DB reset); clear selection.
-            state.media.selected = None;
-            state.media.details_text.clear();
-            state.media.local_path.clear();
+    if let Some(record) = record {
+        state.media.details_text = build_details_text(record);
+        state.media.info_subtitle = build_info_subtitle(record);
+        state.media.local_path = record.local_path.clone().unwrap_or_default();
+        // Load preview from local file if it's an image.
+        if is_image_name(&name) && !state.media.local_path.is_empty() {
+            state.media.preview_image = load_image_preview(&state.media.local_path, 800);
+        } else if !state.media.media_stream_active {
             state.media.preview_image = None;
         }
+    } else {
+        // Row was pruned (e.g. DB reset); clear selection.
+        state.media.selected = None;
+        state.media.details_text.clear();
+        state.media.info_subtitle.clear();
+        state.media.local_path.clear();
+        state.media.preview_image = None;
     }
     match store.media().get_capture_metadata(&media_id, &name) {
         Ok(Some(meta)) => {
             state.media.capture_text = build_capture_text(&meta);
             state.media.has_capture_meta = true;
+            populate_capture_overlay(state, &meta);
         }
         Ok(None) => {
             state.media.capture_text.clear();
             state.media.has_capture_meta = false;
+            clear_capture_overlay(state);
         }
         Err(err) => {
             state.media.capture_text = format!("Failed to load capture metadata: {err:#}");
             state.media.has_capture_meta = true;
+            clear_capture_overlay(state);
         }
     }
 }
@@ -2169,6 +1291,20 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_media_selected_local_path(state.media.local_path.clone().into());
     ui.set_media_selected_has_capture_meta(state.media.has_capture_meta);
     ui.set_media_download_in_progress(state.media.download_in_progress);
+    let selected_is_video = state
+        .media
+        .selected
+        .as_ref()
+        .is_some_and(|(_, name)| is_video_name(name));
+    ui.set_media_selected_is_video(selected_is_video);
+    ui.set_media_stream_active(state.media.media_stream_active);
+    ui.set_media_info_subtitle(state.media.info_subtitle.clone().into());
+    ui.set_media_capture_depth(state.media.capture_depth.clone().into());
+    ui.set_media_capture_temp(state.media.capture_temp.clone().into());
+    ui.set_media_capture_heading(state.media.capture_heading.clone().into());
+    ui.set_media_capture_attitude(state.media.capture_attitude.clone().into());
+    ui.set_media_capture_coords(state.media.capture_coords.clone().into());
+    ui.set_media_capture_battery(state.media.capture_battery.clone().into());
     if let Some(img) = &state.media.preview_image {
         ui.set_media_preview_image(img.clone());
         ui.set_has_media_preview(true);
@@ -2180,8 +1316,7 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Reconciles the ROV media list and writes a `capture_metadata` row for the
@@ -2228,13 +1363,7 @@ fn attach_capture_metadata_to_latest(
         return Ok(None);
     };
 
-    media_store.attach_capture_metadata(
-        &media_id,
-        &name,
-        captured_at_ms,
-        status,
-        None,
-    )?;
+    media_store.attach_capture_metadata(&media_id, &name, captured_at_ms, status, None)?;
     let mut line = format!("Attached capture metadata to {name}.");
     if let Some(status) = status {
         line.push_str(&format!(
@@ -2263,6 +1392,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         if state.last_screen == Screen::Stream {
             state.stream_left_at_ms = current_unix_ms();
         }
+        state.media.stop_media_stream();
         state.active_screen = Screen::Configuration;
         state.last_screen = Screen::Configuration;
         apply_state_to_ui(&ui, &state);
@@ -2284,8 +1414,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 return;
             }
             state.viewport_anim = None;
-            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
-            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+            state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
             apply_map_runtime_to_ui(&ui, &state);
         },
     );
@@ -2301,8 +1431,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Ok(state) => state,
                 Err(_) => return,
             };
-            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
-            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+            state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
             state.viewport_anim = None;
             let next_zoom = state.map.zoom.saturating_add(1).min(MAX_ZOOM);
             let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
@@ -2324,8 +1454,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Ok(state) => state,
                 Err(_) => return,
             };
-            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
-            state.set_map_viewport(viewport_x as f64, viewport_y as f64);
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+            state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
             state.viewport_anim = None;
             let next_zoom = state.map.zoom.saturating_sub(1).max(MIN_ZOOM);
             let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
@@ -2347,10 +1477,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Ok(state) => state,
                 Err(_) => return,
             };
-            state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
             state.map_tiles.fallback_zoom = None;
             let (old_vp_x, old_vp_y, _, _) = state.map_tiles.viewport_for_slint(state.map.zoom);
-            match detect_location(&mut state.map) {
+            let nmea_fix = state.nmea_gps.latest_location();
+            match detect_location(&mut state.map, nmea_fix) {
                 Ok(location) => {
                     state.map.lat = Some(location.lat);
                     state.map.lon = Some(location.lon);
@@ -2403,10 +1534,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         if state.last_screen == Screen::Stream {
             state.stream_left_at_ms = current_unix_ms();
         }
+        state.media.stop_media_stream();
         state.active_screen = Screen::Map;
         // Map fills the entire content panel
-        let est_width = (content_width as f64).max(320.0);
-        let est_height = (content_height as f64).max(320.0);
+        let est_width = f64::from(content_width).max(320.0);
+        let est_height = f64::from(content_height).max(320.0);
         state.set_map_visible_size(est_width, est_height);
         state.map_tiles.fallback_zoom = None;
         state.auto_refresh_map_on_tab_enter();
@@ -2428,7 +1560,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         pull_configuration_from_ui(&ui, &mut state, &store_for_stream_navigation);
 
         // Refresh device location for the POS overlay.
-        if let Ok(location) = detect_location(&mut state.map) {
+        let nmea_fix = state.nmea_gps.latest_location();
+        if let Ok(location) = detect_location(&mut state.map, nmea_fix) {
             state.map.lat = Some(location.lat);
             state.map.lon = Some(location.lon);
             state.location_detected_at_ms = current_unix_ms();
@@ -2454,9 +1587,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Ok(port) => {
                     let bind_host = state.config.rov_status_udp_bind_host.clone();
                     let iface = state.config.rov_interface().map(str::to_owned);
-                    if let Err(err) =
-                        state.rov_status.start(&bind_host, port, iface.as_deref())
-                    {
+                    if let Err(err) = state.rov_status.start(&bind_host, port, iface.as_deref()) {
                         state
                             .rov_status
                             .set_status_text(format!("Failed to start UDP listener: {err:#}"));
@@ -2470,6 +1601,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             }
         }
 
+        state.media.stop_media_stream();
         state.active_screen = Screen::Stream;
         state.last_screen = Screen::Stream;
         apply_state_to_ui(&ui, &state);
@@ -2838,8 +1970,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_detect_location);
-        state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
-        match detect_location(&mut state.map) {
+        state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+        let nmea_fix = state.nmea_gps.latest_location();
+        match detect_location(&mut state.map, nmea_fix) {
             Ok(location) => {
                 state.map.lat = Some(location.lat);
                 state.map.lon = Some(location.lon);
@@ -2871,7 +2004,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_load_map_tile);
-        state.set_map_visible_size(viewport_width as f64, viewport_height as f64);
+        state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
         state.load_map_tile_for_current_location(
             "Loaded OpenStreetMap tile for detected location.".to_owned(),
         );
@@ -2988,6 +2121,70 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
+    // --- NMEA GPS callbacks ---
+
+    let ui_weak = ui.as_weak();
+    let state_for_start_nmea = Rc::clone(&state);
+    let store_for_start_nmea = Rc::clone(&store);
+    ui.on_start_nmea_gps(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_start_nmea.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_start_nmea);
+        state.nmea_gps.stop();
+        let port = match state.config.parse_nmea_gps_port() {
+            Ok(port) => port,
+            Err(err) => {
+                state.nmea_gps = NmeaGpsState::default();
+                apply_state_to_ui(&ui, &state);
+                ui.set_nmea_gps_status(format!("Invalid NMEA GPS port: {err:#}").into());
+                return;
+            }
+        };
+        let host = state.config.nmea_gps_host.clone();
+        match state.nmea_gps.start(&host, port) {
+            Ok(_msg) => {}
+            Err(err) => {
+                ui.set_nmea_gps_status(format!("Failed to start NMEA GPS: {err:#}").into());
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stop_nmea = Rc::clone(&state);
+    ui.on_stop_nmea_gps(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stop_nmea.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.nmea_gps.stop();
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_default_nmea_port = Rc::clone(&state);
+    let store_for_default_nmea_port = Rc::clone(&store);
+    ui.on_use_default_nmea_gps_port(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_default_nmea_port.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.nmea_gps_port = DEFAULT_NMEA_GPS_PORT.to_string();
+        persist_config(&state, &store_for_default_nmea_port);
+        apply_state_to_ui(&ui, &state);
+    });
+
     // --- Media screen callbacks ---
 
     let ui_weak = ui.as_weak();
@@ -3046,18 +2243,16 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.media.status_text = "Refreshing media from ROV...".to_owned();
         thread::spawn(move || {
             let status_text = match client.list_medias(None::<MediaScene>) {
-                Ok(items) => {
-                    match media_store.apply_rov_listing(&items, None) {
-                        Ok(report) => format!(
-                            "Refreshed. {} on ROV (new {}, updated {}, newly vanished {}).",
-                            report.total_on_rov,
-                            report.new_media,
-                            report.updated_media,
-                            report.disappeared_media
-                        ),
-                        Err(err) => format!("Refresh succeeded but local update failed: {err:#}"),
-                    }
-                }
+                Ok(items) => match media_store.apply_rov_listing(&items, None) {
+                    Ok(report) => format!(
+                        "Refreshed. {} on ROV (new {}, updated {}, newly vanished {}).",
+                        report.total_on_rov,
+                        report.new_media,
+                        report.updated_media,
+                        report.disappeared_media
+                    ),
+                    Err(err) => format!("Refresh succeeded but local update failed: {err:#}"),
+                },
                 Err(err) => format!("Refresh failed: {err:#}"),
             };
             let _ = tx.send(MediaEvent::Refresh { status_text });
@@ -3078,6 +2273,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         let media_id_str = media_id.to_string();
         let name_str = name.to_string();
+        state.media.stop_media_stream();
         state.media.selected = Some((media_id_str.clone(), name_str.clone()));
         recompute_media_selection_details(&mut state, &store_for_select_media);
 
@@ -3086,10 +2282,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             && state.media.local_path.is_empty()
             && !state.media.download_in_progress
         {
-            let data_root = match store_for_select_media
-                .data_path()
-                .and_then(|p| p.parent())
-            {
+            let data_root = match store_for_select_media.data_path().and_then(|p| p.parent()) {
                 Some(dir) => dir.to_path_buf(),
                 None => std::env::temp_dir().join("third-eye-client"),
             };
@@ -3106,10 +2299,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             thread::spawn(move || {
                 let result = download_to_local(&media_store, &camera, &data_root, &mid, &nm)
                     .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(MediaEvent::Download {
-                    name: nm,
-                    result,
-                });
+                let _ = tx.send(MediaEvent::Download { name: nm, result });
             });
         }
 
@@ -3234,10 +2424,72 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     format!("Deleted {name_thread} locally (ROV delete failed: {err:#}).")
                 }
             };
-            let _ = tx.send(MediaEvent::Delete {
-                status_text,
-            });
+            let _ = tx.send(MediaEvent::Delete { status_text });
         });
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stream_media = Rc::clone(&state);
+    ui.on_stream_selected_media(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stream_media.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some((_, name)) = state.media.selected.clone() else {
+            state.media.status_text = "Select a media entry first.".to_owned();
+            apply_state_to_ui(&ui, &state);
+            return;
+        };
+        if state.media.media_stream_active {
+            return;
+        }
+        let download_url = match build_media_download_url(&state.config.rov_http_base, &name) {
+            Ok(url) => url,
+            Err(err) => {
+                state.media.status_text = format!("Cannot build stream URL: {err:#}");
+                apply_state_to_ui(&ui, &state);
+                return;
+            }
+        };
+        let ffmpeg_bin = if let Some(bin) = locate_ffmpeg_binary() {
+            bin
+        } else {
+            state.media.status_text = "ffmpeg not found. Bundle it as ./bin/ffmpeg.".to_owned();
+            apply_state_to_ui(&ui, &state);
+            return;
+        };
+        match spawn_media_stream_pipeline(ffmpeg_bin, download_url) {
+            Ok((controller, rx)) => {
+                state.media.media_stream_controller = Some(controller);
+                state.media.media_stream_event_rx = Some(rx);
+                state.media.media_stream_active = true;
+                state.media.media_stream_frames = 0;
+                state.media.status_text = format!("Streaming {name} from ROV...");
+            }
+            Err(err) => {
+                state.media.status_text = format!("Failed to start media stream: {err:#}");
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_stop_media_stream = Rc::clone(&state);
+    ui.on_stop_media_stream(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_stop_media_stream.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.media.stop_media_stream();
+        state.media.preview_image = None;
+        state.media.status_text = "Playback stopped.".to_owned();
         apply_state_to_ui(&ui, &state);
     });
 }
@@ -3249,10 +2501,7 @@ fn poll_media_events(state: &mut ThirdEyeState, store: &AppStore) -> bool {
     while let Ok(event) = state.media.event_rx.try_recv() {
         changed = true;
         match event {
-            MediaEvent::Download {
-                name,
-                result,
-            } => {
+            MediaEvent::Download { name, result } => {
                 state.media.download_in_progress = false;
                 match result {
                     Ok(path) => {
@@ -3260,8 +2509,7 @@ fn poll_media_events(state: &mut ThirdEyeState, store: &AppStore) -> bool {
                             format!("Downloaded {name} to {}.", path.display());
                     }
                     Err(err) => {
-                        state.media.status_text =
-                            format!("Download of {name} failed: {err}");
+                        state.media.status_text = format!("Download of {name} failed: {err}");
                     }
                 }
                 refresh_media_rows(state, store);
@@ -3283,9 +2531,7 @@ fn poll_media_events(state: &mut ThirdEyeState, store: &AppStore) -> bool {
                 state.attached_metadata_text = attached_text;
                 refresh_media_rows(state, store);
             }
-            MediaEvent::Delete {
-                status_text,
-            } => {
+            MediaEvent::Delete { status_text } => {
                 state.media.status_text = status_text;
             }
             MediaEvent::ListMedias { rov_info } => {
@@ -3330,6 +2576,63 @@ fn stream_stderr_loop(
             let _ = tx.send(StreamEvent::Error(format!("ffmpeg: {trimmed}")));
         }
     }
+}
+
+fn spawn_media_stream_pipeline(
+    ffmpeg_bin: PathBuf,
+    http_url: String,
+) -> Result<(StreamController, Receiver<StreamEvent>)> {
+    let mut ffmpeg_child = Command::new(&ffmpeg_bin)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&http_url)
+        .arg("-vf")
+        .arg("fps=15,scale=960:-1")
+        .arg("-f")
+        .arg("mjpeg")
+        .arg("-q:v")
+        .arg("6")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn ffmpeg for media streaming")?;
+
+    let stdout = ffmpeg_child
+        .stdout
+        .take()
+        .context("failed to capture ffmpeg stdout")?;
+    let stderr = ffmpeg_child
+        .stderr
+        .take()
+        .context("failed to capture ffmpeg stderr")?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stdout_stop_flag = Arc::clone(&stop_flag);
+    let stderr_stop_flag = Arc::clone(&stop_flag);
+    let (tx, rx) = mpsc::channel();
+    let stdout_tx = tx.clone();
+    let stdout_worker = thread::spawn(move || {
+        let _ = tx.send(StreamEvent::Status(
+            "Media stream started. Waiting for frames...".to_owned(),
+        ));
+        stream_worker_loop(stdout, stdout_stop_flag, tx);
+    });
+    let stderr_worker = thread::spawn(move || {
+        stream_stderr_loop(stderr, stderr_stop_flag, stdout_tx);
+    });
+
+    Ok((
+        StreamController {
+            stop_flag,
+            ffmpeg_child,
+            workers: vec![stdout_worker, stderr_worker],
+            _proxy_guard: None,
+        },
+        rx,
+    ))
 }
 
 fn spawn_stream_pipeline(
@@ -3476,8 +2779,8 @@ fn ensure_rov_route_at_startup(rov_http_base: &str, interface: &str) {
     let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
     let _ = client.list_medias(None::<MediaScene>); // ignore result, just need ARP populated
 
-    let host = parse_host_from_http_base(rov_http_base)
-        .unwrap_or_else(|| "192.168.1.88".to_owned());
+    let host =
+        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_owned());
     let dummy_rtsp = format!("rtsp://x@{host}:8554/");
     if let Err(err) = ensure_rov_route_for_rtsp(&dummy_rtsp, interface) {
         eprintln!("Network route setup failed: {err:#}");
@@ -3591,10 +2894,7 @@ fn get_interface_mac(interface: &str) -> Option<String> {
 /// Reads the MAC address for `host` from the ARP table, filtered to entries
 /// on the specified interface.
 fn read_arp_mac_on_interface(host: &str, interface: &str) -> Option<String> {
-    let output = Command::new("arp")
-        .arg("-an")
-        .output()
-        .ok()?;
+    let output = Command::new("arp").arg("-an").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let host_pattern = format!("({host})");
     for line in text.lines() {
@@ -3604,7 +2904,8 @@ fn read_arp_mac_on_interface(host: &str, interface: &str) -> Option<String> {
         if let Some(at_pos) = line.find(" at ") {
             let after_at = &line[at_pos + 4..];
             if let Some(mac) = after_at.split_whitespace().next()
-                && mac.contains(':') && mac != "(incomplete)"
+                && mac.contains(':')
+                && mac != "(incomplete)"
             {
                 return Some(mac.to_owned());
             }
@@ -3688,8 +2989,7 @@ fn main() -> Result<()> {
                 Err(_) => return,
             };
             // Tear down stream + telemetry after 10 min away from the stream screen.
-            if state.stream_left_at_ms > 0
-                && current_unix_ms() - state.stream_left_at_ms > 600_000
+            if state.stream_left_at_ms > 0 && current_unix_ms() - state.stream_left_at_ms > 600_000
             {
                 state.stream.stop();
                 state.rov_status.stop();
@@ -3699,6 +2999,14 @@ fn main() -> Result<()> {
                 ui.set_stream_image(rgba_frame_to_slint_image(&frame));
                 ui.set_has_stream_image(true);
             }
+            // Poll media playback stream (MP4 streaming from ROV).
+            if let Some(frame) = state.media.poll_media_stream() {
+                let img = rgba_frame_to_slint_image(&frame);
+                state.media.preview_image = Some(img.clone());
+                ui.set_media_preview_image(img);
+                ui.set_has_media_preview(true);
+            }
+            ui.set_media_stream_active(state.media.media_stream_active);
             let current_zoom = state.map.zoom;
             let (map_changed, map_error) = state.map_tiles.poll_loaded_tiles(current_zoom);
             let has_map_error = map_error.is_some();
@@ -3717,6 +3025,16 @@ fn main() -> Result<()> {
                 apply_map_runtime_to_ui(&ui, &state);
             }
             state.rov_status.poll_events();
+            // Poll NMEA GPS: update map location when a fix arrives.
+            if state.nmea_gps.poll_events()
+                && let Some((lat, lon)) = state.nmea_gps.latest_location()
+            {
+                state.map.lat = Some(lat);
+                state.map.lon = Some(lon);
+                state.location_detected_at_ms = current_unix_ms();
+            }
+            ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
+            ui.set_nmea_gps_running(state.nmea_gps.is_running());
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
             if poll_media_events(&mut state, &poll_store) {
                 apply_state_to_ui(&ui, &state);
@@ -3729,7 +3047,9 @@ fn main() -> Result<()> {
 
     if let Ok(mut state) = state.try_borrow_mut() {
         state.stream.stop();
+        state.media.stop_media_stream();
         state.rov_status.stop();
+        state.nmea_gps.stop();
     }
     store.shutdown();
 

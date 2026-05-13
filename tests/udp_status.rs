@@ -14,8 +14,8 @@ fn sample_status_json() -> String {
         "roll": -0.34_f32,
         "yaw": 1.57_f32,
         "depth": 12.5_f32,
-        "lat": 451234567_i32,
-        "lon": 161234567_i32,
+        "lat": 451_234_567_i32,
+        "lon": 161_234_567_i32,
         "temperature": 23.4_f32,
         "batteries": [
             {
@@ -40,11 +40,11 @@ fn build_status_packet(payload_json: &str, little_endian_len: bool) -> Vec<u8> {
     packet.push(TEST_PACKET_ID);
     packet.push(1_u8);
     packet.extend_from_slice(&[0_u8, 0_u8]);
-    let payload_len = payload.len() as u32;
+    let payload_len = u32::try_from(payload.len());
     if little_endian_len {
-        packet.extend_from_slice(&payload_len.to_le_bytes());
+        packet.extend_from_slice(&payload_len.expect("REASON").to_le_bytes());
     } else {
-        packet.extend_from_slice(&payload_len.to_be_bytes());
+        packet.extend_from_slice(&payload_len.expect("REASON").to_be_bytes());
     }
     packet.push(TEST_PACKET_TYPE);
     packet.extend_from_slice(&[0_u8, 0_u8, 0_u8]);

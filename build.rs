@@ -2,6 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    slint_build::compile("ui/app.slint").expect("Slint compilation failed");
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "macos" {
         return;

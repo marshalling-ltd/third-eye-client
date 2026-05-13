@@ -20,7 +20,7 @@ use super::db::SharedDb;
 /// Maximum number of seconds between retries.
 const MAX_BACKOFF_SECS: i64 = 300;
 /// Wait between polls when the queue is empty.
-const IDLE_POLL: Duration = Duration::from_millis(1_000);
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// Minimal builder-style request description the worker needs to replay an
 /// outbox row.
@@ -34,6 +34,7 @@ pub struct OutboxRequest {
 }
 
 impl OutboxRequest {
+    #[must_use]
     pub fn new_with_random_key(method: &str, endpoint: &str) -> Self {
         Self {
             method: method.to_owned(),
@@ -44,6 +45,7 @@ impl OutboxRequest {
         }
     }
 
+    #[must_use]
     pub fn with_json_body(mut self, body: &serde_json::Value) -> Self {
         self.body_json = Some(body.to_string());
         self
@@ -160,6 +162,7 @@ struct OutboxRow {
 
 /// Returns the number of seconds before the next retry for the given attempt
 /// count (1-indexed).
+#[must_use]
 pub fn backoff_for(attempts: i64) -> i64 {
     if attempts <= 0 {
         return 0;
@@ -176,6 +179,7 @@ pub struct OutboxWorker {
 }
 
 impl OutboxWorker {
+    #[must_use]
     pub fn spawn(store: OutboxStore) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&stop_flag);
@@ -275,8 +279,7 @@ fn attempt_send(
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]

@@ -96,9 +96,19 @@ impl MediaStore {
         items: &[MediaInfo],
         scene: Option<MediaScene>,
     ) -> Result<MediaSyncReport> {
-        let now = now_ms();
         let conn = self.db.lock().expect("media_sync mutex poisoned");
         let tx = conn.unchecked_transaction()?;
+        // Ensure the sweep timestamp is strictly greater than any existing
+        // `last_seen_ms` so that the disappeared-detection query (`< ?1`)
+        // works even when two calls land within the same millisecond.
+        let max_existing: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(last_seen_ms), 0) FROM media_sync",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let now = now_ms().max(max_existing + 1);
 
         let mut report = MediaSyncReport {
             total_on_rov: items.len(),
@@ -121,8 +131,8 @@ impl MediaStore {
                  ON CONFLICT(media_id, name) DO UPDATE SET
                      size_bytes     = excluded.size_bytes,
                      duration_s     = excluded.duration_s,
-                     width          = excluded.width,
-                     height         = excluded.height,
+                     width          = COALESCE(NULLIF(excluded.width, 0), media_sync.width),
+                     height         = COALESCE(NULLIF(excluded.height, 0), media_sync.height),
                      mime           = COALESCE(excluded.mime, media_sync.mime),
                      scene          = COALESCE(excluded.scene, media_sync.scene),
                      last_seen_ms   = excluded.last_seen_ms,
@@ -136,7 +146,7 @@ impl MediaStore {
                     item.origin.width,
                     item.origin.height,
                     mime,
-                    scene.map(|s| s.as_query_int()),
+                    scene.map(super::super::camera::MediaScene::as_query_int),
                     now,
                     now,
                     item.origin.stat,
@@ -205,11 +215,11 @@ impl MediaStore {
                 media_id,
                 name,
                 captured_at_ms,
-                status.map(|s| s.pitch as f64),
-                status.map(|s| s.roll as f64),
-                status.map(|s| s.yaw as f64),
-                status.map(|s| s.depth as f64),
-                status.map(|s| s.temperature as f64),
+                status.map(|s| f64::from(s.pitch)),
+                status.map(|s| f64::from(s.roll)),
+                status.map(|s| f64::from(s.yaw)),
+                status.map(|s| f64::from(s.depth)),
+                status.map(|s| f64::from(s.temperature)),
                 status.map(|s| s.lat),
                 status.map(|s| s.lon),
                 batteries_json,
@@ -242,11 +252,11 @@ impl MediaStore {
                 ts_ms,
                 media_id,
                 name,
-                status.map(|s| s.pitch as f64),
-                status.map(|s| s.roll as f64),
-                status.map(|s| s.yaw as f64),
-                status.map(|s| s.depth as f64),
-                status.map(|s| s.temperature as f64),
+                status.map(|s| f64::from(s.pitch)),
+                status.map(|s| f64::from(s.roll)),
+                status.map(|s| f64::from(s.yaw)),
+                status.map(|s| f64::from(s.depth)),
+                status.map(|s| f64::from(s.temperature)),
                 status.map(|s| s.lat),
                 status.map(|s| s.lon),
                 note,
@@ -353,6 +363,25 @@ impl MediaStore {
         Ok(())
     }
 
+    /// Updates the width/height columns for a media row.
+    pub fn set_dimensions(
+        &self,
+        media_id: &str,
+        name: &str,
+        width: i32,
+        height: i32,
+    ) -> Result<()> {
+        let conn = self.db.lock().expect("media_sync mutex poisoned");
+        conn.execute(
+            "UPDATE media_sync
+                SET width = ?3, height = ?4
+              WHERE media_id = ?1 AND name = ?2",
+            params![media_id, name, width, height],
+        )
+        .context("updating media_sync dimensions")?;
+        Ok(())
+    }
+
     /// Clears `local_path` / `local_sha256` when the local copy is gone.
     pub fn forget_local(&self, media_id: &str, name: &str) -> Result<()> {
         let conn = self.db.lock().expect("media_sync mutex poisoned");
@@ -421,22 +450,49 @@ pub fn download_to_local(
         .with_context(|| format!("writing {}", target.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&payload.bytes);
-    let sha_hex = format!("{:x}", hasher.finalize());
+    let sha_hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     store.set_local_path(media_id, name, &target, Some(&sha_hex))?;
+    // Persist image dimensions into the DB so the UI can show them without
+    // re-reading the file every time.
+    if let Ok(dim) = image::image_dimensions(&target) {
+        let _ = store.set_dimensions(media_id, name, dim.0 as i32, dim.1 as i32);
+    }
     Ok(target)
 }
 
 fn guess_mime(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+    if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpeg"))
+    {
         Some("image/jpeg".to_owned())
-    } else if lower.ends_with(".dng") {
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
+    {
         Some("image/x-adobe-dng".to_owned())
-    } else if lower.ends_with(".png") {
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+    {
         Some("image/png".to_owned())
-    } else if lower.ends_with(".mp4") {
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+    {
         Some("video/mp4".to_owned())
-    } else if lower.ends_with(".mov") {
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+    {
         Some("video/quicktime".to_owned())
     } else {
         None
@@ -446,8 +502,7 @@ fn guess_mime(name: &str) -> Option<String> {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -671,6 +726,47 @@ mod tests {
             )
             .unwrap();
         assert!(id >= 1);
+    }
+
+    #[test]
+    fn dimensions_survive_set_and_rov_refresh() {
+        let db = open_in_memory().unwrap();
+        let store = MediaStore::new(Arc::clone(&db));
+        store
+            .apply_rov_listing(&[info("id-a", "a.jpeg", 100)], None)
+            .unwrap();
+        // info() sets width=1920, height=1080 from ROV listing
+        let rec = store
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.media_id == "id-a")
+            .unwrap();
+        assert_eq!(rec.width, Some(1920), "width from ROV listing");
+        assert_eq!(rec.height, Some(1080), "height from ROV listing");
+        // Simulate download setting dimensions
+        store.set_dimensions("id-a", "a.jpeg", 3840, 2160).unwrap();
+        let rec = store
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.media_id == "id-a")
+            .unwrap();
+        assert_eq!(rec.width, Some(3840), "width after set_dimensions");
+        assert_eq!(rec.height, Some(2160), "height after set_dimensions");
+        // Simulate ROV refresh with 0 dimensions — should preserve
+        let mut zero_dim = info("id-a", "a.jpeg", 100);
+        zero_dim.origin.width = 0;
+        zero_dim.origin.height = 0;
+        store.apply_rov_listing(&[zero_dim], None).unwrap();
+        let rec = store
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.media_id == "id-a")
+            .unwrap();
+        assert_eq!(rec.width, Some(3840), "width preserved after ROV refresh with 0");
+        assert_eq!(rec.height, Some(2160), "height preserved after ROV refresh with 0");
     }
 
     // Required by `Arc::clone` in the tests above.
