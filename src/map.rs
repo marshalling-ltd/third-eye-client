@@ -127,15 +127,15 @@ impl MapTilesState {
             fallback_zoom: None,
             tile_result_tx,
             tile_result_rx,
-            visible_width: MAP_IMAGE_SIZE_PX as f64,
-            visible_height: MAP_IMAGE_SIZE_PX as f64,
+            visible_width: f64::from(MAP_IMAGE_SIZE_PX),
+            visible_height: f64::from(MAP_IMAGE_SIZE_PX),
             offset_x: 0.0,
             offset_y: 0.0,
         }
     }
 
     pub fn world_size_px(zoom_level: u32) -> f64 {
-        (MAP_TILE_SIZE_PX as f64) * f64::exp2(zoom_level as f64)
+        (MAP_TILE_SIZE_PX as f64) * f64::exp2(f64::from(zoom_level))
     }
 
     fn clamp_offset_to_world(&mut self, zoom_level: u32) {
@@ -237,7 +237,7 @@ impl MapTilesState {
         current_zoom: u32,
         target_zoom: u32,
     ) -> (isize, isize, isize, isize, isize) {
-        let scale = f64::exp2((target_zoom as i32 - current_zoom as i32) as f64);
+        let scale = f64::exp2(f64::from(target_zoom as i32 - current_zoom as i32));
         let world_tiles = 1_isize << target_zoom;
         let offset_x = self.offset_x * scale;
         let offset_y = self.offset_y * scale;
@@ -328,20 +328,21 @@ impl MapTilesState {
                 let spawn_result = thread::Builder::new()
                     .name(format!("osm-tile-{}-{}-{}", coord.z, coord.x, coord.y))
                     .spawn(move || {
-                        let outcome = load_osm_tile(client, coord, &user_agent)
-                            .map(|frame| TileLoadResult {
-                                coord,
-                                frame: Some(frame),
-                                error: None,
-                            })
-                            .unwrap_or_else(|err| TileLoadResult {
+                        let outcome = load_osm_tile(client, coord, &user_agent).map_or_else(
+                            |err| TileLoadResult {
                                 coord,
                                 frame: None,
                                 error: Some(format!(
                                     "Failed loading tile z{} x{} y{}: {err:#}",
                                     coord.z, coord.x, coord.y
                                 )),
-                            });
+                            },
+                            |frame| TileLoadResult {
+                                coord,
+                                frame: Some(frame),
+                                error: None,
+                            },
+                        );
                         let _ = tx_for_thread.send(outcome);
                     });
                 if let Err(err) = spawn_result {
@@ -444,8 +445,8 @@ pub fn ease_out_cubic(t: f64) -> f64 {
 pub fn compute_scale_bar(zoom: u32, lat: f64) -> (f32, String) {
     const BAR_PX: f32 = 100.0;
     let lat_rad = lat.to_radians();
-    let meters_per_pixel = 156543.03392 * lat_rad.cos() / f64::exp2(zoom as f64);
-    let exact_meters = BAR_PX as f64 * meters_per_pixel;
+    let meters_per_pixel = 156543.03392 * lat_rad.cos() / f64::exp2(f64::from(zoom));
+    let exact_meters = f64::from(BAR_PX) * meters_per_pixel;
 
     const NICE_DISTANCES: &[f64] = &[
         1.0,
@@ -525,7 +526,19 @@ fn detect_location_from_ip() -> Result<(f64, f64)> {
     Ok((lat, lon))
 }
 
-pub fn detect_location(map: &mut MapState) -> Result<DetectedLocation> {
+pub fn detect_location(
+    map: &mut MapState,
+    nmea_fix: Option<(f64, f64)>,
+) -> Result<DetectedLocation> {
+    // Highest priority: NMEA GPS fix from phone.
+    if let Some((lat, lon)) = nmea_fix {
+        return Ok(DetectedLocation {
+            lat,
+            lon,
+            source: "Phone GPS (NMEA/TCP)".to_owned(),
+        });
+    }
+
     #[cfg(target_os = "macos")]
     {
         match detect_location_from_corelocation(map) {
@@ -578,15 +591,15 @@ pub fn detect_location(map: &mut MapState) -> Result<DetectedLocation> {
 
 #[cfg(target_os = "macos")]
 fn corelocation_status_label(status: CLAuthorizationStatus) -> &'static str {
-    if status == CLAuthorizationStatus::kCLAuthorizationStatusNotDetermined {
+    if status == CLAuthorizationStatus::NotDetermined {
         "NotDetermined"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusDenied {
+    } else if status == CLAuthorizationStatus::Denied {
         "Denied"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusRestricted {
+    } else if status == CLAuthorizationStatus::Restricted {
         "Restricted"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedWhenInUse {
+    } else if status == CLAuthorizationStatus::AuthorizedWhenInUse {
         "AuthorizedWhenInUse"
-    } else if status == CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedAlways {
+    } else if status == CLAuthorizationStatus::AuthorizedAlways {
         "AuthorizedAlways"
     } else {
         "Unknown"
@@ -634,7 +647,7 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
         manager.setDesiredAccuracy(kCLLocationAccuracyBest);
         let status = manager.authorizationStatus();
 
-        if status == CLAuthorizationStatus::kCLAuthorizationStatusNotDetermined {
+        if status == CLAuthorizationStatus::NotDetermined {
             if !map.corelocation_permission_requested {
                 manager.requestWhenInUseAuthorization();
                 map.corelocation_permission_requested = true;
@@ -648,9 +661,7 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
         }
         map.corelocation_permission_requested = false;
 
-        if status == CLAuthorizationStatus::kCLAuthorizationStatusDenied
-            || status == CLAuthorizationStatus::kCLAuthorizationStatusRestricted
-        {
+        if status == CLAuthorizationStatus::Denied || status == CLAuthorizationStatus::Restricted {
             anyhow::bail!("CoreLocation permission is denied or restricted");
         }
 
@@ -665,8 +676,8 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
             }
         }
 
-        if status != CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedAlways
-            && status != CLAuthorizationStatus::kCLAuthorizationStatusAuthorizedWhenInUse
+        if status != CLAuthorizationStatus::AuthorizedAlways
+            && status != CLAuthorizationStatus::AuthorizedWhenInUse
         {
             anyhow::bail!("CoreLocation is not authorized for this app");
         }

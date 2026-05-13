@@ -74,12 +74,7 @@ pub struct UdpStatusState {
 }
 
 impl UdpStatusState {
-    pub fn start(
-        &mut self,
-        bind_host: &str,
-        port: u16,
-        interface: Option<&str>,
-    ) -> Result<String> {
+    pub fn start(&mut self, bind_host: &str, port: u16, interface: Option<&str>) -> Result<String> {
         let bind_host = bind_host.trim();
         if bind_host.is_empty() {
             anyhow::bail!("UDP bind host cannot be empty");
@@ -103,7 +98,7 @@ impl UdpStatusState {
         });
         self.latest_status = None;
         self.packets_received = 0;
-        self.status = format!("Listening for UDP ROV status broadcasts on {}.", bind_addr);
+        self.status = format!("Listening for UDP ROV status broadcasts on {bind_addr}.");
 
         Ok(self.status.clone())
     }
@@ -116,6 +111,7 @@ impl UdpStatusState {
         self.event_rx = None;
     }
 
+    #[must_use]
     pub fn is_running(&self) -> bool {
         self.controller.is_some()
     }
@@ -155,6 +151,7 @@ impl UdpStatusState {
         }
     }
 
+    #[must_use]
     pub fn status_text(&self) -> &str {
         &self.status
     }
@@ -163,10 +160,12 @@ impl UdpStatusState {
         self.status = text;
     }
 
+    #[must_use]
     pub fn packets_received(&self) -> u64 {
         self.packets_received
     }
 
+    #[must_use]
     pub fn latest_status(&self) -> Option<&Status> {
         self.latest_status.as_ref()
     }
@@ -223,8 +222,7 @@ fn udp_status_worker_loop(
                     || err.kind() == std::io::ErrorKind::TimedOut => {}
             Err(err) => {
                 let _ = tx.send(UdpStatusEvent::Error(format!(
-                    "UDP receive failed on port {}: {}",
-                    ROV_STATUS_UDP_PORT, err
+                    "UDP receive failed on port {ROV_STATUS_UDP_PORT}: {err}"
                 )));
                 let _ = tx.send(UdpStatusEvent::Ended);
                 return;

@@ -1,0 +1,1224 @@
+import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+export struct MapTile {
+    x: length,
+    y: length,
+    size: length,
+    tile: image,
+}
+
+export struct MediaRow {
+    media_id: string,
+    name: string,
+    size_text: string,
+    seen_text: string,
+    state_text: string,
+    origin_text: string,
+    has_local: bool,
+    deleted_on_rov: bool,
+    selected: bool,
+    thumbnail: image,
+    has_thumbnail: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "Third Eye Client";
+    icon: @image-url("../assets/logo.png");
+    preferred-width: 1520px;
+    preferred-height: 960px;
+    min-width: 680px;
+    min-height: 400px;
+
+    in-out property <int> active_screen: 0;
+
+    in-out property <string> rtsp_url;
+    in-out property <string> rov_http_base;
+    in-out property <string> rov_status_udp_bind_host;
+    in-out property <string> rov_status_udp_port;
+    in-out property <string> osm_tile_user_agent;
+    in-out property <string> rov_network_interface;
+    in-out property <string> rov_info;
+
+    // Phone GPS (NMEA over TCP).
+    in-out property <string> nmea_gps_host;
+    in-out property <string> nmea_gps_port;
+    in-out property <string> nmea_gps_status;
+    in-out property <bool> nmea_gps_running: false;
+
+    // Server account (third-eye backend).
+    in-out property <string> server_base_url;
+    in-out property <string> auth_email;
+    in-out property <string> auth_password;
+    in-out property <string> auth_status_text;
+    in-out property <string> auth_signed_in_as;
+    in-out property <bool> auth_is_signed_in: false;
+
+    // Per-capture ROV telemetry summary surfaced after a successful capture.
+    in-out property <string> attached_metadata_text;
+
+    // Media screen bindings.
+    in property <[MediaRow]> media_rows;
+    in-out property <string> media_status;
+    in-out property <string> media_selected_id;
+    in-out property <string> media_selected_name;
+    in-out property <string> media_selected_details;
+    in-out property <string> media_selected_capture_text;
+    in-out property <string> media_selected_local_path;
+    in-out property <bool> media_selected_has_capture_meta: false;
+    in-out property <bool> media_download_in_progress: false;
+    in-out property <image> media_preview_image;
+    in-out property <bool> has_media_preview: false;
+    in-out property <bool> media_selected_is_video: false;
+    in-out property <bool> media_stream_active: false;
+
+    // Structured capture telemetry for media detail overlay.
+    in-out property <string> media_capture_depth;
+    in-out property <string> media_capture_temp;
+    in-out property <string> media_capture_heading;
+    in-out property <string> media_capture_attitude;
+    in-out property <string> media_capture_coords;
+    in-out property <string> media_capture_battery;
+    // Compact subtitle: "793 KB \u{2022} image/jpeg \u{2022} 1920\u{00d7}1080"
+    in-out property <string> media_info_subtitle;
+
+    in-out property <string> map_status;
+    in-out property <string> corelocation_debug;
+    in-out property <string> lat_lon_text;
+    in-out property <string> zoom_text;
+    in property <[MapTile]> map_tiles;
+    in-out property <length> map_pin_world_x: 0px;
+    in-out property <length> map_pin_world_y: 0px;
+    in-out property <bool> map_has_pin: false;
+    in-out property <length> map_viewport_x: 0px;
+    in-out property <length> map_viewport_y: 0px;
+    in-out property <length> map_viewport_width: 0px;
+    in-out property <length> map_viewport_height: 0px;
+    in-out property <string> pin_lat_lon_short;
+    in property <length> scale_bar_width: 100px;
+    in-out property <string> scale_bar_text;
+
+    in-out property <string> stream_status;
+    in-out property <string> frames_received_text;
+    in-out property <image> stream_image;
+    in-out property <bool> has_stream_image: false;
+
+    in-out property <string> rov_status_text;
+    in-out property <string> rov_packets_received_text;
+    in-out property <bool> has_rov_status: false;
+    in-out property <string> rov_attitude_text;
+    in-out property <string> rov_depth_temp_text;
+    in-out property <string> rov_coordinates_text;
+    in-out property <string> rov_imu_text;
+    in-out property <string> rov_batteries_text;
+
+    // Compact overlay telemetry for the full-bleed stream screen.
+    in-out property <string> rov_depth_short;
+    in-out property <string> rov_temp_short;
+    in-out property <string> rov_heading_short;
+    in-out property <string> rov_attitude_short;
+    in-out property <string> rov_coords_short;
+    in-out property <string> rov_battery_short;
+
+    callback navigate_configuration();
+    callback navigate_map(length, length);
+    callback navigate_stream();
+    callback navigate_media();
+
+    callback use_default_test_rtsp();
+    callback use_default_rov_rtsp();
+    callback use_default_rov_http_base();
+    callback use_host_from_rov_http_base();
+    callback use_default_rov_status_udp_port();
+    callback use_default_osm_tile_user_agent();
+    callback use_default_rov_network_interface();
+    callback clear_rov_network_interface();
+
+    callback list_medias();
+    callback capture_photo();
+
+    callback refresh_media();
+    callback select_media(string, string);
+    callback download_selected_media();
+    callback open_selected_local_media();
+    callback delete_selected_media_from_rov();
+    callback stream_selected_media();
+    callback stop_media_stream();
+
+    callback start_nmea_gps();
+    callback stop_nmea_gps();
+    callback use_default_nmea_gps_port();
+
+    callback sign_in();
+    callback sign_out();
+    callback use_default_server_base_url();
+
+    callback detect_location(length, length);
+    callback load_map_tile(length, length);
+    callback open_interactive_map();
+    callback map_flicked(length, length, length, length);
+    callback map_zoom_in(length, length, length, length);
+    callback map_zoom_out(length, length, length, length);
+    callback center_map_on_pin(length, length, length, length);
+
+    callback start_stream();
+    callback stop_stream();
+    callback start_rov_status_listener();
+    callback stop_rov_status_listener();
+
+    public function set_map_viewport(ox: length, oy: length, width: length, height: length) {
+        root.map_viewport_x = ox;
+        root.map_viewport_y = oy;
+        root.map_viewport_width = width;
+        root.map_viewport_height = height;
+    }
+    HorizontalBox {
+        padding: 10px;
+        spacing: 10px;
+
+        Rectangle {
+            min-width: 240px;
+            max-width: 240px;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #1f2127;
+
+            VerticalBox {
+                padding: 12px;
+                spacing: 8px;
+                Image {
+                    width: 90px;
+                    height: 70px;
+                    source: @image-url("../assets/logo.png");
+                    image-fit: contain;
+                }
+
+                Text {
+                    text: "Third Eye Client";
+                    font-size: 26px;
+                }
+                Text {
+                    text: "Navigation";
+                    color: #8f96a3;
+                }
+                Rectangle {
+                    height: 1px;
+                    background: #3f4148;
+                }
+
+                Button {
+                    text: "Configuration";
+                    clicked => { root.navigate_configuration(); }
+                }
+                Button {
+                    text: "Device Map";
+                    clicked => { root.navigate_map(content_panel.width, content_panel.height); }
+                }
+                Button {
+                    text: "Live Stream";
+                    clicked => { root.navigate_stream(); }
+                }
+                Button {
+                    text: "Media";
+                    clicked => { root.navigate_media(); }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+            }
+        }
+
+        content_panel := Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #202328;
+
+            if root.active_screen == 0 : ScrollView {
+                viewport-width: self.visible-width;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 10px;
+
+                if root.active_screen == 0 : VerticalBox {
+                    spacing: 8px;
+                    Text {
+                        text: "RTSP + ROV Configuration";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.";
+                        wrap: word-wrap;
+                    }
+
+                    Text { text: "RTSP URL:"; }
+                    LineEdit { text <=> root.rtsp_url; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default test RTSP URL";
+                            clicked => { root.use_default_test_rtsp(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default ROV RTSP URL";
+                            clicked => { root.use_default_rov_rtsp(); }
+                        }
+                    }
+
+                    Text { text: "ROV HTTP API Base URL:"; }
+                    LineEdit { text <=> root.rov_http_base; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default ROV HTTP API URL";
+                            clicked => { root.use_default_rov_http_base(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use host from ROV HTTP API URL for telemetry UDP bind";
+                            clicked => { root.use_host_from_rov_http_base(); }
+                        }
+                    }
+
+                    Text { text: "ROV telemetry UDP bind host:"; }
+                    LineEdit { text <=> root.rov_status_udp_bind_host; }
+                    Text { text: "ROV telemetry UDP port:"; }
+                    LineEdit { text <=> root.rov_status_udp_port; }
+                    Button {
+                        text: "Use default ROV telemetry UDP port (8500)";
+                        clicked => { root.use_default_rov_status_udp_port(); }
+                    }
+
+                    Text { text: "OpenStreetMap tile User-Agent:"; }
+                    LineEdit { text <=> root.osm_tile_user_agent; }
+                    Button {
+                        text: "Use default OSM tile User-Agent";
+                        clicked => { root.use_default_osm_tile_user_agent(); }
+                    }
+                    Text {
+                        text: "Include an app identifier and contact URL/email for OSM tile policy compliance.";
+                        wrap: word-wrap;
+                    }
+
+                    Text { text: "ROV network interface (bind all connections to this adapter):"; }
+                    LineEdit { text <=> root.rov_network_interface; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Use default ROV interface (en10)";
+                            clicked => { root.use_default_rov_network_interface(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Clear (use OS routing)";
+                            clicked => { root.clear_rov_network_interface(); }
+                        }
+                    }
+                    Text {
+                        text: "Enter the name of the USB ethernet adapter (e.g. en10). Find it with 'ifconfig'. When set, all ROV HTTP and UDP traffic is bound to this interface via IP_BOUND_IF. Leave empty for default OS routing.";
+                        wrap: word-wrap;
+                    }
+
+                    Text { text: "ROV API notes:"; }
+                    Text {
+                        text: "• RTSP stream example: rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• HTTP API server example: http://192.168.1.88:80";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• Capture endpoint: POST /v1/capture";
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "• Media list endpoint: GET /v1/medias";
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "List medias (GET /v1/medias)";
+                            clicked => { root.list_medias(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Capture photo (POST /v1/capture)";
+                            clicked => { root.capture_photo(); }
+                        }
+                    }
+
+                    Text { text: root.rov_info; wrap: word-wrap; }
+                    if root.attached_metadata_text != "" : Text {
+                        text: root.attached_metadata_text;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Phone GPS (NMEA over TCP)"; font-size: 18px; }
+                    Text {
+                        text: "Receive GPS from a phone app (GPS2IP, GPSd Forwarder, ShareGPS). Configure the app as TCP client pointing to this Mac's IP on the port below.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "Listen address (leave empty for all interfaces):"; }
+                    LineEdit { text <=> root.nmea_gps_host; }
+                    Text { text: "Listen port:"; }
+                    LineEdit { text <=> root.nmea_gps_port; }
+                    Button {
+                        text: "Use default GPS2IP port (11123)";
+                        clicked => { root.use_default_nmea_gps_port(); }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start Phone GPS";
+                            enabled: !root.nmea_gps_running;
+                            clicked => { root.start_nmea_gps(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop Phone GPS";
+                            enabled: root.nmea_gps_running;
+                            clicked => { root.stop_nmea_gps(); }
+                        }
+                    }
+                    Text { text: root.nmea_gps_status; wrap: word-wrap; }
+
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Server account"; font-size: 18px; }
+                    Text {
+                        text: "Sign in to https://third-eye.marshalling.eu for media syncing and status uploads.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "Server base URL:"; }
+                    LineEdit { text <=> root.server_base_url; }
+                    Button {
+                        text: "Use default server URL";
+                        clicked => { root.use_default_server_base_url(); }
+                    }
+                    Text { text: "Email:"; }
+                    LineEdit { text <=> root.auth_email; }
+                    Text { text: "Password:"; }
+                    LineEdit {
+                        text <=> root.auth_password;
+                        input-type: password;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Sign in";
+                            enabled: !root.auth_is_signed_in;
+                            clicked => { root.sign_in(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Sign out";
+                            enabled: root.auth_is_signed_in;
+                            clicked => { root.sign_out(); }
+                        }
+                    }
+                    if root.auth_is_signed_in : Text {
+                        text: "Signed in as " + root.auth_signed_in_as;
+                    }
+                    Text { text: root.auth_status_text; wrap: word-wrap; }
+                }
+
+            }
+            }
+
+            // Media screen — outside ScrollView so the two-column layout
+            // can stretch to fill the full panel height.
+            if root.active_screen == 3 : VerticalBox {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: "Media library (ROV + local)";
+                    font-size: 24px;
+                }
+                    Text {
+                        text: "Camera HTTP base: " + root.rov_http_base;
+                        wrap: word-wrap;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Refresh from ROV";
+                            clicked => { root.refresh_media(); }
+                        }
+                    }
+                    Text { text: root.media_status; wrap: word-wrap; }
+
+                    HorizontalBox {
+                        spacing: 12px;
+
+                        // --- Left column: scrollable tile list of media. ---
+                        Rectangle {
+                            min-width: 340px;
+                            max-width: 480px;
+                            horizontal-stretch: 0;
+                            vertical-stretch: 1;
+                            border-width: 1px;
+                            border-color: #3f4148;
+                            background: #1a1c22;
+
+                            ScrollView {
+                                viewport-width: self.visible-width;
+                                VerticalBox {
+                                    padding: 6px;
+                                    spacing: 4px;
+                                    if root.media_rows.length == 0 : Text {
+                                        text: "No media recorded yet. Click \"Refresh from ROV\" to populate the list.";
+                                        wrap: word-wrap;
+                                        color: #8f96a3;
+                                    }
+                                    for row in root.media_rows : Rectangle {
+                                        height: row.has_thumbnail ? 100px : 52px;
+                                        border-radius: 6px;
+                                        border-width: row.selected ? 2px : 1px;
+                                        border-color: row.selected ? #0a84ff : #2b2d34;
+                                        background: row.selected ? #0a84ff22 :
+                                            (row.deleted_on_rov ? #30181888 : #262931);
+                                        HorizontalBox {
+                                            padding: 4px;
+                                            spacing: 8px;
+                                            if row.has_thumbnail : Rectangle {
+                                                width: 88px;
+                                                border-radius: 4px;
+                                                clip: true;
+                                                background: #111318;
+                                                Image {
+                                                    width: parent.width;
+                                                    height: parent.height;
+                                                    source: row.thumbnail;
+                                                    image-fit: contain;
+                                                }
+                                            }
+                                            VerticalBox {
+                                                spacing: 2px;
+                                                Text {
+                                                    text: row.name;
+                                                    font-size: 13px;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: row.size_text + " \u{2022} " + row.state_text;
+                                                    font-size: 11px;
+                                                    color: #8f96a3;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: row.seen_text;
+                                                    font-size: 10px;
+                                                    color: #666666;
+                                                }
+                                            }
+                                        }
+                                        TouchArea {
+                                            clicked => {
+                                                root.select_media(row.media_id, row.name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // --- Right column: detail panel. ---
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            border-width: 1px;
+                            border-color: #3f4148;
+                            background: #111318;
+
+                            if root.media_selected_name == "" : Text {
+                                text: "Select a media entry on the left to see its metadata.";
+                                color: #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            if root.media_selected_name != "" : VerticalBox {
+                                padding: 0px;
+                                spacing: 0px;
+
+                                // ---- Preview area ----
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    clip: true;
+                                    background: #000000;
+
+                                    if root.has_media_preview : Image {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        source: root.media_preview_image;
+                                        image-fit: contain;
+                                    }
+                                    if !root.has_media_preview : Text {
+                                        text: root.media_selected_is_video
+                                            ? "Click \"Stream\" to preview"
+                                            : "Loading preview...";
+                                        color: #555555;
+                                        font-size: 15px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // ---- Bottom section: name + telemetry + buttons ----
+                                Rectangle {
+                                    background: #1a1c22;
+                                    vertical-stretch: 0;
+
+                                    VerticalBox {
+                                        padding: 10px;
+                                        spacing: 6px;
+
+                                        // File name + subtitle
+                                        Text {
+                                            text: root.media_selected_name;
+                                            font-size: 15px;
+                                            color: #ffffff;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: root.media_info_subtitle;
+                                            font-size: 11px;
+                                            color: #8f96a3;
+                                            overflow: elide;
+                                        }
+
+                                        // Capture telemetry bar
+                                        if root.media_selected_has_capture_meta : Rectangle {
+                                            height: 56px;
+                                            border-radius: 8px;
+                                            background: #0d1a2acc;
+                                            border-width: 1px;
+                                            border-color: #0a84ff22;
+
+                                            HorizontalBox {
+                                                padding-left: 10px;
+                                                padding-right: 10px;
+                                                padding-top: 6px;
+                                                padding-bottom: 6px;
+                                                spacing: 14px;
+
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "DEPTH"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_depth; color: #ffffff; font-size: 15px; }
+                                                }
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "TEMP"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_temp; color: #aaccff; font-size: 15px; }
+                                                }
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "HDG"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_heading; color: #ffffff; font-size: 15px; }
+                                                }
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "ATT"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_attitude; color: #ffffff; font-size: 12px; }
+                                                }
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "POS"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_coords; color: #ffffff; font-size: 12px; }
+                                                }
+                                                VerticalBox { spacing: 1px;
+                                                    Text { text: "BAT"; color: #8f96a3; font-size: 9px; }
+                                                    Text { text: root.media_capture_battery; color: #ffffff; font-size: 12px; }
+                                                }
+                                            }
+                                        }
+
+                                        if !root.media_selected_has_capture_meta : Text {
+                                            text: "No capture telemetry attached.";
+                                            font-size: 11px;
+                                            color: #555555;
+                                        }
+
+                                        // Action buttons
+                                        HorizontalBox {
+                                            spacing: 6px;
+                                            Button {
+                                                horizontal-stretch: 1;
+                                                text: root.media_download_in_progress
+                                                    ? "Downloading..."
+                                                    : (root.media_selected_local_path == ""
+                                                        ? "Download"
+                                                        : "Re-download");
+                                                enabled: !root.media_download_in_progress;
+                                                clicked => { root.download_selected_media(); }
+                                            }
+                                            Button {
+                                                horizontal-stretch: 1;
+                                                text: "Open";
+                                                enabled: root.media_selected_local_path != "";
+                                                clicked => { root.open_selected_local_media(); }
+                                            }
+                                            if root.media_selected_is_video && !root.media_stream_active : Button {
+                                                horizontal-stretch: 1;
+                                                text: "Stream";
+                                                enabled: !root.media_download_in_progress;
+                                                clicked => { root.stream_selected_media(); }
+                                            }
+                                            if root.media_selected_is_video && root.media_stream_active : Button {
+                                                horizontal-stretch: 1;
+                                                text: "Stop";
+                                                clicked => { root.stop_media_stream(); }
+                                            }
+                                            Button {
+                                                text: "Delete";
+                                                clicked => { root.delete_selected_media_from_rov(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
+
+            // Full-bleed live stream screen
+            if root.active_screen == 2 : Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: #000000;
+                clip: true;
+
+                // Full-bleed video
+                if root.has_stream_image : Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.stream_image;
+                    image-fit: contain;
+                }
+                if !root.has_stream_image : Text {
+                    text: "No stream active. Press \u{25b6} Start to begin.";
+                    color: #555555;
+                    font-size: 18px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                // Top-right: status info
+                Rectangle {
+                    width: 300px;
+                    height: 92px;
+                    x: parent.width - self.width - 10px;
+                    y: 10px;
+                    border-radius: 12px;
+                    background: #0d1a2acc;
+                    border-width: 1px;
+                    border-color: #0a84ff44;
+
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 4px;
+                        Text {
+                            text: root.stream_status;
+                            color: #ffffff;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Frames: " + root.frames_received_text;
+                            color: #aaaaaa;
+                            font-size: 11px;
+                        }
+                        Text {
+                            text: root.rov_status_text;
+                            color: #ffffff;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Packets: " + root.rov_packets_received_text;
+                            color: #aaaaaa;
+                            font-size: 11px;
+                        }
+                    }
+                }
+
+                // Right: capture photo button (camera icon)
+                Rectangle {
+                    width: 56px;
+                    height: 48px;
+                    x: parent.width - self.width - 16px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 10px;
+                    background: btn-capture-ta.pressed ? #0a84ffcc : btn-capture-ta.has-hover ? #0a84ff88 : #0d1a2acc;
+                    border-width: 1px;
+                    border-color: #0a84ff44;
+                    animate background { duration: 120ms; }
+
+                    // Camera body
+                    Rectangle {
+                        width: 36px;
+                        height: 26px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2 + 2px;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: #ffffffcc;
+                        background: #00000000;
+                    }
+                    // Lens circle
+                    Rectangle {
+                        width: 14px;
+                        height: 14px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2 + 2px;
+                        border-radius: 7px;
+                        border-width: 2px;
+                        border-color: #ffffffcc;
+                        background: #00000000;
+                    }
+                    // Viewfinder bump
+                    Rectangle {
+                        width: 14px;
+                        height: 6px;
+                        x: (parent.width - self.width) / 2 + 2px;
+                        y: (parent.height - self.height) / 2 - 4px;
+                        border-radius: 2px;
+                        background: #ffffffcc;
+                    }
+                    // Flash dot
+                    Rectangle {
+                        width: 4px;
+                        height: 4px;
+                        x: (parent.width - self.width) / 2 + 26px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 2px;
+                        background: #ffffffaa;
+                    }
+                    btn-capture-ta := TouchArea {
+                        clicked => {
+                            root.capture_photo();
+                        }
+                    }
+                }
+
+                // Bottom: ROV telemetry overlay bar
+                if root.has_rov_status : Rectangle {
+                    width: parent.width;
+                    height: 80px;
+                    y: parent.height - self.height;
+                    background: #0d1a2add;
+
+                    HorizontalBox {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 24px;
+
+                        // Depth
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "DEPTH";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_depth_short;
+                                color: #ffffff;
+                                font-size: 22px;
+                            }
+                        }
+
+                        // Temperature
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "TEMP";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_temp_short;
+                                color: #aaccff;
+                                font-size: 22px;
+                            }
+                        }
+
+                        // Heading
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "HDG";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_heading_short;
+                                color: #ffffff;
+                                font-size: 22px;
+                            }
+                        }
+
+                        // Attitude
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "ATT";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_attitude_short;
+                                color: #ffffff;
+                                font-size: 16px;
+                            }
+                        }
+
+                        // Coordinates
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "POS";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_coords_short;
+                                color: #ffffff;
+                                font-size: 16px;
+                            }
+                        }
+
+                        // Battery
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: "BAT";
+                                color: #8f96a3;
+                                font-size: 10px;
+                            }
+                            Text {
+                                text: root.rov_battery_short;
+                                color: #ffffff;
+                                font-size: 16px;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Full-bleed map screen
+            if root.active_screen == 1 : Rectangle {
+                width: parent.width;
+                height: parent.height;
+
+                map_canvas := Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    clip: true;
+                    background: #ffffff;
+
+                    map_fli := Flickable {
+                        viewport-x <=> root.map_viewport_x;
+                        viewport-y <=> root.map_viewport_y;
+                        viewport-width: root.map_viewport_width;
+                        viewport-height: root.map_viewport_height;
+
+                        for tile in root.map_tiles : Image {
+                            x: tile.x;
+                            y: tile.y;
+                            width: tile.size;
+                            height: tile.size;
+                            source: tile.tile;
+                            image-fit: fill;
+                        }
+
+                        if root.map_has_pin : Rectangle {
+                            width: 52px;
+                            height: 52px;
+                            x: root.map_pin_world_x - self.width / 2;
+                            y: root.map_pin_world_y - self.height / 2;
+                            background: #00000000;
+
+                            Rectangle {
+                                width: 52px;
+                                height: 52px;
+                                border-radius: 26px;
+                                background: #0a84ff15;
+                            }
+                            Rectangle {
+                                width: 42px;
+                                height: 42px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 21px;
+                                background: #0a84ff28;
+                            }
+                            Rectangle {
+                                width: 34px;
+                                height: 34px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 17px;
+                                background: #0a84ff40;
+                            }
+                            Image {
+                                width: 26px;
+                                height: 26px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                source: @image-url("../assets/macbook_pin.png");
+                                image-fit: contain;
+                            }
+                        }
+
+                        // Coordinate label below pin
+                        if root.map_has_pin : Rectangle {
+                            width: 140px;
+                            height: 20px;
+                            x: root.map_pin_world_x - self.width / 2;
+                            y: root.map_pin_world_y + 30px;
+                            border-radius: 4px;
+                            background: #000000aa;
+
+                            Text {
+                                text: root.pin_lat_lon_short;
+                                font-size: 11px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        flicked => {
+                            root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                        }
+                    }
+
+                    if root.map_tiles.length == 0 : Text {
+                        text: "Loading map tiles...";
+                        color: #888888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Map control button group – top-right
+                    Rectangle {
+                        width: 46px;
+                        height: 132px;
+                        x: parent.width - self.width - 10px;
+                        y: 10px;
+                        border-radius: 12px;
+                        background: #0d1a2acc;
+                        border-width: 1px;
+                        border-color: #0a84ff44;
+
+                        // Zoom-in button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 3px;
+                            border-radius: 10px;
+                            background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+                            Text {
+                                text: "+";
+                                font-size: 26px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            btn-plus-ta := TouchArea {
+                                clicked => {
+                                    root.map_zoom_in(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            width: 28px;
+                            height: 1px;
+                            x: (parent.width - self.width) / 2;
+                            y: 44px;
+                            background: #0a84ff33;
+                        }
+
+                        // Zoom-out button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 46px;
+                            border-radius: 10px;
+                            background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+                            Text {
+                                text: "\u{2212}";
+                                font-size: 26px;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            btn-minus-ta := TouchArea {
+                                clicked => {
+                                    root.map_zoom_out(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            width: 28px;
+                            height: 1px;
+                            x: (parent.width - self.width) / 2;
+                            y: 87px;
+                            background: #0a84ff33;
+                        }
+
+                        // Center / locate button
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            x: 3px;
+                            y: 89px;
+                            border-radius: 10px;
+                            background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                            animate background { duration: 120ms; }
+
+                            // Crosshair ring
+                            Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-width: 2px;
+                                border-color: #ffffff;
+                                border-radius: 8px;
+                                background: #00000000;
+                            }
+                            // Center dot
+                            Rectangle {
+                                width: 4px;
+                                height: 4px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 2px;
+                                background: #ffffff;
+                            }
+                            // Crosshair top
+                            Rectangle {
+                                width: 2px;
+                                height: 5px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - 16px) / 2 - self.height;
+                                background: #ffffff;
+                            }
+                            // Crosshair bottom
+                            Rectangle {
+                                width: 2px;
+                                height: 5px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height + 16px) / 2;
+                                background: #ffffff;
+                            }
+                            // Crosshair left
+                            Rectangle {
+                                width: 5px;
+                                height: 2px;
+                                x: (parent.width - 16px) / 2 - self.width;
+                                y: (parent.height - self.height) / 2;
+                                background: #ffffff;
+                            }
+                            // Crosshair right
+                            Rectangle {
+                                width: 5px;
+                                height: 2px;
+                                x: (parent.width + 16px) / 2;
+                                y: (parent.height - self.height) / 2;
+                                background: #ffffff;
+                            }
+
+                            btn-center-ta := TouchArea {
+                                clicked => {
+                                    root.center_map_on_pin(
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Scale legend \u{2013} bottom-right
+                    Rectangle {
+                        width: 148px;
+                        height: 30px;
+                        x: parent.width - self.width - 14px;
+                        y: parent.height - self.height - 14px;
+                        border-radius: 6px;
+                        background: #0d1a2acc;
+                        border-width: 1px;
+                        border-color: #0a84ff44;
+
+                        // Scale line
+                        Rectangle {
+                            width: root.scale_bar_width;
+                            height: 2px;
+                            x: (parent.width - self.width) / 2;
+                            y: 6px;
+                            background: #ffffff;
+                        }
+                        // Left tick
+                        Rectangle {
+                            width: 2px;
+                            height: 8px;
+                            x: (parent.width - root.scale_bar_width) / 2;
+                            y: 3px;
+                            background: #ffffff;
+                        }
+                        // Right tick
+                        Rectangle {
+                            width: 2px;
+                            height: 8px;
+                            x: (parent.width + root.scale_bar_width) / 2 - 1px;
+                            y: 3px;
+                            background: #ffffff;
+                        }
+                        // Scale label
+                        Text {
+                            text: root.scale_bar_text;
+                            font-size: 11px;
+                            color: #ffffff;
+                            width: parent.width;
+                            y: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

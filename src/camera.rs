@@ -13,6 +13,7 @@ pub enum PhotoFormat {
 }
 
 impl PhotoFormat {
+    #[must_use]
     pub fn as_api_str(self) -> &'static str {
         match self {
             PhotoFormat::Jpeg => "JPEG",
@@ -30,6 +31,7 @@ pub struct CaptureRequest {
 }
 
 impl CaptureRequest {
+    #[must_use]
     pub fn new(format: PhotoFormat, burst: u8) -> Self {
         Self {
             format: format.as_api_str().to_owned(),
@@ -40,7 +42,7 @@ impl CaptureRequest {
 
 /// Success or failure envelope returned by the camera for `/v1/capture`.
 ///
-/// Per the Chasing ROV camera OpenAPI spec (camera FW >= 7.10.0):
+/// Per the Chasing ROV camera `OpenAPI` spec (camera FW >= 7.10.0):
 /// - Success (HTTP 201): `{"status":0,"msg":"success","data":null}`.
 /// - Failure (HTTP 500): `{"code":...,"error":"...","status":...,"msg":"...","data":null,"errors":[...]}`
 ///   where `errors[*].meta` may contain an `{"ip": "..."}` object (multi-camera setups).
@@ -89,6 +91,7 @@ pub enum MediaScene {
 }
 
 impl MediaScene {
+    #[must_use]
     pub fn as_query_int(self) -> i32 {
         match self {
             MediaScene::Normal => 0,
@@ -109,6 +112,7 @@ pub enum MediaFileStat {
 }
 
 impl MediaFileStat {
+    #[must_use]
     pub fn from_code(code: i32) -> Self {
         match code {
             0 => MediaFileStat::Normal,
@@ -149,6 +153,7 @@ pub struct MediaOrigin {
 }
 
 impl MediaOrigin {
+    #[must_use]
     pub fn file_stat(&self) -> MediaFileStat {
         MediaFileStat::from_code(self.stat)
     }
@@ -161,6 +166,7 @@ pub struct VideoStat {
 }
 
 impl VideoStat {
+    #[must_use]
     pub fn file_stat(&self) -> MediaFileStat {
         MediaFileStat::from_code(self.stat)
     }
@@ -184,6 +190,7 @@ pub enum MediaWhich {
 }
 
 impl MediaWhich {
+    #[must_use]
     pub fn as_query_value(self) -> Option<&'static str> {
         match self {
             MediaWhich::Original => None,
@@ -203,6 +210,7 @@ pub enum MediaInfoFor {
 }
 
 impl MediaInfoFor {
+    #[must_use]
     pub fn as_query_value(self) -> Option<&'static str> {
         match self {
             MediaInfoFor::Default => None,
@@ -274,6 +282,7 @@ pub struct CameraApiClient {
 }
 
 impl CameraApiClient {
+    #[must_use]
     pub fn new(base_url: String) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
@@ -286,6 +295,7 @@ impl CameraApiClient {
     ///
     /// On macOS this uses `IP_BOUND_IF`; on Linux `SO_BINDTODEVICE`.
     /// Pass `None` for default OS routing (equivalent to [`Self::new`]).
+    #[must_use]
     pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
         let mut builder = Client::builder();
         if let Some(iface) = interface {
@@ -298,6 +308,7 @@ impl CameraApiClient {
     }
 
     /// Convenience constructor that accepts a pre-built `reqwest` blocking client.
+    #[must_use]
     pub fn with_http(base_url: String, http: Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
@@ -311,7 +322,7 @@ impl CameraApiClient {
         {
             let mut path_segments = url
                 .path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("base URL {} cannot be a base", self.base_url))?;
+                .map_err(|()| anyhow::anyhow!("base URL {} cannot be a base", self.base_url))?;
             for segment in segments {
                 path_segments.push(segment);
             }
@@ -704,7 +715,7 @@ mod tests {
 
     #[test]
     fn parse_lamp_get_envelope() {
-        let payload = r#"{"status":0,"msg":"sucess","data":{"brightness":10}}"#;
+        let payload = r#"{"status":0,"msg":"success","data":{"brightness":10}}"#;
         let parsed: LampEnvelope<LampBrightnessData> = serde_json::from_str(payload).unwrap();
         assert_eq!(parsed.status, 0);
         assert_eq!(parsed.data.unwrap().brightness, 10);

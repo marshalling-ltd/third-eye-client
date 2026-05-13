@@ -6,7 +6,7 @@
 //!   * `GET  /api/v1/account/logout`                    -> `204`
 //!
 //! The refresh token is set by the server as an `HttpOnly` cookie. A persisted
-//! cookie jar ([`PersistentCookieJar`]) mirrors those cookies to SQLite so the
+//! cookie jar ([`PersistentCookieJar`]) mirrors those cookies to `SQLite` so the
 //! session survives restarts without the user re-entering credentials.
 
 use std::sync::{Arc, Mutex};
@@ -151,7 +151,7 @@ impl AuthClient {
     /// POST `/api/v1/account/login`.
     ///
     /// On success, stores the JWT access token plus every `Set-Cookie` the
-    /// server returned (in particular the HttpOnly refresh cookie).
+    /// server returned (in particular the `HttpOnly` refresh cookie).
     pub fn login(
         &self,
         server_base: &str,
@@ -323,12 +323,12 @@ fn clear_session(db: &SharedDb) -> Result<()> {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Decodes the `exp` claim of a JWT without verifying the signature. We only
 /// use this for scheduling proactive refresh.
+#[must_use]
 pub fn decode_jwt_exp_ms(token: &str) -> Option<i64> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
@@ -418,7 +418,7 @@ impl PersistentCookieJar {
             };
             let stored = StoredCookie::from_parsed(&cookie, url);
             // Max-Age / expiry of 0 or in the past == deletion request.
-            if stored.expires_ms.map(|ms| ms <= now_ms()).unwrap_or(false) {
+            if stored.expires_ms.is_some_and(|ms| ms <= now_ms()) {
                 tx.execute(
                     "DELETE FROM http_cookies WHERE domain = ?1 AND path = ?2 AND name = ?3",
                     params![stored.domain, stored.path, stored.name],
@@ -441,8 +441,8 @@ impl PersistentCookieJar {
                     stored.name,
                     stored.value,
                     stored.expires_ms,
-                    stored.secure as i64,
-                    stored.http_only as i64,
+                    i64::from(stored.secure),
+                    i64::from(stored.http_only),
                     stored.same_site,
                 ],
             )

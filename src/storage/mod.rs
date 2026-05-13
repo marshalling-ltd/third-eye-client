@@ -2,7 +2,7 @@
 //!
 //! All per-user state - client configuration, authentication against the
 //! third-eye server, ROV media bookkeeping, capture metadata, and the outbox
-//! for delayed server writes - lives in a single SQLite database at
+//! for delayed server writes - lives in a single `SQLite` database at
 //! `~/Library/Application Support/eu.marshalling.third-eye-client/state.db`
 //! on macOS (equivalent paths elsewhere via [`directories`]).
 //!
@@ -32,7 +32,7 @@ use crate::storage::outbox::{OutboxStore, OutboxWorker};
 pub const PROJECT_QUALIFIER: &str = "eu";
 pub const PROJECT_ORG: &str = "marshalling";
 pub const PROJECT_APP: &str = "third-eye-client";
-/// Name of the SQLite file inside the data dir.
+/// Name of the `SQLite` file inside the data dir.
 pub const DB_FILE_NAME: &str = "state.db";
 
 /// Facade over the persistent storage layer. Cheap to clone the inner stores

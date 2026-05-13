@@ -152,8 +152,10 @@ fn build_test_status(elapsed: Duration, seq: u64) -> Status {
     let lon = 161_234_567 + ((t * 7.0).cos() * 8_000.0) as i32;
     let temperature = 23.0 + (t * 0.2).sin() * 2.0;
 
-    let battery_1_remain = ((100_i32 - (seq as i32 % 100)).max(1)) as u8;
-    let battery_2_remain = ((95_i32 - (seq as i32 % 95)).max(1)) as u8;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let battery_1_remain = (100_i32 - (seq as i32 % 100)).max(1) as u8;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let battery_2_remain = (95_i32 - (seq as i32 % 95)).max(1) as u8;
 
     Status {
         pitch,
@@ -191,7 +193,7 @@ fn build_packet(status: &Status) -> Result<Vec<u8>> {
     packet.push(PACKET_ID_STATUS);
     packet.push(1);
     packet.extend_from_slice(&[0_u8, 0_u8]);
-    packet.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    packet.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     packet.push(PACKET_TYPE_ROV_STATUS);
     packet.extend_from_slice(&[0_u8, 0_u8, 0_u8]);
     packet.extend_from_slice(&payload);
