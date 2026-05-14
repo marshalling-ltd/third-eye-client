@@ -1761,7 +1761,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let rov_http_base = state.config.rov_http_base.clone();
         state.rov_info = format!("Setting up ROV network route on {iface}...");
         apply_state_to_ui(&ui, &state);
-        ensure_rov_route_at_startup(&rov_http_base, &iface);
+        force_setup_rov_route(&rov_http_base, &iface);
         state.rov_info = format!("ROV network route setup completed for interface {iface}.");
         apply_state_to_ui(&ui, &state);
     });
@@ -2795,6 +2795,22 @@ fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
 /// Placeholder for the proxy guard; kept for `StreamController` layout.
 type TcpProxyGuard = ();
 
+/// Like [`ensure_rov_route_at_startup`] but always re-runs the osascript
+/// admin prompt, even when a valid route already exists. Used by the
+/// "Setup ROV network route" button so the user can force a re-setup
+/// after changing the ROV IP or interface.
+fn force_setup_rov_route(rov_http_base: &str, interface: &str) {
+    let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
+    let _ = client.list_medias(None::<MediaScene>);
+
+    let host =
+        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_owned());
+    let dummy_rtsp = format!("rtsp://x@{host}:8554/");
+    if let Err(err) = force_rov_route_for_rtsp(&dummy_rtsp, interface) {
+        eprintln!("Network route setup failed: {err:#}");
+    }
+}
+
 /// Called once at app startup. Makes an HTTP probe via `IP_BOUND_IF` to
 /// populate the ARP table with the ROV's real MAC, then sets up the OS route
 /// so external processes (ffmpeg) can also reach the ROV.
@@ -2819,24 +2835,7 @@ fn ensure_rov_route_at_startup(rov_http_base: &str, interface: &str) {
 /// `IP_BOUND_IF` on its sockets. On macOS this uses `osascript` to request
 /// admin privileges with a native password dialog.
 #[cfg(target_os = "macos")]
-fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
-    let rov_host = parsed
-        .host_str()
-        .context("RTSP URL has no host")?
-        .to_owned();
-
-    // Check if a correct route+ARP already exists from a previous run.
-    if has_valid_rov_route(&rov_host, interface) {
-        return Ok(());
-    }
-
-    // Resolve the ROV's MAC from the ARP table. It should be there from
-    // HTTP/UDP traffic that already went through IP_BOUND_IF.
-    let rov_mac = read_arp_mac_on_interface(&rov_host, interface)
-        .context("ROV MAC not found in ARP table. Make an HTTP request first so the app populates the ARP entry via IP_BOUND_IF.")?;
-
-    // Three steps: route → delete bad ARP → set correct ARP.
+fn run_rov_route_osascript(rov_host: &str, interface: &str, rov_mac: &str) -> Result<()> {
     let script = format!(
         r#"do shell script "
 /sbin/route delete -host {rov_host} 2>/dev/null; 
@@ -2860,9 +2859,42 @@ fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_rov_host_and_mac(rtsp_url: &str, interface: &str) -> Result<(String, String)> {
+    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
+    let rov_host = parsed
+        .host_str()
+        .context("RTSP URL has no host")?
+        .to_owned();
+    let rov_mac = read_arp_mac_on_interface(&rov_host, interface)
+        .context("ROV MAC not found in ARP table. Make an HTTP request first so the app populates the ARP entry via IP_BOUND_IF.")?;
+    Ok((rov_host, rov_mac))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
+    let (rov_host, rov_mac) = resolve_rov_host_and_mac(rtsp_url, interface)?;
+    if has_valid_rov_route(&rov_host, interface) {
+        return Ok(());
+    }
+    run_rov_route_osascript(&rov_host, interface, &rov_mac)
+}
+
+/// Always runs the osascript, even if a valid route already exists.
+#[cfg(target_os = "macos")]
+fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
+    let (rov_host, rov_mac) = resolve_rov_host_and_mac(rtsp_url, interface)?;
+    run_rov_route_osascript(&rov_host, interface, &rov_mac)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn ensure_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
-    Ok(()) // On Linux, SO_BINDTODEVICE on the app sockets is sufficient.
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn force_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
+    Ok(())
 }
 
 /// Checks whether a valid host route + ARP entry already exists for the ROV
