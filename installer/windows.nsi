@@ -10,7 +10,7 @@ Unicode true
 !define REG_KEY       "Software\Microsoft\Windows\CurrentVersion\Uninstall\Third Eye Client"
 
 Name            "${APP_NAME}"
-OutFile         "Third.Eye.Client.windows-x64-setup.exe"
+OutFile         "${OUT_FILE}"
 InstallDir      "${INSTALL_DIR}"
 InstallDirRegKey HKLM "${REG_KEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -39,10 +39,10 @@ Section "Install"
   ExecWait 'taskkill /F /IM "${APP_EXE}"' $0
 
   SetOutPath "$INSTDIR"
-  File "${__FILEDIR__}\..\package\${APP_EXE}"
+  File "${PKG_DIR}\${APP_EXE}"
 
   SetOutPath "$INSTDIR\bin"
-  File "${__FILEDIR__}\..\package\bin\ffmpeg.exe"
+  File "${PKG_DIR}\bin\ffmpeg.exe"
 
   ; Write uninstaller.
   SetOutPath "$INSTDIR"

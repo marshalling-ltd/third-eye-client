@@ -104,7 +104,11 @@ jobs:
           echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
 
       - name: Build installer
-        run: makensis installer\windows.nsi
+        shell: pwsh
+        run: |
+          $pkgDir  = (Resolve-Path "package").Path
+          $outFile = (Join-Path (Get-Location) "Third.Eye.Client.windows-x64-setup.exe")
+          makensis /DPKG_DIR="$pkgDir" /DOUT_FILE="$outFile" installer\windows.nsi
 
       - uses: actions/upload-artifact@v4
         with:
