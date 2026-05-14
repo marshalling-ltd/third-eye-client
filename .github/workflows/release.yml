@@ -1,0 +1,219 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # macOS — universal .app wrapped in a .dmg
+  # ---------------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --bin third-eye-client --target aarch64-apple-darwin
+          cargo build --release --bin third-eye-client --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/third-eye-client \
+            target/x86_64-apple-darwin/release/third-eye-client \
+            -output target/third-eye-client-universal
+          lipo -info target/third-eye-client-universal
+
+      - name: Assemble .app bundle
+        run: |
+          APP="staging/Third Eye Client.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+          cp target/third-eye-client-universal "$APP/Contents/MacOS/third-eye-client"
+          chmod 755 "$APP/Contents/MacOS/third-eye-client"
+          cp macos/Info.plist "$APP/Contents/Info.plist"
+          cp assets/logo.icns "$APP/Contents/Resources/logo.icns"
+          codesign --force --sign - "$APP/Contents/MacOS/third-eye-client"
+          codesign --force --sign - "$APP"
+
+      - name: Create DMG
+        run: |
+          ln -s /Applications staging/Applications
+          hdiutil create \
+            -volname "Third Eye Client" \
+            -srcfolder staging \
+            -ov -format UDZO \
+            "Third.Eye.Client.macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: Third.Eye.Client.macos-universal.dmg
+
+  # ---------------------------------------------------------------------------
+  # Windows — native MSVC build + NSIS installer (includes ffmpeg.exe)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --bin third-eye-client
+
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extracted
+          $ffmpegDir = Get-ChildItem ffmpeg-extracted -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path package\bin | Out-Null
+          Copy-Item "$($ffmpegDir.FullName)\bin\ffmpeg.exe" package\bin\
+          Copy-Item target\release\third-eye-client.exe package\
+
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Build installer
+        run: makensis installer\windows.nsi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          path: Third.Eye.Client.windows-x64-setup.exe
+
+  # ---------------------------------------------------------------------------
+  # Linux — x86_64 AppImage (self-contained, runs on any modern distro)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libfontconfig-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            pkg-config \
+            build-essential
+
+      - name: Build
+        run: cargo build --release --bin third-eye-client
+
+      - name: Download ffmpeg
+        run: |
+          curl -fsSL \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+            -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          mkdir -p appdir/usr/bin
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg appdir/usr/bin/
+
+      - name: Assemble AppDir
+        run: |
+          cp target/release/third-eye-client appdir/usr/bin/
+          chmod +x appdir/usr/bin/third-eye-client
+
+          cat > appdir/AppRun << 'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="$HERE/usr/bin:$PATH"
+          exec "$HERE/usr/bin/third-eye-client" "$@"
+          EOF
+          chmod +x appdir/AppRun
+
+          cat > appdir/third-eye-client.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Third Eye Client
+          Exec=third-eye-client
+          Icon=logo
+          Categories=Utility;
+          EOF
+
+          cp assets/logo.png appdir/logo.png
+
+      - name: Create AppImage
+        run: |
+          curl -fsSL \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+            -o appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+            ./appimagetool appdir Third.Eye.Client.linux-x64.AppImage
+          chmod +x Third.Eye.Client.linux-x64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: Third.Eye.Client.linux-x64.AppImage
+
+  # ---------------------------------------------------------------------------
+  # Publish — create/overwrite the rolling "latest" GitHub Release
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-setup
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-appimage
+          path: artifacts/
+
+      - name: Create latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          # Delete the existing latest release + tag so we can recreate it.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create latest \
+            --title "Latest (${SHORT_SHA})" \
+            --notes "$(cat <<EOF
+          Built from commit \`${GITHUB_SHA}\` on the \`release\` branch.
+
+          ## Downloads
+
+          | Platform | File | Notes |
+          |----------|------|-------|
+          | **macOS** (Apple Silicon + Intel) | \`Third.Eye.Client.macos-universal.dmg\` | Mount DMG → drag app to Applications |
+          | **Windows** x64 | \`Third.Eye.Client.windows-x64-setup.exe\` | Installs to Program Files, includes ffmpeg |
+          | **Linux** x64 | \`Third.Eye.Client.linux-x64.AppImage\` | \`chmod +x\` then run — no install needed |
+
+          > **macOS streaming**: ffmpeg is not bundled. Install it with \`brew install ffmpeg\`.
+          EOF
+          )" \
+            --prerelease \
+            artifacts/Third.Eye.Client.macos-universal.dmg \
+            artifacts/Third.Eye.Client.windows-x64-setup.exe \
+            artifacts/Third.Eye.Client.linux-x64.AppImage
