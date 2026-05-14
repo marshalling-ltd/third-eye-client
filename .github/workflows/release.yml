@@ -76,7 +76,10 @@ jobs:
           Copy-Item target\release\third-eye-client.exe package\
 
       - name: Install NSIS
-        run: choco install nsis --yes --no-progress
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
 
       - name: Build installer
         run: makensis installer\windows.nsi
