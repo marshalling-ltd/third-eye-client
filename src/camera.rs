@@ -294,10 +294,14 @@ impl CameraApiClient {
     /// interface (e.g. `"en10"` for a USB ethernet adapter).
     ///
     /// On macOS this uses `IP_BOUND_IF`; on Linux `SO_BINDTODEVICE`.
+    /// On Windows, interface binding is not supported by reqwest and the
+    /// parameter is ignored (OS routing is used).
     /// Pass `None` for default OS routing (equivalent to [`Self::new`]).
     #[must_use]
+    #[allow(unused_variables)]
     pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
         let mut builder = Client::builder();
+        #[cfg(unix)]
         if let Some(iface) = interface {
             builder = builder.interface(iface);
         }
