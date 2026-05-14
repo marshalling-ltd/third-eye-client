@@ -27,15 +27,30 @@ jobs:
             -output target/third-eye-client-universal
           lipo -info target/third-eye-client-universal
 
+      - name: Bundle universal ffmpeg
+        run: |
+          # Download separate arm64 and x86_64 static builds, lipo into universal.
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/arm64/zip" -o ffmpeg-arm64.zip
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/zip"       -o ffmpeg-x86_64.zip
+          unzip -q ffmpeg-arm64.zip  -d ffmpeg-arm64
+          unzip -q ffmpeg-x86_64.zip -d ffmpeg-x86_64
+          ARM64_BIN=$(find ffmpeg-arm64  -type f -name "ffmpeg" | head -1)
+          X86_BIN=$(find   ffmpeg-x86_64 -type f -name "ffmpeg" | head -1)
+          lipo -create "$ARM64_BIN" "$X86_BIN" -output ffmpeg-universal
+          lipo -info ffmpeg-universal
+
       - name: Assemble .app bundle
         run: |
           APP="staging/Third Eye Client.app"
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS/bin"
           mkdir -p "$APP/Contents/Resources"
           cp target/third-eye-client-universal "$APP/Contents/MacOS/third-eye-client"
           chmod 755 "$APP/Contents/MacOS/third-eye-client"
+          cp ffmpeg-universal "$APP/Contents/MacOS/bin/ffmpeg"
+          chmod 755 "$APP/Contents/MacOS/bin/ffmpeg"
           cp macos/Info.plist "$APP/Contents/Info.plist"
           cp assets/logo.icns "$APP/Contents/Resources/logo.icns"
+          codesign --force --sign - "$APP/Contents/MacOS/bin/ffmpeg"
           codesign --force --sign - "$APP/Contents/MacOS/third-eye-client"
           codesign --force --sign - "$APP"
 
@@ -64,16 +79,26 @@ jobs:
       - name: Build
         run: cargo build --release --bin third-eye-client
 
-      - name: Download ffmpeg
+      - name: Stage package
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path package\bin | Out-Null
+
+          # Copy application binary with explicit destination.
+          Copy-Item target\release\third-eye-client.exe package\third-eye-client.exe
+
+          # Download ffmpeg and find the exe regardless of zip directory structure.
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extracted
-          $ffmpegDir = Get-ChildItem ffmpeg-extracted -Directory | Select-Object -First 1
-          New-Item -ItemType Directory -Force -Path package\bin | Out-Null
-          Copy-Item "$($ffmpegDir.FullName)\bin\ffmpeg.exe" package\bin\
-          Copy-Item target\release\third-eye-client.exe package\
+          $ffmpegExe = Get-ChildItem ffmpeg-extracted -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $ffmpegExe) { throw "ffmpeg.exe not found in extracted archive" }
+          Copy-Item $ffmpegExe.FullName package\bin\ffmpeg.exe
+
+          Write-Host "Package contents:"
+          Get-ChildItem package -Recurse | ForEach-Object { Write-Host "  $_" }
 
       - name: Install NSIS
         shell: pwsh
@@ -209,11 +234,9 @@ jobs:
 
           | Platform | File | Notes |
           |----------|------|-------|
-          | **macOS** (Apple Silicon + Intel) | \`Third.Eye.Client.macos-universal.dmg\` | Mount DMG → drag app to Applications |
+          | **macOS** (Apple Silicon + Intel) | \`Third.Eye.Client.macos-universal.dmg\` | Mount DMG → drag app to Applications. ffmpeg included. |
           | **Windows** x64 | \`Third.Eye.Client.windows-x64-setup.exe\` | Installs to Program Files, includes ffmpeg |
-          | **Linux** x64 | \`Third.Eye.Client.linux-x64.AppImage\` | \`chmod +x\` then run — no install needed |
-
-          > **macOS streaming**: ffmpeg is not bundled. Install it with \`brew install ffmpeg\`.
+          | **Linux** x64 | \`Third.Eye.Client.linux-x64.AppImage\` | \`chmod +x\` then run — no install needed. ffmpeg included. |
           EOF
           )" \
             --prerelease \
