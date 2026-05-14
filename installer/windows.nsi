@@ -39,10 +39,10 @@ Section "Install"
   ExecWait 'taskkill /F /IM "${APP_EXE}"' $0
 
   SetOutPath "$INSTDIR"
-  File "package\${APP_EXE}"
+  File "${__FILEDIR__}\..\package\${APP_EXE}"
 
   SetOutPath "$INSTDIR\bin"
-  File "package\bin\ffmpeg.exe"
+  File "${__FILEDIR__}\..\package\bin\ffmpeg.exe"
 
   ; Write uninstaller.
   SetOutPath "$INSTDIR"
