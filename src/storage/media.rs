@@ -765,8 +765,16 @@ mod tests {
             .into_iter()
             .find(|r| r.media_id == "id-a")
             .unwrap();
-        assert_eq!(rec.width, Some(3840), "width preserved after ROV refresh with 0");
-        assert_eq!(rec.height, Some(2160), "height preserved after ROV refresh with 0");
+        assert_eq!(
+            rec.width,
+            Some(3840),
+            "width preserved after ROV refresh with 0"
+        );
+        assert_eq!(
+            rec.height,
+            Some(2160),
+            "height preserved after ROV refresh with 0"
+        );
     }
 
     // Required by `Arc::clone` in the tests above.

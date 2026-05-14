@@ -33,10 +33,8 @@ export component AppWindow inherits Window {
 
     in-out property <string> rtsp_url;
     in-out property <string> rov_http_base;
-    in-out property <string> rov_status_udp_bind_host;
     in-out property <string> rov_status_udp_port;
     in-out property <string> osm_tile_user_agent;
-    in-out property <string> rov_network_interface;
     in-out property <string> rov_info;
 
     // Phone GPS (NMEA over TCP).
@@ -130,8 +128,7 @@ export component AppWindow inherits Window {
     callback use_host_from_rov_http_base();
     callback use_default_rov_status_udp_port();
     callback use_default_osm_tile_user_agent();
-    callback use_default_rov_network_interface();
-    callback clear_rov_network_interface();
+    callback recalibrate_rov_network();
 
     callback list_medias();
     callback capture_photo();
@@ -159,8 +156,6 @@ export component AppWindow inherits Window {
     callback map_zoom_in(length, length, length, length);
     callback map_zoom_out(length, length, length, length);
     callback center_map_on_pin(length, length, length, length);
-
-    callback setup_rov_route();
 
     callback start_stream();
     callback stop_stream();
@@ -286,8 +281,6 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    Text { text: "ROV telemetry UDP bind host:"; }
-                    LineEdit { text <=> root.rov_status_udp_bind_host; }
                     Text { text: "ROV telemetry UDP port:"; }
                     LineEdit { text <=> root.rov_status_udp_port; }
                     Button {
@@ -306,67 +299,16 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
 
-                    Text { text: "ROV network interface (bind all connections to this adapter):"; }
-                    LineEdit { text <=> root.rov_network_interface; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV interface (en10)";
-                            clicked => { root.use_default_rov_network_interface(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Clear (use OS routing)";
-                            clicked => { root.clear_rov_network_interface(); }
-                        }
-                    }
                     Button {
-                        text: "Setup ROV network route (admin)";
-                        clicked => { root.setup_rov_route(); }
+                        text: "Recalibrate ROV network";
+                        clicked => { root.recalibrate_rov_network(); }
                     }
                     Text {
-                        text: "Enter the name of the USB ethernet adapter (e.g. en10). Find it with 'ifconfig'. When set, all ROV HTTP and UDP traffic is bound to this interface via IP_BOUND_IF. Leave empty for default OS routing. Click 'Setup ROV network route' to configure the OS route+ARP for external processes (ffmpeg) — requires admin password.";
+                        text: "Auto-detects the wired USB-ethernet interface for the ROV (192.168.1.88) and sets up the OS route for ffmpeg. If no cable is connected, falls back to OS routing (ROV WiFi). May prompt for admin password.";
                         wrap: word-wrap;
-                    }
-
-                    Text { text: "ROV API notes:"; }
-                    Text {
-                        text: "• RTSP stream example: rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• HTTP API server example: http://192.168.1.88:80";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• Capture endpoint: POST /v1/capture";
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "• Media list endpoint: GET /v1/medias";
-                        wrap: word-wrap;
-                    }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "List medias (GET /v1/medias)";
-                            clicked => { root.list_medias(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Capture photo (POST /v1/capture)";
-                            clicked => { root.capture_photo(); }
-                        }
                     }
 
                     Text { text: root.rov_info; wrap: word-wrap; }
-                    if root.attached_metadata_text != "" : Text {
-                        text: root.attached_metadata_text;
-                        wrap: word-wrap;
-                    }
 
                     Rectangle { height: 1px; background: #3f4148; }
                     Text { text: "Phone GPS (NMEA over TCP)"; font-size: 18px; }

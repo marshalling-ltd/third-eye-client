@@ -53,7 +53,7 @@ const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
 const DEFAULT_SERVER_BASE_URL: &str = "https://third-eye.marshalling.eu";
-const DEFAULT_ROV_INTERFACE: &str = "en10";
+const DEFAULT_ROV_UDP_BIND_HOST: &str = "0.0.0.0";
 
 slint::include_modules!();
 
@@ -213,7 +213,7 @@ fn parse_host_from_http_base(base: &str) -> Option<String> {
 }
 
 fn default_rov_udp_bind_host() -> String {
-    parse_host_from_http_base(DEFAULT_ROV_HTTP_BASE).unwrap_or_else(|| "0.0.0.0".to_owned())
+    DEFAULT_ROV_UDP_BIND_HOST.to_owned()
 }
 
 #[derive(Default)]
@@ -669,10 +669,8 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
 
     ui.set_rtsp_url(state.config.rtsp_url.clone().into());
     ui.set_rov_http_base(state.config.rov_http_base.clone().into());
-    ui.set_rov_status_udp_bind_host(state.config.rov_status_udp_bind_host.clone().into());
     ui.set_rov_status_udp_port(state.config.rov_status_udp_port.clone().into());
     ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
-    ui.set_rov_network_interface(state.config.rov_network_interface.clone().into());
     ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
     ui.set_nmea_gps_host(state.config.nmea_gps_host.clone().into());
@@ -856,10 +854,8 @@ fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
 fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: &AppStore) {
     state.config.rtsp_url = ui.get_rtsp_url().to_string();
     state.config.rov_http_base = ui.get_rov_http_base().to_string();
-    state.config.rov_status_udp_bind_host = ui.get_rov_status_udp_bind_host().to_string();
     state.config.rov_status_udp_port = ui.get_rov_status_udp_port().to_string();
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
-    state.config.rov_network_interface = ui.get_rov_network_interface().to_string();
     state.config.server_base_url = ui.get_server_base_url().to_string();
     state.config.nmea_gps_host = ui.get_nmea_gps_host().to_string();
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
@@ -873,6 +869,131 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
 fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
         eprintln!("failed to persist configuration: {err:#}");
+    }
+}
+
+struct IfconfigEntry {
+    name: String,
+    ipv4: std::net::Ipv4Addr,
+    netmask: std::net::Ipv4Addr,
+}
+
+fn detect_rov_interface(rov_host: &str) -> Option<String> {
+    let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
+    let output = Command::new("ifconfig").arg("-a").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let candidates = parse_ifconfig_entries(&text)
+        .into_iter()
+        .filter(|entry| entry.name.starts_with("en"))
+        .filter(|entry| entry.ipv4 != rov_ip)
+        .filter(|entry| {
+            let mask = u32::from(entry.netmask);
+            (u32::from(entry.ipv4) & mask) == (u32::from(rov_ip) & mask)
+        })
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    if let Some(wired) = candidates
+        .iter()
+        .find(|name| name.as_str() != "en0")
+        .cloned()
+    {
+        return Some(wired);
+    }
+
+    None
+}
+
+fn parse_ifconfig_entries(text: &str) -> Vec<IfconfigEntry> {
+    let mut entries = Vec::new();
+    let mut current_iface = String::new();
+
+    for line in text.lines() {
+        let is_indented = line.starts_with(' ') || line.starts_with('\t');
+        if !is_indented && line.contains(':') {
+            if let Some(name) = line.split(':').next() {
+                current_iface = name.to_owned();
+            }
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if !trimmed.starts_with("inet ") || trimmed.starts_with("inet6 ") {
+            continue;
+        }
+
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(ip_text) = parts.get(1) else {
+            continue;
+        };
+        let Some(netmask_pos) = parts.iter().position(|part| *part == "netmask") else {
+            continue;
+        };
+        let Some(mask_text) = parts.get(netmask_pos + 1) else {
+            continue;
+        };
+        let Ok(ipv4) = ip_text.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        let Some(netmask) = parse_ifconfig_netmask(mask_text) else {
+            continue;
+        };
+        if current_iface.is_empty() {
+            continue;
+        }
+
+        entries.push(IfconfigEntry {
+            name: current_iface.clone(),
+            ipv4,
+            netmask,
+        });
+    }
+
+    entries
+}
+
+fn parse_ifconfig_netmask(mask: &str) -> Option<std::net::Ipv4Addr> {
+    let normalized = mask.strip_prefix("0x").unwrap_or(mask);
+    if let Ok(value) = u32::from_str_radix(normalized, 16) {
+        return Some(std::net::Ipv4Addr::from(value));
+    }
+    mask.parse().ok()
+}
+
+fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
+    state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
+    let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base) else {
+        state.config.rov_network_interface.clear();
+        state.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
+        return;
+    };
+
+    match detect_rov_interface(&rov_host) {
+        Some(interface) => {
+            state.config.rov_network_interface = interface.clone();
+            let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
+            if setup_external_route {
+                match ensure_rov_external_route(&state.config.rov_http_base, &interface) {
+                    Ok(()) => {
+                        summary.push_str(" External stream route is ready.");
+                    }
+                    Err(err) => {
+                        summary
+                            .push_str(&format!(" External stream route is not ready yet: {err:#}"));
+                    }
+                }
+            }
+            state.rov_info = summary;
+        }
+        None => {
+            state.config.rov_network_interface.clear();
+            // Remove any stale host route from a previous cable session so
+            // ffmpeg falls back to the default OS routing (e.g. ROV WiFi).
+            cleanup_stale_rov_route(&rov_host);
+            state.rov_info = format!(
+                "No dedicated wired ROV interface detected for {rov_host}. Using OS routing."
+            );
+        }
     }
 }
 
@@ -1567,10 +1688,20 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.location_detected_at_ms = current_unix_ms();
         }
 
-        // Reuse running stream/telemetry if we left < 10 min ago.
+        // Auto-detect ROV interface before starting stream.
+        refresh_rov_network(&mut state, false);
+        persist_config(&state, &store_for_stream_navigation);
+
+        // Always restart stream+telemetry: the underlying network may have
+        // changed (WiFi ↔ hotspot ↔ cable) even if the interface name didn't.
         state.stream_left_at_ms = 0;
-        let stream_already_running = state.stream.controller.is_some();
-        if !stream_already_running {
+        state.stream.stop();
+        state.rov_status.stop();
+        {
+            // Set up external route for ffmpeg now that we know the interface.
+            if let Some(iface) = state.config.rov_interface() {
+                let _ = ensure_rov_external_route(&state.config.rov_http_base, iface);
+            }
             state.stream.stop();
             let rtsp_url = state.config.rtsp_url.clone();
             state.stream.status = match state.stream.start(rtsp_url) {
@@ -1580,12 +1711,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             ui.set_has_stream_image(false);
         }
 
-        // Auto-start telemetry listener.
+        // Auto-start telemetry listener on 0.0.0.0.
         if !state.rov_status.is_running() {
             let port = state.config.parse_rov_status_udp_port();
             match port {
                 Ok(port) => {
-                    let bind_host = state.config.rov_status_udp_bind_host.clone();
+                    let bind_host = DEFAULT_ROV_UDP_BIND_HOST.to_owned();
                     let iface = state.config.rov_interface().map(str::to_owned);
                     if let Err(err) = state.rov_status.start(&bind_host, port, iface.as_deref()) {
                         state
@@ -1668,11 +1799,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Err(_) => return,
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_use_host_from_base);
-        if let Some(host) = parse_host_from_http_base(&state.config.rov_http_base) {
-            state.config.rov_status_udp_bind_host = host;
-        } else {
-            state.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
-        }
+        state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
         persist_config(&state, &store_for_use_host_from_base);
         apply_state_to_ui(&ui, &state);
     });
@@ -1710,59 +1837,19 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
-    let state_for_default_iface_ip = Rc::clone(&state);
-    let store_for_default_iface_ip = Rc::clone(&store);
-    ui.on_use_default_rov_network_interface(move || {
+    let state_for_recalibrate = Rc::clone(&state);
+    let store_for_recalibrate = Rc::clone(&store);
+    ui.on_recalibrate_rov_network(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_iface_ip.try_borrow_mut() {
+        let mut state = match state_for_recalibrate.try_borrow_mut() {
             Ok(state) => state,
             Err(_) => return,
         };
-        state.config.rov_network_interface = DEFAULT_ROV_INTERFACE.to_owned();
-        persist_config(&state, &store_for_default_iface_ip);
-        apply_state_to_ui(&ui, &state);
-    });
-
-    let ui_weak = ui.as_weak();
-    let state_for_clear_iface_ip = Rc::clone(&state);
-    let store_for_clear_iface_ip = Rc::clone(&store);
-    ui.on_clear_rov_network_interface(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let mut state = match state_for_clear_iface_ip.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        state.config.rov_network_interface = String::new();
-        persist_config(&state, &store_for_clear_iface_ip);
-        apply_state_to_ui(&ui, &state);
-    });
-
-    let ui_weak = ui.as_weak();
-    let state_for_setup_route = Rc::clone(&state);
-    let store_for_setup_route = Rc::clone(&store);
-    ui.on_setup_rov_route(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let mut state = match state_for_setup_route.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        pull_configuration_from_ui(&ui, &mut state, &store_for_setup_route);
-        let iface = state
-            .config
-            .rov_interface()
-            .unwrap_or(DEFAULT_ROV_INTERFACE)
-            .to_owned();
-        let rov_http_base = state.config.rov_http_base.clone();
-        state.rov_info = format!("Setting up ROV network route on {iface}...");
-        apply_state_to_ui(&ui, &state);
-        force_setup_rov_route(&rov_http_base, &iface);
-        state.rov_info = format!("ROV network route setup completed for interface {iface}.");
+        pull_configuration_from_ui(&ui, &mut state, &store_for_recalibrate);
+        refresh_rov_network(&mut state, true);
+        persist_config(&state, &store_for_recalibrate);
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2795,38 +2882,56 @@ fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
 /// Placeholder for the proxy guard; kept for `StreamController` layout.
 type TcpProxyGuard = ();
 
-/// Like [`ensure_rov_route_at_startup`] but always re-runs the osascript
-/// admin prompt, even when a valid route already exists. Used by the
-/// "Setup ROV network route" button so the user can force a re-setup
-/// after changing the ROV IP or interface.
-fn force_setup_rov_route(rov_http_base: &str, interface: &str) {
+/// Probes the ROV via HTTP (to populate ARP) then ensures the OS-level
+/// route exists. Called by `refresh_rov_network` when a wired interface
+/// is detected. Returns `Ok(())` when the route is ready, or an error
+/// if ARP/route setup failed (e.g. ROV is off).
+fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
     let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
     let _ = client.list_medias(None::<MediaScene>);
-
     let host =
         parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_owned());
     let dummy_rtsp = format!("rtsp://x@{host}:8554/");
-    if let Err(err) = force_rov_route_for_rtsp(&dummy_rtsp, interface) {
-        eprintln!("Network route setup failed: {err:#}");
-    }
+    ensure_rov_route_for_rtsp(&dummy_rtsp, interface)
 }
 
-/// Called once at app startup. Makes an HTTP probe via `IP_BOUND_IF` to
-/// populate the ARP table with the ROV's real MAC, then sets up the OS route
-/// so external processes (ffmpeg) can also reach the ROV.
-fn ensure_rov_route_at_startup(rov_http_base: &str, interface: &str) {
-    // First, make a quick HTTP request through IP_BOUND_IF so the ROV's MAC
-    // appears in the ARP table. We need this MAC for the route setup.
-    let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
-    let _ = client.list_medias(None::<MediaScene>); // ignore result, just need ARP populated
-
-    let host =
-        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_owned());
-    let dummy_rtsp = format!("rtsp://x@{host}:8554/");
-    if let Err(err) = ensure_rov_route_for_rtsp(&dummy_rtsp, interface) {
-        eprintln!("Network route setup failed: {err:#}");
+/// Removes a stale host route for `rov_host` that may have been created by a
+/// previous cable session. Without this, switching from cable to ROV WiFi
+/// leaves ffmpeg trying to reach the ROV through the disconnected wired
+/// interface.
+#[cfg(target_os = "macos")]
+fn cleanup_stale_rov_route(rov_host: &str) {
+    // Check if there's actually a static host route before prompting for admin.
+    let has_route = Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.lines().any(|line| {
+                line.contains(rov_host)
+                    && line
+                        .split_whitespace()
+                        .nth(2)
+                        .is_some_and(|flags| flags.contains('H') && flags.contains('S'))
+            })
+        });
+    if !has_route {
+        return;
     }
+    let script = format!(
+        r#"do shell script "/sbin/route delete -host {rov_host} 2>/dev/null; /usr/sbin/arp -d {rov_host} 2>/dev/null" with administrator privileges"#
+    );
+    let _ = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_stale_rov_route(_rov_host: &str) {}
 
 /// Sets up an OS-level host route + ARP entry so that ffmpeg's TCP connections
 /// to the ROV go through the correct network interface.
@@ -2880,24 +2985,12 @@ fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
     run_rov_route_osascript(&rov_host, interface, &rov_mac)
 }
 
-/// Always runs the osascript, even if a valid route already exists.
-#[cfg(target_os = "macos")]
-fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let (rov_host, rov_mac) = resolve_rov_host_and_mac(rtsp_url, interface)?;
-    run_rov_route_osascript(&rov_host, interface, &rov_mac)
-}
-
 #[cfg(not(target_os = "macos"))]
 fn ensure_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn force_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
-    Ok(())
-}
-
-/// Checks whether a valid host route + ARP entry already exists for the ROV
+/// Checks whether a valid host route
 /// on the specified interface.
 fn has_valid_rov_route(host: &str, interface: &str) -> bool {
     // Check ARP: must have a real MAC (not incomplete, not adapter's own MAC)
@@ -3013,14 +3106,11 @@ fn main() -> Result<()> {
     });
     let state = Rc::new(RefCell::new(ThirdEyeState::new(&store)));
     state.borrow_mut().initialize_location_on_startup();
-    // If a network interface is configured, set up the OS-level route so
-    // that external processes (ffmpeg) can reach the ROV. This prompts for
-    // admin credentials once at startup via a native macOS dialog.
+    // Auto-detect ROV network interface at startup (passive ifconfig scan).
     {
-        let s = state.borrow();
-        if let Some(iface) = s.config.rov_interface() {
-            ensure_rov_route_at_startup(&s.config.rov_http_base, iface);
-        }
+        let mut s = state.borrow_mut();
+        refresh_rov_network(&mut s, false);
+        persist_config(&s, &store);
     }
 
     {
