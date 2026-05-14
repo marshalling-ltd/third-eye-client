@@ -160,6 +160,8 @@ export component AppWindow inherits Window {
     callback map_zoom_out(length, length, length, length);
     callback center_map_on_pin(length, length, length, length);
 
+    callback setup_rov_route();
+
     callback start_stream();
     callback stop_stream();
     callback start_rov_status_listener();
@@ -319,8 +321,12 @@ export component AppWindow inherits Window {
                             clicked => { root.clear_rov_network_interface(); }
                         }
                     }
+                    Button {
+                        text: "Setup ROV network route (admin)";
+                        clicked => { root.setup_rov_route(); }
+                    }
                     Text {
-                        text: "Enter the name of the USB ethernet adapter (e.g. en10). Find it with 'ifconfig'. When set, all ROV HTTP and UDP traffic is bound to this interface via IP_BOUND_IF. Leave empty for default OS routing.";
+                        text: "Enter the name of the USB ethernet adapter (e.g. en10). Find it with 'ifconfig'. When set, all ROV HTTP and UDP traffic is bound to this interface via IP_BOUND_IF. Leave empty for default OS routing. Click 'Setup ROV network route' to configure the OS route+ARP for external processes (ffmpeg) — requires admin password.";
                         wrap: word-wrap;
                     }
 

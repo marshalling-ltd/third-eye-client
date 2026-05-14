@@ -1742,6 +1742,31 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_setup_route = Rc::clone(&state);
+    let store_for_setup_route = Rc::clone(&store);
+    ui.on_setup_rov_route(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_setup_route.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_setup_route);
+        let iface = state
+            .config
+            .rov_interface()
+            .unwrap_or(DEFAULT_ROV_INTERFACE)
+            .to_owned();
+        let rov_http_base = state.config.rov_http_base.clone();
+        state.rov_info = format!("Setting up ROV network route on {iface}...");
+        apply_state_to_ui(&ui, &state);
+        ensure_rov_route_at_startup(&rov_http_base, &iface);
+        state.rov_info = format!("ROV network route setup completed for interface {iface}.");
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
     let state_for_default_server_url = Rc::clone(&state);
     let store_for_default_server_url = Rc::clone(&store);
     ui.on_use_default_server_base_url(move || {
