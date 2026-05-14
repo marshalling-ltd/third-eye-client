@@ -3069,35 +3069,30 @@ fn read_arp_mac_on_interface(host: &str, interface: &str) -> Option<String> {
 }
 
 fn locate_ffmpeg_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("bin/ffmpeg"));
-        candidates.push(dir.join("ffmpeg"));
+        candidates.push(dir.join("bin").join(exe_name));
+        candidates.push(dir.join(exe_name));
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("bin/ffmpeg"));
-        candidates.push(cwd.join("ffmpeg"));
+        candidates.push(cwd.join("bin").join(exe_name));
+        candidates.push(cwd.join(exe_name));
     }
 
     candidates
         .into_iter()
         .find(|path| path.exists())
-        .or_else(|| Some(PathBuf::from("ffmpeg")))
-}
-
-fn configure_slint_style() {
-    if std::env::var_os("SLINT_STYLE").is_none() {
-        // SAFETY: Called in main before UI initialization or background threads.
-        unsafe {
-            std::env::set_var("SLINT_STYLE", "cupertino");
-        }
-    }
+        .or_else(|| Some(PathBuf::from(exe_name)))
 }
 
 fn main() -> Result<()> {
-    configure_slint_style();
     let ui = AppWindow::new().context("failed to initialize Slint window")?;
     let store = Rc::new(match AppStore::open() {
         Ok(store) => store,
