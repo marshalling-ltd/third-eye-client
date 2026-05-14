@@ -27,17 +27,14 @@ jobs:
             -output target/third-eye-client-universal
           lipo -info target/third-eye-client-universal
 
-      - name: Bundle universal ffmpeg
+      - name: Bundle ffmpeg
         run: |
-          # Download separate arm64 and x86_64 static builds, lipo into universal.
-          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/arm64/zip" -o ffmpeg-arm64.zip
-          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/zip"       -o ffmpeg-x86_64.zip
-          unzip -q ffmpeg-arm64.zip  -d ffmpeg-arm64
-          unzip -q ffmpeg-x86_64.zip -d ffmpeg-x86_64
-          ARM64_BIN=$(find ffmpeg-arm64  -type f -name "ffmpeg" | head -1)
-          X86_BIN=$(find   ffmpeg-x86_64 -type f -name "ffmpeg" | head -1)
-          lipo -create "$ARM64_BIN" "$X86_BIN" -output ffmpeg-universal
-          lipo -info ffmpeg-universal
+          # brew gives us the native arm64 binary; Rosetta 2 runs it
+          # transparently on Intel Macs so no lipo is needed.
+          brew install --quiet ffmpeg
+          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-bundled
+          chmod +x ffmpeg-bundled
+          file ffmpeg-bundled
 
       - name: Assemble .app bundle
         run: |
@@ -46,7 +43,7 @@ jobs:
           mkdir -p "$APP/Contents/Resources"
           cp target/third-eye-client-universal "$APP/Contents/MacOS/third-eye-client"
           chmod 755 "$APP/Contents/MacOS/third-eye-client"
-          cp ffmpeg-universal "$APP/Contents/MacOS/bin/ffmpeg"
+          cp ffmpeg-bundled "$APP/Contents/MacOS/bin/ffmpeg"
           chmod 755 "$APP/Contents/MacOS/bin/ffmpeg"
           cp macos/Info.plist "$APP/Contents/Info.plist"
           cp assets/logo.icns "$APP/Contents/Resources/logo.icns"

@@ -13,6 +13,12 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Local build script artifacts
+ffmpeg-arm64/
+ffmpeg-arm64.zip
+ffmpeg-x86_64/
+ffmpeg-x86_64.zip
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
