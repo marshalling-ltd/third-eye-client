@@ -1700,7 +1700,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         {
             // Set up external route for ffmpeg now that we know the interface.
             if let Some(iface) = state.config.rov_interface() {
-                let _ = ensure_rov_external_route(&state.config.rov_http_base, iface);
+                if let Err(err) = ensure_rov_external_route(&state.config.rov_http_base, iface) {
+                    state.rov_info = format!(
+                        "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
+                    );
+                }
             }
             state.stream.stop();
             let rtsp_url = state.config.rtsp_url.clone();
