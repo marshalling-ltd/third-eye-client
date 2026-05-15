@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -617,8 +618,7 @@ fn detect_location_from_windows_location() -> Result<(f64, f64)> {
 
     let locator = Geolocator::new().context("failed to create Windows Geolocator")?;
 
-    let access = locator
-        .RequestAccessAsync()
+    let access = Geolocator::RequestAccessAsync()
         .context("RequestAccessAsync failed")?
         .get()
         .context("waiting for location access timed out")?;

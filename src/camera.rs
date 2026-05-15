@@ -300,6 +300,7 @@ impl CameraApiClient {
     #[must_use]
     #[allow(unused_variables)]
     pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
+        #[allow(unused_mut)]
         let mut builder = Client::builder();
         #[cfg(unix)]
         if let Some(iface) = interface {
