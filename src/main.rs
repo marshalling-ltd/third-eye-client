@@ -2690,8 +2690,8 @@ fn spawn_media_stream_pipeline(
     ffmpeg_bin: PathBuf,
     http_url: String,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
-    let mut ffmpeg_child = Command::new(&ffmpeg_bin)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-i")
@@ -2704,8 +2704,13 @@ fn spawn_media_stream_pipeline(
         .arg("6")
         .arg("pipe:1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut ffmpeg_child = cmd.spawn()
         .context("failed to spawn ffmpeg for media streaming")?;
 
     let stdout = ffmpeg_child
@@ -2762,7 +2767,7 @@ fn spawn_stream_pipeline(
     if let Some(localaddr) = &localaddr {
         command.arg("-localaddr").arg(localaddr);
     }
-    let mut ffmpeg_child = command
+    command
         .arg("-i")
         .arg(&rtsp_url)
         .arg("-vf")
@@ -2773,7 +2778,13 @@ fn spawn_stream_pipeline(
         .arg("6")
         .arg("pipe:1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut ffmpeg_child = command
         .spawn()
         .context("failed to spawn ffmpeg for embedded stream")?;
 
