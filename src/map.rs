@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -612,8 +612,21 @@ pub fn detect_location(
 // Windows Location Services
 // ---------------------------------------------------------------------------
 
+/// Wraps the blocking Windows location call with a 2-second timeout so it
+/// never freezes the UI thread. Windows GPS hardware can block indefinitely
+/// while warming up, which would stall every button/tab click.
 #[cfg(target_os = "windows")]
 fn detect_location_from_windows_location() -> Result<(f64, f64)> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(detect_location_from_windows_location_blocking());
+    });
+    rx.recv_timeout(Duration::from_secs(2))
+        .context("Windows location timed out after 2 s")?
+}
+
+#[cfg(target_os = "windows")]
+fn detect_location_from_windows_location_blocking() -> Result<(f64, f64)> {
     use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 
     let locator = Geolocator::new().context("failed to create Windows Geolocator")?;
@@ -621,7 +634,7 @@ fn detect_location_from_windows_location() -> Result<(f64, f64)> {
     let access = Geolocator::RequestAccessAsync()
         .context("RequestAccessAsync failed")?
         .get()
-        .context("waiting for location access timed out")?;
+        .context("waiting for location access")?;
 
     if access != GeolocationAccessStatus::Allowed {
         anyhow::bail!("Windows location access was not granted (status: {access:?})");
@@ -631,7 +644,7 @@ fn detect_location_from_windows_location() -> Result<(f64, f64)> {
         .GetGeopositionAsync()
         .context("GetGeopositionAsync failed")?
         .get()
-        .context("waiting for GPS position timed out")?;
+        .context("waiting for GPS position")?;
 
     let coordinate = position.Coordinate().context("no coordinate in position")?;
     let point = coordinate.Point().context("no point in coordinate")?;
