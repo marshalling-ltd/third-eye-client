@@ -573,7 +573,29 @@ pub fn detect_location(
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = map;
+        match detect_location_from_windows_location() {
+            Ok((lat, lon)) => Ok(DetectedLocation {
+                lat,
+                lon,
+                source: "Windows Location Services (native)".to_owned(),
+            }),
+            Err(native_err) => {
+                let (lat, lon) = detect_location_from_ip().with_context(|| {
+                    format!("Windows Location failed ({native_err:#}) and IP fallback also failed")
+                })?;
+                Ok(DetectedLocation {
+                    lat,
+                    lon,
+                    source: format!("IP geolocation fallback ({native_err:#})"),
+                })
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = map;
         let (lat, lon) = detect_location_from_ip()?;
@@ -583,6 +605,49 @@ pub fn detect_location(
             source: "IP geolocation".to_owned(),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Windows Location Services
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn detect_location_from_windows_location() -> Result<(f64, f64)> {
+    use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
+
+    let locator = Geolocator::new().context("failed to create Windows Geolocator")?;
+
+    let access = locator
+        .RequestAccessAsync()
+        .context("RequestAccessAsync failed")?
+        .get()
+        .context("waiting for location access timed out")?;
+
+    if access != GeolocationAccessStatus::Allowed {
+        anyhow::bail!("Windows location access was not granted (status: {access:?})");
+    }
+
+    let position = locator
+        .GetGeopositionAsync()
+        .context("GetGeopositionAsync failed")?
+        .get()
+        .context("waiting for GPS position timed out")?;
+
+    let coordinate = position.Coordinate().context("no coordinate in position")?;
+    let point = coordinate.Point().context("no point in coordinate")?;
+    let pos = point.Position().context("no position in point")?;
+
+    let lat = pos.Latitude;
+    let lon = pos.Longitude;
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+    {
+        anyhow::bail!("Windows Location returned an invalid coordinate ({lat}, {lon})");
+    }
+
+    Ok((lat, lon))
 }
 
 // ---------------------------------------------------------------------------

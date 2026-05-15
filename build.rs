@@ -9,6 +9,17 @@ fn main() {
     .expect("Slint compilation failed");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    #[cfg(target_os = "windows")]
+    if target_os == "windows" {
+        let mut res = winres::WindowsResource::new();
+        res.set_icon("assets/logo.ico");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=Failed to embed Windows icon: {e}");
+        }
+        return;
+    }
+
     if target_os != "macos" {
         return;
     }

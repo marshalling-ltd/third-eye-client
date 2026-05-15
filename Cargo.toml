@@ -30,14 +30,21 @@ sha2 = "0.11"
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
 socket2 = { version = "0.6", features = ["all"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+if-addrs = "0.13"
 webbrowser = "1.2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }
 objc2 = "0.6.4"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Devices_Geolocation", "Foundation"] }
+
 [build-dependencies]
 slint-build = "1.16.1"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 mockito = "1"

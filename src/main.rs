@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -21,6 +22,7 @@ mod map;
 
 use std::cell::RefCell;
 use std::io::Read;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::rc::Rc;
@@ -566,17 +568,21 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn start(&mut self, rtsp_url: String) -> Result<String> {
+    fn start(&mut self, rtsp_url: String, rov_interface: Option<&str>) -> Result<String> {
         let ffmpeg_bin = locate_ffmpeg_binary().context(
             "ffmpeg binary not found. Bundle it as ./bin/ffmpeg beside the app executable.",
         )?;
         let ffmpeg_label = ffmpeg_bin.display().to_string();
-        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url)?;
+        let localaddr = local_rtsp_bind_addr(&rtsp_url, rov_interface);
+        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url, localaddr.clone())?;
         self.event_rx = Some(rx);
         self.controller = Some(controller);
         self.frames_received = 0;
+        let bind_suffix = localaddr
+            .map(|addr| format!(" (bound to {addr})"))
+            .unwrap_or_default();
         Ok(format!(
-            "Embedded stream started via ffmpeg at {ffmpeg_label}."
+            "Embedded stream started via ffmpeg at {ffmpeg_label}{bind_suffix}."
         ))
     }
 
@@ -872,92 +878,76 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     }
 }
 
-struct IfconfigEntry {
-    name: String,
-    ipv4: std::net::Ipv4Addr,
-    netmask: std::net::Ipv4Addr,
-}
-
+/// Finds the network interface that is on the same subnet as `rov_host`.
+///
+/// Uses `if-addrs` for cross-platform interface enumeration. On macOS the
+/// WiFi adapter (`en0`) is excluded so that wired USB-ethernet adapters are
+/// preferred; on other platforms the first matching non-loopback interface
+/// is returned.
 fn detect_rov_interface(rov_host: &str) -> Option<String> {
     let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
-    let output = Command::new("ifconfig").arg("-a").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let candidates = parse_ifconfig_entries(&text)
+    let interfaces = if_addrs::get_if_addrs().ok()?;
+
+    let candidates: Vec<String> = interfaces
         .into_iter()
-        .filter(|entry| entry.name.starts_with("en"))
-        .filter(|entry| entry.ipv4 != rov_ip)
-        .filter(|entry| {
-            let mask = u32::from(entry.netmask);
-            (u32::from(entry.ipv4) & mask) == (u32::from(rov_ip) & mask)
-        })
-        .map(|entry| entry.name)
-        .collect::<Vec<_>>();
-
-    if let Some(wired) = candidates
-        .iter()
-        .find(|name| name.as_str() != "en0")
-        .cloned()
-    {
-        return Some(wired);
-    }
-
-    None
-}
-
-fn parse_ifconfig_entries(text: &str) -> Vec<IfconfigEntry> {
-    let mut entries = Vec::new();
-    let mut current_iface = String::new();
-
-    for line in text.lines() {
-        let is_indented = line.starts_with(' ') || line.starts_with('\t');
-        if !is_indented && line.contains(':') {
-            if let Some(name) = line.split(':').next() {
-                current_iface = name.to_owned();
+        .filter(|iface| !iface.is_loopback())
+        .filter_map(|iface| {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                if v4.ip != rov_ip {
+                    let mask = u32::from(v4.netmask);
+                    if (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask) {
+                        return Some(iface.name);
+                    }
+                }
             }
-            continue;
-        }
+            None
+        })
+        .collect();
 
-        let trimmed = line.trim();
-        if !trimmed.starts_with("inet ") || trimmed.starts_with("inet6 ") {
-            continue;
-        }
-
-        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
-        let Some(ip_text) = parts.get(1) else {
-            continue;
-        };
-        let Some(netmask_pos) = parts.iter().position(|part| *part == "netmask") else {
-            continue;
-        };
-        let Some(mask_text) = parts.get(netmask_pos + 1) else {
-            continue;
-        };
-        let Ok(ipv4) = ip_text.parse::<std::net::Ipv4Addr>() else {
-            continue;
-        };
-        let Some(netmask) = parse_ifconfig_netmask(mask_text) else {
-            continue;
-        };
-        if current_iface.is_empty() {
-            continue;
-        }
-
-        entries.push(IfconfigEntry {
-            name: current_iface.clone(),
-            ipv4,
-            netmask,
-        });
+    // On macOS prefer any interface over en0 (en0 is typically WiFi;
+    // wired USB-ethernet adapters appear as en5, en6, etc.).
+    #[cfg(target_os = "macos")]
+    {
+        return candidates
+            .iter()
+            .find(|name| name.as_str() != "en0")
+            .cloned();
     }
 
-    entries
+    #[cfg(not(target_os = "macos"))]
+    candidates.into_iter().next()
 }
 
-fn parse_ifconfig_netmask(mask: &str) -> Option<std::net::Ipv4Addr> {
-    let normalized = mask.strip_prefix("0x").unwrap_or(mask);
-    if let Ok(value) = u32::from_str_radix(normalized, 16) {
-        return Some(std::net::Ipv4Addr::from(value));
-    }
-    mask.parse().ok()
+fn local_ipv4_for_interface(interface: &str, remote_host: Option<&str>) -> Option<Ipv4Addr> {
+    let remote_ip = remote_host.and_then(|host| host.parse::<Ipv4Addr>().ok());
+    let interfaces = if_addrs::get_if_addrs().ok()?;
+
+    interfaces
+        .into_iter()
+        .filter(|iface| iface.name == interface && !iface.is_loopback())
+        .find_map(|iface| {
+            let if_addrs::IfAddr::V4(v4) = iface.addr else {
+                return None;
+            };
+            if v4.ip.is_loopback() {
+                return None;
+            }
+            if let Some(remote_ip) = remote_ip {
+                let mask = u32::from(v4.netmask);
+                if (u32::from(v4.ip) & mask) != (u32::from(remote_ip) & mask) {
+                    return None;
+                }
+            }
+            Some(v4.ip)
+        })
+}
+
+fn local_rtsp_bind_addr(rtsp_url: &str, interface: Option<&str>) -> Option<String> {
+    let interface = interface?;
+    let remote_host = Url::parse(rtsp_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    local_ipv4_for_interface(interface, remote_host.as_deref()).map(|ip| ip.to_string())
 }
 
 fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
@@ -1708,7 +1698,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             }
             state.stream.stop();
             let rtsp_url = state.config.rtsp_url.clone();
-            state.stream.status = match state.stream.start(rtsp_url) {
+            let rov_interface = state.config.rov_interface().map(str::to_owned);
+            state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
                 Ok(msg) => msg,
                 Err(err) => format!("Failed to start stream: {err:#}"),
             };
@@ -2167,7 +2158,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_stream);
         state.stream.stop();
         let rtsp_url = state.config.rtsp_url.clone();
-        state.stream.status = match state.stream.start(rtsp_url) {
+        let rov_interface = state.config.rov_interface().map(str::to_owned);
+        state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
             Ok(msg) => msg,
             Err(err) => format!("Failed to start stream: {err:#}"),
         };
@@ -2754,8 +2746,10 @@ fn spawn_media_stream_pipeline(
 fn spawn_stream_pipeline(
     ffmpeg_bin: PathBuf,
     rtsp_url: String,
+    localaddr: Option<String>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
-    let mut ffmpeg_child = Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
@@ -2764,7 +2758,11 @@ fn spawn_stream_pipeline(
         .arg("-fflags")
         .arg("nobuffer")
         .arg("-flags")
-        .arg("low_delay")
+        .arg("low_delay");
+    if let Some(localaddr) = &localaddr {
+        command.arg("-localaddr").arg(localaddr);
+    }
+    let mut ffmpeg_child = command
         .arg("-i")
         .arg(&rtsp_url)
         .arg("-vf")
