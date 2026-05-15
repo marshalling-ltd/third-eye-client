@@ -1697,6 +1697,17 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 }
             }
             state.stream.stop();
+            // On Windows, ping the ROV via HTTP to ensure the ARP cache is
+            // populated before ffmpeg tries to open the RTSP stream.
+            // (macOS uses osascript+arp instead; Linux handles it via routing.)
+            #[cfg(target_os = "windows")]
+            if let Some(iface) = state.config.rov_interface() {
+                let client = CameraApiClient::new_bound(
+                    state.config.rov_http_base.clone(),
+                    Some(iface),
+                );
+                let _ = client.list_medias(None::<MediaScene>);
+            }
             let rtsp_url = state.config.rtsp_url.clone();
             let rov_interface = state.config.rov_interface().map(str::to_owned);
             state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
@@ -3113,6 +3124,10 @@ fn main() -> Result<()> {
         }
     });
     let state = Rc::new(RefCell::new(ThirdEyeState::new(&store)));
+    // On Windows, skip blocking location detection at startup: Windows Location
+    // Services can block for many seconds waiting for a GPS fix, freezing the UI
+    // before it even opens. Use Detect Location button or Map tab instead.
+    #[cfg(not(target_os = "windows"))]
     state.borrow_mut().initialize_location_on_startup();
     // Auto-detect ROV network interface at startup (passive ifconfig scan).
     {

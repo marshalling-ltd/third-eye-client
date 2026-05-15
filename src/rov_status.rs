@@ -281,7 +281,9 @@ fn bind_socket_to_interface(socket: &Socket, iface: &str) -> Result<()> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        anyhow::bail!("interface binding is not supported on this platform");
+        // Interface binding is not supported on this platform (e.g. Windows).
+        // Bind to 0.0.0.0 instead — the socket will receive on all interfaces.
+        let _ = iface;
     }
     Ok(())
 }
