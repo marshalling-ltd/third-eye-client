@@ -43,6 +43,9 @@ export component AppWindow inherits Window {
     in-out property <string> nmea_gps_status;
     in-out property <bool> nmea_gps_running: false;
 
+    // Phone GPS (Bluetooth / serial).
+    in-out property <string> bluetooth_gps_port;
+
     // Server account (third-eye backend).
     in-out property <string> server_base_url;
     in-out property <string> auth_email;
@@ -144,6 +147,8 @@ export component AppWindow inherits Window {
     callback start_nmea_gps();
     callback stop_nmea_gps();
     callback use_default_nmea_gps_port();
+    callback start_bluetooth_gps();
+    callback list_bluetooth_ports();
 
     callback sign_in();
     callback sign_out();
@@ -340,6 +345,34 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text { text: root.nmea_gps_status; wrap: word-wrap; }
+
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Phone GPS (Bluetooth)"; font-size: 18px; }
+                    Text {
+                        text: "Pair your Android phone via Bluetooth, then click \"List ports\" to find its serial port name (e.g. /dev/cu.YourPhone on macOS, COM5 on Windows). Popular apps: Bluetooth GPS, GPS Share.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "Bluetooth serial port:"; }
+                    LineEdit { text <=> root.bluetooth_gps_port; placeholder-text: "e.g. /dev/cu.GPS or COM5"; }
+                    Button {
+                        text: "List available ports";
+                        clicked => { root.list_bluetooth_ports(); }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start Bluetooth GPS";
+                            enabled: !root.nmea_gps_running;
+                            clicked => { root.start_bluetooth_gps(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop Bluetooth GPS";
+                            enabled: root.nmea_gps_running;
+                            clicked => { root.stop_nmea_gps(); }
+                        }
+                    }
 
                     Rectangle { height: 1px; background: #3f4148; }
                     Text { text: "Server account"; font-size: 18px; }

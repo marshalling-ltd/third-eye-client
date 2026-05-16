@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,10 +19,6 @@ pub const MAX_ZOOM: u32 = 19;
 pub const MAP_IMAGE_SIZE_PX: u32 = 768;
 const MAP_TILE_SIZE_PX: isize = 256;
 const MAP_TILE_CACHE_MARGIN: isize = 8;
-#[cfg(target_os = "macos")]
-const CORELOCATION_FIX_POLL_ATTEMPTS: u32 = 8;
-#[cfg(target_os = "macos")]
-const CORELOCATION_FIX_POLL_INTERVAL_MS: u64 = 250;
 pub const DEFAULT_OSM_TILE_USER_AGENT: &str =
     "third-eye-client/0.1 (desktop map viewer; set contact URL/email for production use)";
 
@@ -57,19 +53,6 @@ pub struct MapState {
     pub(crate) corelocation_manager: Option<Retained<CLLocationManager>>,
     #[cfg(target_os = "macos")]
     pub(crate) corelocation_permission_requested: bool,
-}
-
-pub struct DetectedLocation {
-    pub lat: f64,
-    pub lon: f64,
-    pub source: String,
-}
-
-#[cfg(target_os = "macos")]
-enum CoreLocationDetectionOutcome {
-    Located(f64, f64),
-    PendingPermission(String),
-    PendingFix(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -502,82 +485,8 @@ pub fn lat_lon_to_world_px(lat: f64, lon: f64, zoom_level: u32) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------------------
-// Location detection
-// ---------------------------------------------------------------------------
-
-pub fn detect_location(
-    map: &mut MapState,
-    nmea_fix: Option<(f64, f64)>,
-) -> Result<DetectedLocation> {
-    // Highest priority: NMEA GPS fix from phone.
-    if let Some((lat, lon)) = nmea_fix {
-        return Ok(DetectedLocation {
-            lat,
-            lon,
-            source: "Phone GPS (NMEA/TCP)".to_owned(),
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // IP geolocation is intentionally NOT used as a fallback: it gives
-        // city/ISP-level coordinates that can be hundreds of km off, which
-        // is worse than showing no location at all.
-        match detect_location_from_corelocation(map) {
-            Ok(CoreLocationDetectionOutcome::Located(lat, lon)) => Ok(DetectedLocation {
-                lat,
-                lon,
-                source: "macOS CoreLocation (native)".to_owned(),
-            }),
-            Ok(CoreLocationDetectionOutcome::PendingPermission(message)) => {
-                anyhow::bail!("{message}")
-            }
-            Ok(CoreLocationDetectionOutcome::PendingFix(message)) => {
-                anyhow::bail!("{message}")
-            }
-            Err(native_err) => Err(native_err),
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let _ = map;
-        // IP geolocation is intentionally NOT used as a fallback: it gives
-        // city/ISP-level coordinates that can be hundreds of km off.
-        // If Windows Location Services times out, let the caller show an
-        // error and the user can press Detect Location again (GPS warms up
-        // after the first request).
-        let (lat, lon) = detect_location_from_windows_location()?;
-        Ok(DetectedLocation {
-            lat,
-            lon,
-            source: "Windows Location Services (native)".to_owned(),
-        })
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = map;
-        anyhow::bail!("No native location source available on this platform. Use Phone GPS (NMEA/TCP) instead.");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Windows Location Services
 // ---------------------------------------------------------------------------
-
-/// Wraps the blocking Windows location call with a 2-second timeout so it
-/// never freezes the UI thread. Windows GPS hardware can block indefinitely
-/// while warming up, which would stall every button/tab click.
-#[cfg(target_os = "windows")]
-fn detect_location_from_windows_location() -> Result<(f64, f64)> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(detect_location_from_windows_location_blocking());
-    });
-    rx.recv_timeout(Duration::from_secs(2))
-        .context("Windows location timed out after 2 s")?
-}
 
 #[cfg(target_os = "windows")]
 pub(crate) fn detect_location_from_windows_location_blocking() -> Result<(f64, f64)> {
@@ -622,6 +531,7 @@ pub(crate) fn detect_location_from_windows_location_blocking() -> Result<(f64, f
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn corelocation_status_label(status: CLAuthorizationStatus) -> &'static str {
     if status == CLAuthorizationStatus::NotDetermined {
         "NotDetermined"
@@ -656,81 +566,7 @@ pub fn corelocation_debug_status(map: &MapState) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationDetectionOutcome> {
-    fn valid_coordinate(lat: f64, lon: f64) -> bool {
-        lat.is_finite()
-            && lon.is_finite()
-            && (-90.0..=90.0).contains(&lat)
-            && (-180.0..=180.0).contains(&lon)
-    }
-
-    unsafe {
-        if !CLLocationManager::locationServicesEnabled_class() {
-            anyhow::bail!("CoreLocation services are disabled");
-        }
-        if map.corelocation_manager.is_none() {
-            map.corelocation_manager = Some(CLLocationManager::new());
-        }
-        let manager = map
-            .corelocation_manager
-            .as_ref()
-            .context("failed to initialize CoreLocation manager")?;
-        manager.setDesiredAccuracy(kCLLocationAccuracyBest);
-        let status = manager.authorizationStatus();
-
-        if status == CLAuthorizationStatus::NotDetermined {
-            if !map.corelocation_permission_requested {
-                manager.requestWhenInUseAuthorization();
-                map.corelocation_permission_requested = true;
-                return Ok(CoreLocationDetectionOutcome::PendingPermission(
-                    "Requested native location permission. Approve the macOS prompt, then click Detect location again.".to_owned(),
-                ));
-            }
-            return Ok(CoreLocationDetectionOutcome::PendingPermission(
-                "Waiting for native location permission response. If no prompt appears, focus the app and click Detect location again.".to_owned(),
-            ));
-        }
-        map.corelocation_permission_requested = false;
-
-        if status == CLAuthorizationStatus::Denied || status == CLAuthorizationStatus::Restricted {
-            anyhow::bail!("CoreLocation permission is denied or restricted");
-        }
-
-        // Do NOT use manager.location() as a quick early return: that
-        // property caches the last-known location, which may be from a
-        // previous session or from somewhere hundreds of km away.
-        // Always request a fresh fix via startUpdatingLocation/requestLocation.
-
-        if status != CLAuthorizationStatus::AuthorizedAlways
-            && status != CLAuthorizationStatus::AuthorizedWhenInUse
-        {
-            anyhow::bail!("CoreLocation is not authorized for this app");
-        }
-
-        manager.startUpdatingLocation();
-        manager.requestLocation();
-        for _ in 0..CORELOCATION_FIX_POLL_ATTEMPTS {
-            if let Some(location) = manager.location() {
-                let coordinate = location.coordinate();
-                if valid_coordinate(coordinate.latitude, coordinate.longitude) {
-                    manager.stopUpdatingLocation();
-                    return Ok(CoreLocationDetectionOutcome::Located(
-                        coordinate.latitude,
-                        coordinate.longitude,
-                    ));
-                }
-            }
-            thread::sleep(Duration::from_millis(CORELOCATION_FIX_POLL_INTERVAL_MS));
-        }
-    }
-
-    Ok(CoreLocationDetectionOutcome::PendingFix(
-        "Waiting for native location fix. Click Detect location again in a moment.".to_owned(),
-    ))
-}
-
-/// Initialises the CoreLocation manager and starts location updates without
+/// Initialises the CoreLocation manager
 /// blocking. Safe to call before the Slint run loop starts; actual fixes are
 /// delivered once the event loop is running. Call this at app startup so that
 /// `check_corelocation_warmup_fix` can return a result quickly afterwards.
