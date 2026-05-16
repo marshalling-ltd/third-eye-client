@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
-use map::corelocation_debug_status;
+use map::{check_corelocation_warmup_fix, corelocation_debug_status, prime_corelocation_at_startup};
 use map::{
     DEFAULT_OSM_TILE_USER_AGENT, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, MapState, MapTilesState,
     RgbaFrame, ViewportAnimation, compute_scale_bar, detect_location, ease_out_cubic,
@@ -384,6 +384,11 @@ struct ThirdEyeState {
     /// Unix-ms timestamp when the user left the stream screen.
     /// `0` means we are on the stream screen (or never were).
     stream_left_at_ms: i64,
+    /// Background startup location warmup (Windows only). A background thread
+    /// calls the blocking GPS API and sends the result here; the timer loop
+    /// picks it up and applies it without blocking the UI.
+    #[cfg(target_os = "windows")]
+    startup_location_rx: Option<mpsc::Receiver<Result<(f64, f64), String>>>,
 }
 
 impl ThirdEyeState {
@@ -459,26 +464,8 @@ impl ThirdEyeState {
             media,
             location_detected_at_ms: 0,
             stream_left_at_ms: 0,
-        }
-    }
-
-    fn initialize_location_on_startup(&mut self) {
-        match detect_location(&mut self.map, self.nmea_gps.latest_location()) {
-            Ok(location) => {
-                self.map.lat = Some(location.lat);
-                self.map.lon = Some(location.lon);
-                self.location_detected_at_ms = current_unix_ms();
-                let success_message = format!(
-                    "Startup location via {}: lat={:.6}, lon={:.6}.",
-                    location.source, location.lat, location.lon
-                );
-                self.load_map_tile_for_current_location(format!(
-                    "{success_message} Map tiles are loading."
-                ));
-            }
-            Err(err) => {
-                self.map.status = format!("Startup location detection failed: {err:#}");
-            }
+            #[cfg(target_os = "windows")]
+            startup_location_rx: None,
         }
     }
 
@@ -3101,11 +3088,42 @@ fn main() -> Result<()> {
         }
     });
     let state = Rc::new(RefCell::new(ThirdEyeState::new(&store)));
-    // On Windows, skip blocking location detection at startup: Windows Location
-    // Services can block for many seconds waiting for a GPS fix, freezing the UI
-    // before it even opens. Use Detect Location button or Map tab instead.
-    #[cfg(not(target_os = "windows"))]
-    state.borrow_mut().initialize_location_on_startup();
+    // Warm up location services in the background so the map can auto-centre
+    // without blocking the UI or requiring an explicit user action.
+    //
+    // macOS  – CoreLocation must be initialised on the main thread (framework
+    //           requirement). Permission is requested here (non-blocking native
+    //           dialog); the fix is delivered via the run loop and picked up by
+    //           the 16 ms poll timer once ui.run() starts.
+    //
+    // Windows – the blocking GPS call runs in a background thread; the result
+    //            is forwarded to the UI timer via an mpsc channel.
+    //
+    // Linux / others – no native GPS source; nothing to warm up.
+    #[cfg(target_os = "macos")]
+    {
+        let mut s = state.borrow_mut();
+        prime_corelocation_at_startup(&mut s.map);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let (loc_tx, loc_rx) = mpsc::channel::<Result<(f64, f64), String>>();
+        thread::spawn(move || {
+            // Two-thread wrapper so we can cap the total wait and avoid an
+            // ever-running thread if the GPS hardware never delivers a fix.
+            let (inner_tx, inner_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let r = map::detect_location_from_windows_location_blocking()
+                    .map_err(|e| format!("{e:#}"));
+                let _ = inner_tx.send(r);
+            });
+            let result = inner_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| Err("GPS warmup timed out after 30 s".to_owned()));
+            let _ = loc_tx.send(result);
+        });
+        state.borrow_mut().startup_location_rx = Some(loc_rx);
+    }
     // Auto-detect ROV network interface at startup (passive ifconfig scan).
     {
         let mut s = state.borrow_mut();
@@ -3179,6 +3197,53 @@ fn main() -> Result<()> {
                 state.map.lat = Some(lat);
                 state.map.lon = Some(lon);
                 state.location_detected_at_ms = current_unix_ms();
+            }
+            // Apply background location warmup result.
+            // Only applied if no location has been set yet (user may have
+            // already detected one manually or via NMEA GPS).
+            //
+            // macOS: poll CoreLocation's cached property which is updated by
+            //        the run loop after startUpdatingLocation() was called at
+            //        startup.
+            // Windows: drain the background-thread channel.
+            #[cfg(target_os = "macos")]
+            if state.location_detected_at_ms == 0 {
+                let fix = check_corelocation_warmup_fix(&state.map);
+                if let Some((lat, lon)) = fix {
+                    state.map.lat = Some(lat);
+                    state.map.lon = Some(lon);
+                    state.location_detected_at_ms = current_unix_ms();
+                    if state.active_screen == Screen::Map {
+                        state.load_map_tile_for_current_location(
+                            "Location detected (CoreLocation).".to_owned(),
+                        );
+                        apply_map_runtime_to_ui(&ui, &state);
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let warmup_fix = if let Some(rx) = &state.startup_location_rx {
+                    rx.try_recv().ok()
+                } else {
+                    None
+                };
+                if let Some(result) = warmup_fix {
+                    state.startup_location_rx = None;
+                    if let Ok((lat, lon)) = result {
+                        if state.location_detected_at_ms == 0 {
+                            state.map.lat = Some(lat);
+                            state.map.lon = Some(lon);
+                            state.location_detected_at_ms = current_unix_ms();
+                            if state.active_screen == Screen::Map {
+                                state.load_map_tile_for_current_location(
+                                    "Location detected (Windows GPS).".to_owned(),
+                                );
+                                apply_map_runtime_to_ui(&ui, &state);
+                            }
+                        }
+                    }
+                }
             }
             ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
             ui.set_nmea_gps_running(state.nmea_gps.is_running());

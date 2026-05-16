@@ -11,7 +11,6 @@ use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
 use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationAccuracyBest};
 use reqwest::blocking::Client;
-use serde_json::Value;
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 
 pub const DEFAULT_ZOOM: u32 = 14;
@@ -506,27 +505,6 @@ pub fn lat_lon_to_world_px(lat: f64, lon: f64, zoom_level: u32) -> (f32, f32) {
 // Location detection
 // ---------------------------------------------------------------------------
 
-fn detect_location_from_ip() -> Result<(f64, f64)> {
-    let response = Client::new()
-        .get("http://ip-api.com/json")
-        .send()
-        .context("IP geolocation request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("IP geolocation failed with HTTP {status}");
-    }
-    let payload: Value = response.json().context("invalid location payload")?;
-    let lat = payload
-        .get("lat")
-        .and_then(Value::as_f64)
-        .context("missing lat in location payload")?;
-    let lon = payload
-        .get("lon")
-        .and_then(Value::as_f64)
-        .context("missing lon in location payload")?;
-    Ok((lat, lon))
-}
-
 pub fn detect_location(
     map: &mut MapState,
     nmea_fix: Option<(f64, f64)>,
@@ -542,6 +520,9 @@ pub fn detect_location(
 
     #[cfg(target_os = "macos")]
     {
+        // IP geolocation is intentionally NOT used as a fallback: it gives
+        // city/ISP-level coordinates that can be hundreds of km off, which
+        // is worse than showing no location at all.
         match detect_location_from_corelocation(map) {
             Ok(CoreLocationDetectionOutcome::Located(lat, lon)) => Ok(DetectedLocation {
                 lat,
@@ -549,62 +530,35 @@ pub fn detect_location(
                 source: "macOS CoreLocation (native)".to_owned(),
             }),
             Ok(CoreLocationDetectionOutcome::PendingPermission(message)) => {
-                let (lat, lon) = detect_location_from_ip().with_context(|| {
-                    format!("CoreLocation permission is pending ({message}) and IP fallback failed")
-                })?;
-                Ok(DetectedLocation {
-                    lat,
-                    lon,
-                    source: format!("IP geolocation fallback ({message})"),
-                })
+                anyhow::bail!("{message}")
             }
-            Ok(CoreLocationDetectionOutcome::PendingFix(message)) => anyhow::bail!(
-                "Native CoreLocation is authorized but still acquiring a fix ({message}). Try Detect location again in a moment."
-            ),
-            Err(native_err) => {
-                let (lat, lon) = detect_location_from_ip().with_context(|| {
-                    format!("CoreLocation failed ({native_err:#}) and IP fallback also failed")
-                })?;
-                Ok(DetectedLocation {
-                    lat,
-                    lon,
-                    source: format!("IP geolocation fallback ({native_err:#})"),
-                })
+            Ok(CoreLocationDetectionOutcome::PendingFix(message)) => {
+                anyhow::bail!("{message}")
             }
+            Err(native_err) => Err(native_err),
         }
     }
 
     #[cfg(target_os = "windows")]
     {
         let _ = map;
-        match detect_location_from_windows_location() {
-            Ok((lat, lon)) => Ok(DetectedLocation {
-                lat,
-                lon,
-                source: "Windows Location Services (native)".to_owned(),
-            }),
-            Err(native_err) => {
-                let (lat, lon) = detect_location_from_ip().with_context(|| {
-                    format!("Windows Location failed ({native_err:#}) and IP fallback also failed")
-                })?;
-                Ok(DetectedLocation {
-                    lat,
-                    lon,
-                    source: format!("IP geolocation fallback ({native_err:#})"),
-                })
-            }
-        }
+        // IP geolocation is intentionally NOT used as a fallback: it gives
+        // city/ISP-level coordinates that can be hundreds of km off.
+        // If Windows Location Services times out, let the caller show an
+        // error and the user can press Detect Location again (GPS warms up
+        // after the first request).
+        let (lat, lon) = detect_location_from_windows_location()?;
+        Ok(DetectedLocation {
+            lat,
+            lon,
+            source: "Windows Location Services (native)".to_owned(),
+        })
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = map;
-        let (lat, lon) = detect_location_from_ip()?;
-        Ok(DetectedLocation {
-            lat,
-            lon,
-            source: "IP geolocation".to_owned(),
-        })
+        anyhow::bail!("No native location source available on this platform. Use Phone GPS (NMEA/TCP) instead.");
     }
 }
 
@@ -626,7 +580,7 @@ fn detect_location_from_windows_location() -> Result<(f64, f64)> {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_location_from_windows_location_blocking() -> Result<(f64, f64)> {
+pub(crate) fn detect_location_from_windows_location_blocking() -> Result<(f64, f64)> {
     use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 
     let locator = Geolocator::new().context("failed to create Windows Geolocator")?;
@@ -743,16 +697,10 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
             anyhow::bail!("CoreLocation permission is denied or restricted");
         }
 
-        if let Some(location) = manager.location() {
-            let coordinate = location.coordinate();
-            if valid_coordinate(coordinate.latitude, coordinate.longitude) {
-                manager.stopUpdatingLocation();
-                return Ok(CoreLocationDetectionOutcome::Located(
-                    coordinate.latitude,
-                    coordinate.longitude,
-                ));
-            }
-        }
+        // Do NOT use manager.location() as a quick early return: that
+        // property caches the last-known location, which may be from a
+        // previous session or from somewhere hundreds of km away.
+        // Always request a fresh fix via startUpdatingLocation/requestLocation.
 
         if status != CLAuthorizationStatus::AuthorizedAlways
             && status != CLAuthorizationStatus::AuthorizedWhenInUse
@@ -780,6 +728,74 @@ fn detect_location_from_corelocation(map: &mut MapState) -> Result<CoreLocationD
     Ok(CoreLocationDetectionOutcome::PendingFix(
         "Waiting for native location fix. Click Detect location again in a moment.".to_owned(),
     ))
+}
+
+/// Initialises the CoreLocation manager and starts location updates without
+/// blocking. Safe to call before the Slint run loop starts; actual fixes are
+/// delivered once the event loop is running. Call this at app startup so that
+/// `check_corelocation_warmup_fix` can return a result quickly afterwards.
+#[cfg(target_os = "macos")]
+pub fn prime_corelocation_at_startup(map: &mut MapState) {
+    unsafe {
+        if !CLLocationManager::locationServicesEnabled_class() {
+            return;
+        }
+        if map.corelocation_manager.is_none() {
+            map.corelocation_manager = Some(CLLocationManager::new());
+        }
+        let Some(manager) = map.corelocation_manager.as_ref() else {
+            return;
+        };
+        manager.setDesiredAccuracy(kCLLocationAccuracyBest);
+        let status = manager.authorizationStatus();
+        // Request permission on first launch (non-blocking — shows native prompt).
+        if status == CLAuthorizationStatus::NotDetermined
+            && !map.corelocation_permission_requested
+        {
+            manager.requestWhenInUseAuthorization();
+            map.corelocation_permission_requested = true;
+        }
+        // If already authorised, start the continuous location stream so that
+        // manager.location() gets populated as soon as the run loop starts.
+        if status == CLAuthorizationStatus::AuthorizedAlways
+            || status == CLAuthorizationStatus::AuthorizedWhenInUse
+        {
+            manager.startUpdatingLocation();
+        }
+    }
+}
+
+/// Checks whether the CoreLocation manager already has a valid cached fix,
+/// without blocking. Also ensures location updates are running whenever the
+/// manager is authorised (idempotent). Returns `Some((lat, lon))` on success
+/// and stops the continuous update stream to save power.
+#[cfg(target_os = "macos")]
+pub fn check_corelocation_warmup_fix(map: &MapState) -> Option<(f64, f64)> {
+    unsafe {
+        let manager = map.corelocation_manager.as_ref()?;
+        let status = manager.authorizationStatus();
+        if status == CLAuthorizationStatus::AuthorizedAlways
+            || status == CLAuthorizationStatus::AuthorizedWhenInUse
+        {
+            // Keep updates running until we have a fix (idempotent call).
+            manager.startUpdatingLocation();
+            if let Some(location) = manager.location() {
+                let coordinate = location.coordinate();
+                let lat = coordinate.latitude;
+                let lon = coordinate.longitude;
+                if lat.is_finite()
+                    && lon.is_finite()
+                    && (-90.0..=90.0).contains(&lat)
+                    && (-180.0..=180.0).contains(&lon)
+                {
+                    // We have what we need — stop draining power.
+                    manager.stopUpdatingLocation();
+                    return Some((lat, lon));
+                }
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
