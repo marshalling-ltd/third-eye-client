@@ -28,6 +28,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11"
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+serialport = "4"
 socket2 = { version = "0.6", features = ["all"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 if-addrs = "0.13"

@@ -1,9 +1,14 @@
-//! Receives GPS coordinates from a phone app (GPS2IP, `GPSd` Forwarder,
-//! `ShareGPS`, etc.) that streams NMEA-0183 sentences over a TCP connection.
+//! Receives GPS coordinates from a phone app over TCP or Bluetooth.
 //!
-//! The [`NmeaGpsState`] struct mirrors the `UdpStatusState` pattern used for
-//! ROV telemetry: a background worker reads lines from the TCP stream, parses
-//! GGA/RMC sentences, and posts location fixes through an `mpsc` channel.
+//! **TCP mode** (GPS2IP, `GPSd` Forwarder, `ShareGPS`): the laptop listens on
+//! a TCP port and the phone app connects as a client, streaming NMEA sentences.
+//!
+//! **Bluetooth / serial mode** (Bluetooth GPS, GPS Share, any SPP app): the
+//! Android phone is paired via Bluetooth and its RFCOMM/SPP channel appears
+//! as a virtual serial port (`/dev/cu.*` on macOS, `COM*` on Windows). This
+//! module opens the port at 9600 baud and reads NMEA sentences directly.
+//!
+//! Both modes share the same [`NmeaGpsState`] — only one can run at a time.
 
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
@@ -16,6 +21,27 @@ use anyhow::{Context, Result};
 
 /// Default TCP port used by GPS2IP (both iOS and Android).
 pub const DEFAULT_NMEA_GPS_PORT: u16 = 11123;
+
+/// Baud rate used by the vast majority of Bluetooth GPS apps on Android
+/// (GPS Share, Bluetooth GPS, etc.). Classic NMEA-0183 is 4800 baud but
+/// modern Android apps default to 9600.
+pub const DEFAULT_BT_BAUD_RATE: u32 = 9600;
+
+// ---------------------------------------------------------------------------
+// Serial port enumeration
+// ---------------------------------------------------------------------------
+
+/// Returns all virtual serial / Bluetooth SPP port names visible to the OS.
+///
+/// On macOS the paired Bluetooth device shows up as `/dev/cu.<DeviceName>`.
+/// On Windows it appears as a `COM` port number. The list is unsorted.
+pub fn list_serial_ports() -> Vec<String> {
+    serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.port_name)
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Public state
@@ -38,6 +64,34 @@ pub struct NmeaGpsState {
 }
 
 impl NmeaGpsState {
+    /// Opens a Bluetooth (SPP) or wired serial port and starts reading NMEA
+    /// sentences. `port_path` is e.g. `/dev/cu.GPS-SPPSlave` (macOS) or
+    /// `COM5` (Windows). The baud rate defaults to [`DEFAULT_BT_BAUD_RATE`].
+    pub fn start_bluetooth(&mut self, port_path: &str) -> Result<String> {
+        let port_path = port_path.trim().to_owned();
+        if port_path.is_empty() {
+            anyhow::bail!("Serial port path must not be empty.");
+        }
+        let (tx, rx) = mpsc::channel();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
+        let path_clone = port_path.clone();
+        let worker = thread::Builder::new()
+            .name("nmea-bt".into())
+            .spawn(move || nmea_serial_worker(path_clone, DEFAULT_BT_BAUD_RATE, worker_stop, tx))
+            .context("failed to spawn Bluetooth GPS worker thread")?;
+
+        self.event_rx = Some(rx);
+        self.controller = Some(NmeaGpsController {
+            stop_flag,
+            worker: Some(worker),
+        });
+        self.latest_fix = None;
+        self.fixes_received = 0;
+        self.status = format!("Connecting to Bluetooth GPS on {port_path}...");
+        Ok(self.status.clone())
+    }
+
     pub fn start(&mut self, host: &str, port: u16) -> Result<String> {
         let host = host.trim();
         let bind_addr = if host.is_empty() {
@@ -131,6 +185,12 @@ impl NmeaGpsState {
     #[must_use]
     pub fn status_text(&self) -> &str {
         &self.status
+    }
+
+    /// Directly overwrite the status string (used for non-event messages like
+    /// the serial port list returned by `list_serial_ports`).
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
     }
 
     #[must_use]
@@ -236,6 +296,64 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
                     )));
                     break;
                 }
+            }
+        }
+    }
+
+    let _ = tx.send(NmeaGpsEvent::Ended);
+}
+
+/// Worker for Bluetooth / serial port NMEA. Opens the port once and reads
+/// lines until the stop flag is set or an unrecoverable error occurs.
+fn nmea_serial_worker(
+    port_path: String,
+    baud_rate: u32,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<NmeaGpsEvent>,
+) {
+    let port = match serialport::new(&port_path, baud_rate)
+        .timeout(Duration::from_secs(2))
+        .open()
+    {
+        Ok(p) => p,
+        Err(err) => {
+            let _ = tx.send(NmeaGpsEvent::Error(format!(
+                "Failed to open Bluetooth port {port_path}: {err}. \
+                 Make sure the device is paired and the port name is correct."
+            )));
+            let _ = tx.send(NmeaGpsEvent::Ended);
+            return;
+        }
+    };
+    let _ = tx.send(NmeaGpsEvent::Status(format!(
+        "Bluetooth GPS connected on {port_path} ({baud_rate} baud). Waiting for fix..."
+    )));
+
+    let reader = BufReader::new(port);
+    for line_result in reader.lines() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match line_result {
+            Ok(line) => {
+                if let Some((lat, lon)) = parse_nmea_location(&line)
+                    && tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err()
+                {
+                    return;
+                }
+            }
+            // A 2-second read timeout is normal on quiet Bluetooth links.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Just loop back and check the stop flag.
+            }
+            Err(err) => {
+                let _ = tx.send(NmeaGpsEvent::Error(format!(
+                    "Bluetooth GPS read error on {port_path}: {err}"
+                )));
+                break;
             }
         }
     }

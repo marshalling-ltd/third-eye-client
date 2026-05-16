@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use map::{check_corelocation_warmup_fix, corelocation_debug_status, prime_corelocation_at_startup};
 use map::{
     DEFAULT_OSM_TILE_USER_AGENT, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, MapState, MapTilesState,
-    RgbaFrame, ViewportAnimation, compute_scale_bar, detect_location, ease_out_cubic,
+    RgbaFrame, ViewportAnimation, compute_scale_bar, ease_out_cubic,
     lat_lon_to_world_px, rgba_frame_to_slint_image,
 };
 use reqwest::Url;
@@ -88,6 +88,7 @@ struct AppConfig {
     rov_network_interface: String,
     nmea_gps_host: String,
     nmea_gps_port: String,
+    bluetooth_gps_port: String,
 }
 
 impl Default for AppConfig {
@@ -102,6 +103,7 @@ impl Default for AppConfig {
             rov_network_interface: String::new(),
             nmea_gps_host: String::new(),
             nmea_gps_port: DEFAULT_NMEA_GPS_PORT.to_string(),
+            bluetooth_gps_port: String::new(),
         }
     }
 }
@@ -129,6 +131,7 @@ impl AppConfig {
             rov_network_interface: self.rov_network_interface.clone(),
             nmea_gps_host: self.nmea_gps_host.clone(),
             nmea_gps_port: self.nmea_gps_port.clone(),
+            nmea_bt_port: self.bluetooth_gps_port.clone(),
         }
     }
 
@@ -143,6 +146,7 @@ impl AppConfig {
             rov_network_interface: config.rov_network_interface,
             nmea_gps_host: config.nmea_gps_host,
             nmea_gps_port: config.nmea_gps_port,
+            bluetooth_gps_port: config.nmea_bt_port,
         }
     }
 
@@ -184,6 +188,7 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         rov_network_interface: "",
         nmea_gps_host: "",
         nmea_gps_port: NMEA_GPS_PORT_DEFAULT_STR,
+        nmea_bt_port: "",
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -406,6 +411,7 @@ impl ThirdEyeState {
                 rov_network_interface: defaults.rov_network_interface.to_owned(),
                 nmea_gps_host: defaults.nmea_gps_host.to_owned(),
                 nmea_gps_port: defaults.nmea_gps_port.to_owned(),
+                nmea_bt_port: defaults.nmea_bt_port.to_owned(),
             }
         });
 
@@ -678,6 +684,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_rov_info(state.rov_info.clone().into());
     ui.set_nmea_gps_host(state.config.nmea_gps_host.clone().into());
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
+    ui.set_bluetooth_gps_port(state.config.bluetooth_gps_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
     ui.set_auth_email(state.auth.email.clone().into());
@@ -862,6 +869,7 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.server_base_url = ui.get_server_base_url().to_string();
     state.config.nmea_gps_host = ui.get_nmea_gps_host().to_string();
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
+    state.config.bluetooth_gps_port = ui.get_bluetooth_gps_port().to_string();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -1556,27 +1564,30 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
             state.map_tiles.fallback_zoom = None;
             let (old_vp_x, old_vp_y, _, _) = state.map_tiles.viewport_for_slint(state.map.zoom);
-            let nmea_fix = state.nmea_gps.latest_location();
-            match detect_location(&mut state.map, nmea_fix) {
-                Ok(location) => {
-                    state.map.lat = Some(location.lat);
-                    state.map.lon = Some(location.lon);
-                    state.location_detected_at_ms = current_unix_ms();
-                    state.load_map_tile_for_current_location(format!(
-                        "Centered on device location via {}: lat={:.6}, lon={:.6}.",
-                        location.source, location.lat, location.lon
-                    ));
-                }
-                Err(err) => {
-                    if state.map.lat.is_some() && state.map.lon.is_some() {
-                        state.load_map_tile_for_current_location(format!(
-                            "Centered on last known location (detection unavailable: {err:#})."
-                        ));
-                    } else {
-                        state.map.status =
-                            format!("Cannot center: no location available ({err:#}).");
-                    }
-                }
+            // Non-blocking: try NMEA GPS, then CoreLocation cached fix.
+            // Never call the blocking detect_location() from an event handler.
+            let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
+                Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
+            } else {
+                #[cfg(target_os = "macos")]
+                { check_corelocation_warmup_fix(&state.map).map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned())) }
+                #[cfg(not(target_os = "macos"))]
+                { None }
+            };
+            if let Some((lat, lon, source)) = fresh {
+                state.map.lat = Some(lat);
+                state.map.lon = Some(lon);
+                state.location_detected_at_ms = current_unix_ms();
+                state.load_map_tile_for_current_location(format!(
+                    "Centered on device location via {source}: lat={lat:.6}, lon={lon:.6}."
+                ));
+            } else if state.map.lat.is_some() && state.map.lon.is_some() {
+                state.load_map_tile_for_current_location(
+                    "Centered on last known location.".to_owned(),
+                );
+            } else {
+                state.map.status =
+                    "No location available. Use Detect Location button first.".to_owned();
             }
             let (target_vp_x, target_vp_y, _, _) =
                 state.map_tiles.viewport_for_slint(state.map.zoom);
@@ -1635,13 +1646,15 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_stream_navigation);
 
-        // Refresh device location for the POS overlay.
-        let nmea_fix = state.nmea_gps.latest_location();
-        if let Ok(location) = detect_location(&mut state.map, nmea_fix) {
-            state.map.lat = Some(location.lat);
-            state.map.lon = Some(location.lon);
-            state.location_detected_at_ms = current_unix_ms();
-        }
+        // Note: location is NOT refreshed here via detect_location() because
+        // that call blocks the main thread (CoreLocation polling on macOS,
+        // Windows GPS warmup) from inside an ObjC/winit event handler, which
+        // causes panic_cannot_unwind. Location is kept up-to-date by:
+        //   • the background warmup timer (macOS CoreLocation / Windows GPS)
+        //   • NMEA GPS polling
+        //   • explicit "Detect Location" button clicks
+        // Use whatever location is already in state; the POS overlay will
+        // show "stale" or "—" if the fix is missing or outdated.
 
         // Auto-detect ROV interface before starting stream.
         refresh_rov_network(&mut state, false);
@@ -1903,11 +1916,28 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         }
         pull_configuration_from_ui(&ui, &mut state, &store_for_capture);
 
+        // Refresh location from the best non-blocking source before capture so
+        // the freshest possible coordinates are attached to the photo metadata.
+        {
+            let fresh_fix: Option<(f64, f64)> = if let Some(fix) = state.nmea_gps.latest_location() {
+                Some(fix)
+            } else {
+                #[cfg(target_os = "macos")]
+                { check_corelocation_warmup_fix(&state.map) }
+                #[cfg(not(target_os = "macos"))]
+                { None }
+            };
+            if let Some((lat, lon)) = fresh_fix {
+                state.map.lat = Some(lat);
+                state.map.lon = Some(lon);
+                state.location_detected_at_ms = current_unix_ms();
+            }
+        }
         // Snapshot the latest ROV telemetry *before* the capture call so we
         // attribute the correct depth/attitude/coords to the image.
         let mut status_snapshot: Option<RovUdpStatus> = state.rov_status.latest_status().cloned();
         // The ROV UDP always sends 0,0 for lat/lon — override with the
-        // device's CoreLocation position (same source as the POS overlay).
+        // device's native GPS position (same source as the POS overlay).
         if let Some(ref mut status) = status_snapshot {
             let location_age_ms = current_unix_ms() - state.location_detected_at_ms;
             if let (Some(lat), Some(lon)) = (state.map.lat, state.map.lon)
@@ -2048,23 +2078,32 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_detect_location);
         state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
-        let nmea_fix = state.nmea_gps.latest_location();
-        match detect_location(&mut state.map, nmea_fix) {
-            Ok(location) => {
-                state.map.lat = Some(location.lat);
-                state.map.lon = Some(location.lon);
-                state.location_detected_at_ms = current_unix_ms();
-                let success_message = format!(
-                    "Detected location via {}: lat={:.6}, lon={:.6}",
-                    location.source, location.lat, location.lon
-                );
-                state.load_map_tile_for_current_location(format!(
-                    "{success_message}. Map auto-refreshed."
-                ));
-            }
-            Err(err) => {
-                state.map.status = format!("Failed to detect location: {err:#}");
-            }
+        // Non-blocking: try NMEA GPS then CoreLocation cached fix.
+        // Restart CoreLocation updates so the background timer delivers a
+        // fresh fix within the next polling cycle.
+        #[cfg(target_os = "macos")]
+        prime_corelocation_at_startup(&mut state.map);
+        let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
+            Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
+        } else {
+            #[cfg(target_os = "macos")]
+            { check_corelocation_warmup_fix(&state.map).map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned())) }
+            #[cfg(not(target_os = "macos"))]
+            { None }
+        };
+        if let Some((lat, lon, source)) = fresh {
+            state.map.lat = Some(lat);
+            state.map.lon = Some(lon);
+            state.location_detected_at_ms = current_unix_ms();
+            state.load_map_tile_for_current_location(format!(
+                "Detected location via {source}: lat={lat:.6}, lon={lon:.6}. Map auto-refreshed."
+            ));
+        } else {
+            // No cached fix yet — reset the warmup flag so the 16 ms timer
+            // resumes polling and will apply the fix as soon as it arrives.
+            state.location_detected_at_ms = 0;
+            state.map.status =
+                "Detecting location in background. The map will update automatically.".to_owned();
         }
         apply_state_to_ui(&ui, &state);
     });
@@ -2204,7 +2243,49 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
-    // --- NMEA GPS callbacks ---
+    // --- NMEA GPS / Bluetooth GPS callbacks ---
+
+    let ui_weak = ui.as_weak();
+    let state_for_start_bt_gps = Rc::clone(&state);
+    let store_for_start_bt_gps = Rc::clone(&store);
+    ui.on_start_bluetooth_gps(move || {
+        let Some(ui) = ui_weak.upgrade() else { return; };
+        let mut state = match state_for_start_bt_gps.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_start_bt_gps);
+        state.nmea_gps.stop();
+        let port_path = state.config.bluetooth_gps_port.clone();
+        match state.nmea_gps.start_bluetooth(&port_path) {
+            Ok(_msg) => {}
+            Err(err) => {
+                ui.set_nmea_gps_status(
+                    format!("Failed to start Bluetooth GPS: {err:#}").into()
+                );
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_list_bt = Rc::clone(&state);
+    ui.on_list_bluetooth_ports(move || {
+        let Some(ui) = ui_weak.upgrade() else { return; };
+        let mut state = match state_for_list_bt.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let ports = third_eye_client::nmea::list_serial_ports();
+        let msg = if ports.is_empty() {
+            "No serial/Bluetooth ports found. Pair your Android phone via Bluetooth first."
+                .to_owned()
+        } else {
+            format!("Available ports: {}", ports.join(", "))
+        };
+        state.nmea_gps.set_status(msg);
+        apply_state_to_ui(&ui, &state);
+    });
 
     let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);

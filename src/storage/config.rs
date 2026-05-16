@@ -21,6 +21,7 @@ pub mod keys {
     pub const ROV_NETWORK_INTERFACE: &str = "client.rov_network_interface";
     pub const NMEA_GPS_HOST: &str = "client.nmea_gps_host";
     pub const NMEA_GPS_PORT: &str = "client.nmea_gps_port";
+    pub const NMEA_BT_PORT: &str = "client.nmea_bt_port";
 }
 
 /// Persisted configuration accessor.
@@ -88,6 +89,7 @@ impl ConfigStore {
                 .get_or(keys::ROV_NETWORK_INTERFACE, defaults.rov_network_interface)?,
             nmea_gps_host: self.get_or(keys::NMEA_GPS_HOST, defaults.nmea_gps_host)?,
             nmea_gps_port: self.get_or(keys::NMEA_GPS_PORT, defaults.nmea_gps_port)?,
+            nmea_bt_port: self.get_or(keys::NMEA_BT_PORT, defaults.nmea_bt_port)?,
         })
     }
 
@@ -111,6 +113,7 @@ impl ConfigStore {
             ),
             (keys::NMEA_GPS_HOST, config.nmea_gps_host.as_str()),
             (keys::NMEA_GPS_PORT, config.nmea_gps_port.as_str()),
+            (keys::NMEA_BT_PORT, config.nmea_bt_port.as_str()),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -140,6 +143,9 @@ pub struct ClientConfig {
     pub nmea_gps_host: String,
     /// Phone GPS (NMEA over TCP) port as string. Default `"11123"`.
     pub nmea_gps_port: String,
+    /// Phone GPS (Bluetooth/serial) port path.
+    /// e.g. `/dev/cu.GPS-SPPSlave` (macOS) or `COM5` (Windows).
+    pub nmea_bt_port: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -154,6 +160,7 @@ pub struct ClientConfigDefaults<'a> {
     pub rov_network_interface: &'a str,
     pub nmea_gps_host: &'a str,
     pub nmea_gps_port: &'a str,
+    pub nmea_bt_port: &'a str,
 }
 
 #[cfg(test)]
@@ -171,6 +178,7 @@ mod tests {
         rov_network_interface: "",
         nmea_gps_host: "",
         nmea_gps_port: "11123",
+        nmea_bt_port: "",
     };
 
     #[test]
@@ -209,6 +217,7 @@ mod tests {
             rov_network_interface: "en10".into(),
             nmea_gps_host: "192.168.1.100".into(),
             nmea_gps_port: "11123".into(),
+            nmea_bt_port: "/dev/cu.GPS".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();
