@@ -496,25 +496,21 @@ impl ThirdEyeState {
     }
 
     fn auto_refresh_map_on_tab_enter(&mut self) {
-        match detect_location(&mut self.map, self.nmea_gps.latest_location()) {
-            Ok(location) => {
-                self.map.lat = Some(location.lat);
-                self.map.lon = Some(location.lon);
-                self.location_detected_at_ms = current_unix_ms();
-                self.load_map_tile_for_current_location(format!(
-                    "Auto-refreshed map on entering Device Map tab via {}: lat={:.6}, lon={:.6}.",
-                    location.source, location.lat, location.lon
-                ));
-            }
-            Err(err) => {
-                if self.map.lat.is_some() && self.map.lon.is_some() {
-                    self.load_map_tile_for_current_location(format!(
-                        "Auto-refreshed map using last known location (new detection unavailable: {err:#})."
-                    ));
-                } else {
-                    self.map.status = format!("Auto-refresh on tab enter failed: {err:#}");
-                }
-            }
+        // Always show the map immediately without blocking. If we have a
+        // recent location, center on it. If not, leave the map at its
+        // current position and show a hint. The user can press
+        // "Detect Location" to get a fresh fix — that call is explicit
+        // and the user expects it to take a moment.
+        if self.map.lat.is_some() && self.map.lon.is_some() {
+            self.load_map_tile_for_current_location(
+                "Centered on last known location.".to_owned(),
+            );
+        } else {
+            // No location yet — load tiles at the current viewport
+            // so at least the map renders, and prompt the user.
+            self.request_visible_map_tiles();
+            self.map.status =
+                "No location set. Use Detect location button to find your position.".to_owned();
         }
     }
 

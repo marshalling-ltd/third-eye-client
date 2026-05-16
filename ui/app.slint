@@ -420,8 +420,11 @@ export component AppWindow inherits Window {
                             border-color: #3f4148;
                             background: #1a1c22;
 
-                            ScrollView {
-                                viewport-width: self.visible-width;
+                            // Flickable (rather than ScrollView) gives proper
+                            // touch-drag scrolling on Windows: a short tap still
+                            // fires the TouchArea.clicked inside each row, while
+                            // a drag gesture scrolls the list.
+                            Flickable {
                                 VerticalBox {
                                     padding: 6px;
                                     spacing: 4px;
