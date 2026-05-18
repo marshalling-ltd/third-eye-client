@@ -19,9 +19,7 @@ pub mod keys {
     pub const OSM_TILE_USER_AGENT: &str = "client.osm_tile_user_agent";
     pub const SERVER_BASE_URL: &str = "server.base_url";
     pub const ROV_NETWORK_INTERFACE: &str = "client.rov_network_interface";
-    pub const NMEA_GPS_HOST: &str = "client.nmea_gps_host";
     pub const NMEA_GPS_PORT: &str = "client.nmea_gps_port";
-    pub const NMEA_BT_PORT: &str = "client.nmea_bt_port";
 }
 
 /// Persisted configuration accessor.
@@ -87,9 +85,7 @@ impl ConfigStore {
             server_base_url: self.get_or(keys::SERVER_BASE_URL, defaults.server_base_url)?,
             rov_network_interface: self
                 .get_or(keys::ROV_NETWORK_INTERFACE, defaults.rov_network_interface)?,
-            nmea_gps_host: self.get_or(keys::NMEA_GPS_HOST, defaults.nmea_gps_host)?,
             nmea_gps_port: self.get_or(keys::NMEA_GPS_PORT, defaults.nmea_gps_port)?,
-            nmea_bt_port: self.get_or(keys::NMEA_BT_PORT, defaults.nmea_bt_port)?,
         })
     }
 
@@ -111,9 +107,7 @@ impl ConfigStore {
                 keys::ROV_NETWORK_INTERFACE,
                 config.rov_network_interface.as_str(),
             ),
-            (keys::NMEA_GPS_HOST, config.nmea_gps_host.as_str()),
             (keys::NMEA_GPS_PORT, config.nmea_gps_port.as_str()),
-            (keys::NMEA_BT_PORT, config.nmea_bt_port.as_str()),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -139,13 +133,8 @@ pub struct ClientConfig {
     /// connections to. Uses `IP_BOUND_IF` on macOS and `SO_BINDTODEVICE` on
     /// Linux. Empty means the OS chooses the interface.
     pub rov_network_interface: String,
-    /// Phone GPS (NMEA over TCP) host. Empty means disabled.
-    pub nmea_gps_host: String,
-    /// Phone GPS (NMEA over TCP) port as string. Default `"11123"`.
+    /// Phone GPS (NMEA) TCP listen port as string. Default `"11123"`.
     pub nmea_gps_port: String,
-    /// Phone GPS (Bluetooth/serial) port path.
-    /// e.g. `/dev/cu.GPS-SPPSlave` (macOS) or `COM5` (Windows).
-    pub nmea_bt_port: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -158,9 +147,7 @@ pub struct ClientConfigDefaults<'a> {
     pub osm_tile_user_agent: &'a str,
     pub server_base_url: &'a str,
     pub rov_network_interface: &'a str,
-    pub nmea_gps_host: &'a str,
     pub nmea_gps_port: &'a str,
-    pub nmea_bt_port: &'a str,
 }
 
 #[cfg(test)]
@@ -176,9 +163,7 @@ mod tests {
         osm_tile_user_agent: "ua/0",
         server_base_url: "https://third-eye.marshalling.eu",
         rov_network_interface: "",
-        nmea_gps_host: "",
         nmea_gps_port: "11123",
-        nmea_bt_port: "",
     };
 
     #[test]
@@ -215,9 +200,7 @@ mod tests {
             osm_tile_user_agent: "ua/2".into(),
             server_base_url: "https://api.example".into(),
             rov_network_interface: "en10".into(),
-            nmea_gps_host: "192.168.1.100".into(),
             nmea_gps_port: "11123".into(),
-            nmea_bt_port: "/dev/cu.GPS".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();

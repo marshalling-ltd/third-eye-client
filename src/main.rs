@@ -86,9 +86,7 @@ struct AppConfig {
     osm_tile_user_agent: String,
     server_base_url: String,
     rov_network_interface: String,
-    nmea_gps_host: String,
     nmea_gps_port: String,
-    bluetooth_gps_port: String,
 }
 
 impl Default for AppConfig {
@@ -101,9 +99,7 @@ impl Default for AppConfig {
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
             server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
             rov_network_interface: String::new(),
-            nmea_gps_host: String::new(),
             nmea_gps_port: DEFAULT_NMEA_GPS_PORT.to_string(),
-            bluetooth_gps_port: String::new(),
         }
     }
 }
@@ -129,9 +125,7 @@ impl AppConfig {
             osm_tile_user_agent: self.osm_tile_user_agent.clone(),
             server_base_url: self.server_base_url.clone(),
             rov_network_interface: self.rov_network_interface.clone(),
-            nmea_gps_host: self.nmea_gps_host.clone(),
             nmea_gps_port: self.nmea_gps_port.clone(),
-            nmea_bt_port: self.bluetooth_gps_port.clone(),
         }
     }
 
@@ -144,9 +138,7 @@ impl AppConfig {
             osm_tile_user_agent: config.osm_tile_user_agent,
             server_base_url: config.server_base_url,
             rov_network_interface: config.rov_network_interface,
-            nmea_gps_host: config.nmea_gps_host,
             nmea_gps_port: config.nmea_gps_port,
-            bluetooth_gps_port: config.nmea_bt_port,
         }
     }
 
@@ -186,9 +178,7 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT,
         server_base_url: DEFAULT_SERVER_BASE_URL,
         rov_network_interface: "",
-        nmea_gps_host: "",
         nmea_gps_port: NMEA_GPS_PORT_DEFAULT_STR,
-        nmea_bt_port: "",
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -409,9 +399,7 @@ impl ThirdEyeState {
                 osm_tile_user_agent: defaults.osm_tile_user_agent.to_owned(),
                 server_base_url: defaults.server_base_url.to_owned(),
                 rov_network_interface: defaults.rov_network_interface.to_owned(),
-                nmea_gps_host: defaults.nmea_gps_host.to_owned(),
                 nmea_gps_port: defaults.nmea_gps_port.to_owned(),
-                nmea_bt_port: defaults.nmea_bt_port.to_owned(),
             }
         });
 
@@ -564,8 +552,8 @@ impl StreamState {
     fn start(
         &mut self,
         rtsp_url: String,
-        rov_http_base: Option<&str>,
-        rov_interface: Option<&str>,
+        _rov_http_base: Option<&str>,
+        _rov_interface: Option<&str>,
     ) -> Result<String> {
         let ffmpeg_bin = locate_ffmpeg_binary().context(
             "ffmpeg binary not found. Bundle it as ./bin/ffmpeg beside the app executable.",
@@ -682,11 +670,10 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
     ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
-    ui.set_nmea_gps_host(state.config.nmea_gps_host.clone().into());
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
-    ui.set_bluetooth_gps_port(state.config.bluetooth_gps_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
+    ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
     ui.set_auth_email(state.auth.email.clone().into());
     ui.set_auth_password(state.auth.password.clone().into());
     ui.set_auth_status_text(state.auth.status_text.clone().into());
@@ -867,9 +854,7 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.rov_status_udp_port = ui.get_rov_status_udp_port().to_string();
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
     state.config.server_base_url = ui.get_server_base_url().to_string();
-    state.config.nmea_gps_host = ui.get_nmea_gps_host().to_string();
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
-    state.config.bluetooth_gps_port = ui.get_bluetooth_gps_port().to_string();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -889,6 +874,22 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
 /// WiFi adapter (`en0`) is excluded so that wired USB-ethernet adapters are
 /// preferred; on other platforms the first matching non-loopback interface
 /// is returned.
+/// Returns the first non-loopback IPv4 address on this machine, or `None`
+/// if no suitable interface is found.
+fn detect_local_ip() -> Option<String> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .filter(|iface| !iface.is_loopback())
+        .find_map(|iface| {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                Some(v4.ip.to_string())
+            } else {
+                None
+            }
+        })
+}
+
 fn detect_rov_interface(rov_host: &str) -> Option<String> {
     let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
     let interfaces = if_addrs::get_if_addrs().ok()?;
@@ -897,12 +898,12 @@ fn detect_rov_interface(rov_host: &str) -> Option<String> {
         .into_iter()
         .filter(|iface| !iface.is_loopback())
         .filter_map(|iface| {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                if v4.ip != rov_ip {
-                    let mask = u32::from(v4.netmask);
-                    if (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask) {
-                        return Some(iface.name);
-                    }
+            if let if_addrs::IfAddr::V4(v4) = iface.addr
+                && v4.ip != rov_ip
+            {
+                let mask = u32::from(v4.netmask);
+                if (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask) {
+                    return Some(iface.name);
                 }
             }
             None
@@ -913,10 +914,10 @@ fn detect_rov_interface(rov_host: &str) -> Option<String> {
     // wired USB-ethernet adapters appear as en5, en6, etc.).
     #[cfg(target_os = "macos")]
     {
-        return candidates
+        candidates
             .iter()
             .find(|name| name.as_str() != "en0")
-            .cloned();
+            .cloned()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1667,12 +1668,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.rov_status.stop();
         {
             // Set up external route for ffmpeg now that we know the interface.
-            if let Some(iface) = state.config.rov_interface() {
-                if let Err(err) = ensure_rov_external_route(&state.config.rov_http_base, iface) {
-                    state.rov_info = format!(
-                        "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
-                    );
-                }
+            if let Some(iface) = state.config.rov_interface()
+                && let Err(err) = ensure_rov_external_route(&state.config.rov_http_base, iface)
+            {
+                state.rov_info = format!(
+                    "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
+                );
             }
             state.stream.stop();
             let rtsp_url = state.config.rtsp_url.clone();
@@ -2243,49 +2244,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
-    // --- NMEA GPS / Bluetooth GPS callbacks ---
-
-    let ui_weak = ui.as_weak();
-    let state_for_start_bt_gps = Rc::clone(&state);
-    let store_for_start_bt_gps = Rc::clone(&store);
-    ui.on_start_bluetooth_gps(move || {
-        let Some(ui) = ui_weak.upgrade() else { return; };
-        let mut state = match state_for_start_bt_gps.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        pull_configuration_from_ui(&ui, &mut state, &store_for_start_bt_gps);
-        state.nmea_gps.stop();
-        let port_path = state.config.bluetooth_gps_port.clone();
-        match state.nmea_gps.start_bluetooth(&port_path) {
-            Ok(_msg) => {}
-            Err(err) => {
-                ui.set_nmea_gps_status(
-                    format!("Failed to start Bluetooth GPS: {err:#}").into()
-                );
-            }
-        }
-        apply_state_to_ui(&ui, &state);
-    });
-
-    let ui_weak = ui.as_weak();
-    let state_for_list_bt = Rc::clone(&state);
-    ui.on_list_bluetooth_ports(move || {
-        let Some(ui) = ui_weak.upgrade() else { return; };
-        let mut state = match state_for_list_bt.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        let ports = third_eye_client::nmea::list_serial_ports();
-        let msg = if ports.is_empty() {
-            "No serial/Bluetooth ports found. Pair your Android phone via Bluetooth first."
-                .to_owned()
-        } else {
-            format!("Available ports: {}", ports.join(", "))
-        };
-        state.nmea_gps.set_status(msg);
-        apply_state_to_ui(&ui, &state);
-    });
+    // --- NMEA GPS callback (auto-detects Bluetooth serial vs TCP) ---
 
     let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);
@@ -2300,6 +2259,24 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_nmea);
         state.nmea_gps.stop();
+
+        // Try Bluetooth first: if exactly one serial port is available, use it.
+        let serial_ports = third_eye_client::nmea::list_serial_ports();
+        if serial_ports.len() == 1 {
+            let port_path = &serial_ports[0];
+            match state.nmea_gps.start_bluetooth(port_path) {
+                Ok(_msg) => {}
+                Err(err) => {
+                    ui.set_nmea_gps_status(
+                        format!("Failed to start Bluetooth GPS on {port_path}: {err:#}").into(),
+                    );
+                }
+            }
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+
+        // Fall back to TCP: auto-detect local IP and listen.
         let port = match state.config.parse_nmea_gps_port() {
             Ok(port) => port,
             Err(err) => {
@@ -2309,7 +2286,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 return;
             }
         };
-        let host = state.config.nmea_gps_host.clone();
+        let host = detect_local_ip().unwrap_or_default();
         match state.nmea_gps.start(&host, port) {
             Ok(_msg) => {}
             Err(err) => {
