@@ -41,6 +41,7 @@ export component AppWindow inherits Window {
     in-out property <string> nmea_gps_port;
     in-out property <string> nmea_gps_status;
     in-out property <bool> nmea_gps_running: false;
+    in-out property <bool> nmea_has_fix: false;
     in-out property <string> nmea_local_ip;
 
     // Server account (third-eye backend).
@@ -121,6 +122,7 @@ export component AppWindow inherits Window {
     callback navigate_map(length, length);
     callback navigate_stream();
     callback navigate_media();
+    callback navigate_nmea();
 
     callback use_default_test_rtsp();
     callback use_default_rov_rtsp();
@@ -218,6 +220,10 @@ export component AppWindow inherits Window {
                     text: "Media";
                     clicked => { root.navigate_media(); }
                 }
+                Button {
+                    text: "Phone GPS";
+                    clicked => { root.navigate_nmea(); }
+                }
                 Rectangle {
                     vertical-stretch: 1;
                 }
@@ -311,37 +317,6 @@ export component AppWindow inherits Window {
                     Text { text: root.rov_info; wrap: word-wrap; }
 
                     Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Phone GPS (NMEA)"; font-size: 18px; }
-                    Text {
-                        text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
-                        wrap: word-wrap;
-                    }
-                    Text { text: "TCP listen address (auto-detected, editable):"; }
-                    LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
-                    Text { text: "TCP listen port (used when no Bluetooth port is found):"; }
-                    LineEdit { text <=> root.nmea_gps_port; }
-                    Button {
-                        text: "Use default GPS2IP port (11123)";
-                        clicked => { root.use_default_nmea_gps_port(); }
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Start Phone GPS";
-                            enabled: !root.nmea_gps_running;
-                            clicked => { root.start_nmea_gps(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Stop Phone GPS";
-                            enabled: root.nmea_gps_running;
-                            clicked => { root.stop_nmea_gps(); }
-                        }
-                    }
-                    Text { text: root.nmea_gps_status; wrap: word-wrap; }
-
-                    Rectangle { height: 1px; background: #3f4148; }
                     Text { text: "Server account"; font-size: 18px; }
                     Text {
                         text: "Sign in to https://third-eye.marshalling.eu for media syncing and status uploads.";
@@ -382,6 +357,71 @@ export component AppWindow inherits Window {
                 }
 
             }
+            }
+
+            // Phone GPS (NMEA) screen
+            if root.active_screen == 4 : ScrollView {
+                viewport-width: self.visible-width;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 10px;
+
+                if root.active_screen == 4 : VerticalBox {
+                    spacing: 8px;
+                    vertical-stretch: 0;
+                    Text {
+                        text: "Phone GPS (NMEA)";
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "TCP listen address (auto-detected, editable):"; }
+                    LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
+                    Text { text: "TCP listen port (used when no Bluetooth port is found):"; }
+                    LineEdit { text <=> root.nmea_gps_port; }
+                    Button {
+                        text: "Use default GPS2IP port (11123)";
+                        clicked => { root.use_default_nmea_gps_port(); }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start Phone GPS";
+                            enabled: !root.nmea_gps_running;
+                            clicked => { root.start_nmea_gps(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop Phone GPS";
+                            enabled: root.nmea_gps_running;
+                            clicked => { root.stop_nmea_gps(); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 6px;
+                        Text {
+                            text: root.nmea_gps_running
+                                ? (root.nmea_has_fix ? "\u{2713}" : "\u{23f3}")
+                                : "\u{2717}";
+                            color: root.nmea_gps_running
+                                ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                                : #ff4444;
+                            font-size: 18px;
+                        }
+                        Text {
+                            text: root.nmea_gps_status;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+
+                }
             }
 
             // Media screen — outside ScrollView so the two-column layout
@@ -1123,12 +1163,43 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // Scale legend \u{2013} bottom-right
+                    // NMEA status badge – bottom-left
+                    Rectangle {
+                        width: 68px;
+                        height: 28px;
+                        x: 10px;
+                        y: parent.height - self.height - 10px;
+                        border-radius: 8px;
+                        background: #0d1a2acc;
+                        border-width: 1px;
+                        border-color: root.nmea_has_fix ? #22cc4466 : #ff444466;
+
+                        Text {
+                            text: "NMEA";
+                            color: #8f96a3;
+                            font-size: 9px;
+                            x: 8px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.nmea_gps_running
+                                ? (root.nmea_has_fix ? "\u{2713}" : "\u{23f3}")
+                                : "\u{2717}";
+                            color: root.nmea_gps_running
+                                ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                                : #ff4444;
+                            font-size: 14px;
+                            x: 44px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Scale legend – bottom-right
                     Rectangle {
                         width: 148px;
                         height: 30px;
-                        x: parent.width - self.width - 14px;
-                        y: parent.height - self.height - 14px;
+                        x: parent.width - self.width - 10px;
+                        y: parent.height - self.height - 10px;
                         border-radius: 6px;
                         background: #0d1a2acc;
                         border-width: 1px;
