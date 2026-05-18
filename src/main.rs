@@ -549,11 +549,12 @@ impl StreamState {
     /// `rov_http_base` and `rov_interface` are used on Windows to pre-populate
     /// the ARP cache before launching ffmpeg: without this, Windows may not
     /// have resolved the ROV's MAC address and ffmpeg's TCP CONNECT will fail.
+    #[allow(unused_variables)]
     fn start(
         &mut self,
         rtsp_url: String,
-        _rov_http_base: Option<&str>,
-        _rov_interface: Option<&str>,
+        rov_http_base: Option<&str>,
+        rov_interface: Option<&str>,
     ) -> Result<String> {
         let ffmpeg_bin = locate_ffmpeg_binary().context(
             "ffmpeg binary not found. Bundle it as ./bin/ffmpeg beside the app executable.",
