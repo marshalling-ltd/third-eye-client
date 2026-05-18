@@ -53,6 +53,7 @@ struct Imu {
     gyro_z: i16,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn main() -> Result<()> {
     let config = parse_config()?;
     let destination: SocketAddr = format!("{}:{}", config.target_host, config.target_port)

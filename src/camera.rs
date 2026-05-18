@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use anyhow::{Context, Result};
 use reqwest::Url;
 use reqwest::blocking::Client;
@@ -376,11 +377,11 @@ impl CameraApiClient {
                 if i > 0 {
                     detail.push_str(", ");
                 }
-                detail.push_str(&format!("code={} msg={:?}", sub.code, sub.msg));
+                let _ = write!(detail, "code={} msg={:?}", sub.code, sub.msg);
                 if let Some(meta) = &sub.meta
                     && let Some(ip) = &meta.ip
                 {
-                    detail.push_str(&format!(" ip={ip}"));
+                    let _ = write!(detail, " ip={ip}");
                 }
             }
             detail.push(']');

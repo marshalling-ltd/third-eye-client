@@ -585,8 +585,7 @@ pub fn prime_corelocation_at_startup(map: &mut MapState) {
         manager.setDesiredAccuracy(kCLLocationAccuracyBest);
         let status = manager.authorizationStatus();
         // Request permission on first launch (non-blocking — shows native prompt).
-        if status == CLAuthorizationStatus::NotDetermined
-            && !map.corelocation_permission_requested
+        if status == CLAuthorizationStatus::NotDetermined && !map.corelocation_permission_requested
         {
             manager.requestWhenInUseAuthorization();
             map.corelocation_permission_requested = true;

@@ -32,12 +32,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "macos")]
-use map::{check_corelocation_warmup_fix, corelocation_debug_status, prime_corelocation_at_startup};
 use map::{
     DEFAULT_OSM_TILE_USER_AGENT, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, MapState, MapTilesState,
-    RgbaFrame, ViewportAnimation, compute_scale_bar, ease_out_cubic,
-    lat_lon_to_world_px, rgba_frame_to_slint_image,
+    RgbaFrame, ViewportAnimation, compute_scale_bar, ease_out_cubic, lat_lon_to_world_px,
+    rgba_frame_to_slint_image,
+};
+#[cfg(target_os = "macos")]
+use map::{
+    check_corelocation_warmup_fix, corelocation_debug_status, prime_corelocation_at_startup,
 };
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -483,9 +485,7 @@ impl ThirdEyeState {
         // "Detect Location" to get a fresh fix — that call is explicit
         // and the user expects it to take a moment.
         if self.map.lat.is_some() && self.map.lon.is_some() {
-            self.load_map_tile_for_current_location(
-                "Centered on last known location.".to_owned(),
-            );
+            self.load_map_tile_for_current_location("Centered on last known location.".to_owned());
         } else {
             // No location yet — load tiles at the current viewport
             // so at least the map renders, and prompt the user.
@@ -575,7 +575,9 @@ impl StreamState {
         self.event_rx = Some(rx);
         self.controller = Some(controller);
         self.frames_received = 0;
-        Ok(format!("Embedded stream started via ffmpeg at {ffmpeg_label}."))
+        Ok(format!(
+            "Embedded stream started via ffmpeg at {ffmpeg_label}."
+        ))
     }
 
     fn stop(&mut self) {
@@ -674,7 +676,10 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
-    ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
+    // Only populate the IP field if the user hasn't typed anything yet.
+    if ui.get_nmea_local_ip().is_empty() {
+        ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
+    }
     ui.set_auth_email(state.auth.email.clone().into());
     ui.set_auth_password(state.auth.password.clone().into());
     ui.set_auth_status_text(state.auth.status_text.clone().into());
@@ -875,20 +880,16 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
 /// WiFi adapter (`en0`) is excluded so that wired USB-ethernet adapters are
 /// preferred; on other platforms the first matching non-loopback interface
 /// is returned.
-/// Returns the first non-loopback IPv4 address on this machine, or `None`
-/// if no suitable interface is found.
+/// Returns the local IPv4 address that the OS would use to reach the
+/// internet (i.e. the adapter with the default gateway). Works cross-
+/// platform by connecting a UDP socket to a public IP — no data is sent,
+/// the OS just resolves which local address it would route through.
 fn detect_local_ip() -> Option<String> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .filter(|iface| !iface.is_loopback())
-        .find_map(|iface| {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                Some(v4.ip.to_string())
-            } else {
-                None
-            }
-        })
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Connect to a well-known public IP. No packet is actually sent.
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
 }
 
 fn detect_rov_interface(rov_host: &str) -> Option<String> {
@@ -933,32 +934,27 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
         return;
     };
 
-    match detect_rov_interface(&rov_host) {
-        Some(interface) => {
-            state.config.rov_network_interface = interface.clone();
-            let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
-            if setup_external_route {
-                match ensure_rov_external_route(&state.config.rov_http_base, &interface) {
-                    Ok(()) => {
-                        summary.push_str(" External stream route is ready.");
-                    }
-                    Err(err) => {
-                        summary
-                            .push_str(&format!(" External stream route is not ready yet: {err:#}"));
-                    }
+    if let Some(interface) = detect_rov_interface(&rov_host) {
+        state.config.rov_network_interface = interface.clone();
+        let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
+        if setup_external_route {
+            match ensure_rov_external_route(&state.config.rov_http_base, &interface) {
+                Ok(()) => {
+                    summary.push_str(" External stream route is ready.");
+                }
+                Err(err) => {
+                    summary.push_str(&format!(" External stream route is not ready yet: {err:#}"));
                 }
             }
-            state.rov_info = summary;
         }
-        None => {
-            state.config.rov_network_interface.clear();
-            // Remove any stale host route from a previous cable session so
-            // ffmpeg falls back to the default OS routing (e.g. ROV WiFi).
-            cleanup_stale_rov_route(&rov_host);
-            state.rov_info = format!(
-                "No dedicated wired ROV interface detected for {rov_host}. Using OS routing."
-            );
-        }
+        state.rov_info = summary;
+    } else {
+        state.config.rov_network_interface.clear();
+        // Remove any stale host route from a previous cable session so
+        // ffmpeg falls back to the default OS routing (e.g. ROV WiFi).
+        cleanup_stale_rov_route(&rov_host);
+        state.rov_info =
+            format!("No dedicated wired ROV interface detected for {rov_host}. Using OS routing.");
     }
 }
 
@@ -1572,9 +1568,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
             } else {
                 #[cfg(target_os = "macos")]
-                { check_corelocation_warmup_fix(&state.map).map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned())) }
+                {
+                    check_corelocation_warmup_fix(&state.map)
+                        .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned()))
+                }
                 #[cfg(not(target_os = "macos"))]
-                { None }
+                {
+                    None
+                }
             };
             if let Some((lat, lon, source)) = fresh {
                 state.map.lat = Some(lat);
@@ -1680,14 +1681,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             let rtsp_url = state.config.rtsp_url.clone();
             let rov_http_base = state.config.rov_http_base.clone();
             let rov_interface = state.config.rov_interface().map(str::to_owned);
-            state.stream.status = match state.stream.start(
-                rtsp_url,
-                Some(&rov_http_base),
-                rov_interface.as_deref(),
-            ) {
-                Ok(msg) => msg,
-                Err(err) => format!("Failed to start stream: {err:#}"),
-            };
+            state.stream.status =
+                match state
+                    .stream
+                    .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
+                {
+                    Ok(msg) => msg,
+                    Err(err) => format!("Failed to start stream: {err:#}"),
+                };
             ui.set_has_stream_image(false);
         }
 
@@ -1921,13 +1922,18 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         // Refresh location from the best non-blocking source before capture so
         // the freshest possible coordinates are attached to the photo metadata.
         {
-            let fresh_fix: Option<(f64, f64)> = if let Some(fix) = state.nmea_gps.latest_location() {
+            let fresh_fix: Option<(f64, f64)> = if let Some(fix) = state.nmea_gps.latest_location()
+            {
                 Some(fix)
             } else {
                 #[cfg(target_os = "macos")]
-                { check_corelocation_warmup_fix(&state.map) }
+                {
+                    check_corelocation_warmup_fix(&state.map)
+                }
                 #[cfg(not(target_os = "macos"))]
-                { None }
+                {
+                    None
+                }
             };
             if let Some((lat, lon)) = fresh_fix {
                 state.map.lat = Some(lat);
@@ -2089,9 +2095,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
         } else {
             #[cfg(target_os = "macos")]
-            { check_corelocation_warmup_fix(&state.map).map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned())) }
+            {
+                check_corelocation_warmup_fix(&state.map)
+                    .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned()))
+            }
             #[cfg(not(target_os = "macos"))]
-            { None }
+            {
+                None
+            }
         };
         if let Some((lat, lon, source)) = fresh {
             state.map.lat = Some(lat);
@@ -2171,14 +2182,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let rtsp_url = state.config.rtsp_url.clone();
         let rov_http_base = state.config.rov_http_base.clone();
         let rov_interface = state.config.rov_interface().map(str::to_owned);
-        state.stream.status = match state.stream.start(
-            rtsp_url,
-            Some(&rov_http_base),
-            rov_interface.as_deref(),
-        ) {
-            Ok(msg) => msg,
-            Err(err) => format!("Failed to start stream: {err:#}"),
-        };
+        state.stream.status =
+            match state
+                .stream
+                .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
+            {
+                Ok(msg) => msg,
+                Err(err) => format!("Failed to start stream: {err:#}"),
+            };
         ui.set_has_stream_image(false);
         apply_state_to_ui(&ui, &state);
     });
@@ -2277,7 +2288,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
 
-        // Fall back to TCP: auto-detect local IP and listen.
+        // Fall back to TCP: use the IP from the UI field (user-editable).
         let port = match state.config.parse_nmea_gps_port() {
             Ok(port) => port,
             Err(err) => {
@@ -2287,7 +2298,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 return;
             }
         };
-        let host = detect_local_ip().unwrap_or_default();
+        let host = ui.get_nmea_local_ip().to_string();
+        let host = if host.trim().is_empty() {
+            detect_local_ip().unwrap_or_default()
+        } else {
+            host
+        };
         match state.nmea_gps.start(&host, port) {
             Ok(_msg) => {}
             Err(err) => {
@@ -2744,7 +2760,8 @@ fn spawn_media_stream_pipeline(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut ffmpeg_child = cmd.spawn()
+    let mut ffmpeg_child = cmd
+        .spawn()
         .context("failed to spawn ffmpeg for media streaming")?;
 
     let stdout = ffmpeg_child

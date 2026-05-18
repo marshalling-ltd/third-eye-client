@@ -316,10 +316,8 @@ export component AppWindow inherits Window {
                         text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
                         wrap: word-wrap;
                     }
-                    if root.nmea_local_ip != "" : Text {
-                        text: "This machine's IP: " + root.nmea_local_ip + " — configure your phone GPS app to connect here.";
-                        wrap: word-wrap;
-                    }
+                    Text { text: "TCP listen address (auto-detected, editable):"; }
+                    LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
                     Text { text: "TCP listen port (used when no Bluetooth port is found):"; }
                     LineEdit { text <=> root.nmea_gps_port; }
                     Button {
