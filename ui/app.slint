@@ -37,14 +37,11 @@ export component AppWindow inherits Window {
     in-out property <string> osm_tile_user_agent;
     in-out property <string> rov_info;
 
-    // Phone GPS (NMEA over TCP).
-    in-out property <string> nmea_gps_host;
+    // Phone GPS (NMEA — auto-detects Bluetooth or TCP).
     in-out property <string> nmea_gps_port;
     in-out property <string> nmea_gps_status;
     in-out property <bool> nmea_gps_running: false;
-
-    // Phone GPS (Bluetooth / serial).
-    in-out property <string> bluetooth_gps_port;
+    in-out property <string> nmea_local_ip;
 
     // Server account (third-eye backend).
     in-out property <string> server_base_url;
@@ -147,8 +144,6 @@ export component AppWindow inherits Window {
     callback start_nmea_gps();
     callback stop_nmea_gps();
     callback use_default_nmea_gps_port();
-    callback start_bluetooth_gps();
-    callback list_bluetooth_ports();
 
     callback sign_in();
     callback sign_out();
@@ -316,14 +311,16 @@ export component AppWindow inherits Window {
                     Text { text: root.rov_info; wrap: word-wrap; }
 
                     Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Phone GPS (NMEA over TCP)"; font-size: 18px; }
+                    Text { text: "Phone GPS (NMEA)"; font-size: 18px; }
                     Text {
-                        text: "Receive GPS from a phone app (GPS2IP, GPSd Forwarder, ShareGPS). Configure the app as TCP client pointing to this Mac's IP on the port below.";
+                        text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
                         wrap: word-wrap;
                     }
-                    Text { text: "Listen address (leave empty for all interfaces):"; }
-                    LineEdit { text <=> root.nmea_gps_host; }
-                    Text { text: "Listen port:"; }
+                    if root.nmea_local_ip != "" : Text {
+                        text: "This machine's IP: " + root.nmea_local_ip + " — configure your phone GPS app to connect here.";
+                        wrap: word-wrap;
+                    }
+                    Text { text: "TCP listen port (used when no Bluetooth port is found):"; }
                     LineEdit { text <=> root.nmea_gps_port; }
                     Button {
                         text: "Use default GPS2IP port (11123)";
@@ -345,34 +342,6 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text { text: root.nmea_gps_status; wrap: word-wrap; }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Phone GPS (Bluetooth)"; font-size: 18px; }
-                    Text {
-                        text: "Pair your Android phone via Bluetooth, then click \"List ports\" to find its serial port name (e.g. /dev/cu.YourPhone on macOS, COM5 on Windows). Popular apps: Bluetooth GPS, GPS Share.";
-                        wrap: word-wrap;
-                    }
-                    Text { text: "Bluetooth serial port:"; }
-                    LineEdit { text <=> root.bluetooth_gps_port; placeholder-text: "e.g. /dev/cu.GPS or COM5"; }
-                    Button {
-                        text: "List available ports";
-                        clicked => { root.list_bluetooth_ports(); }
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Start Bluetooth GPS";
-                            enabled: !root.nmea_gps_running;
-                            clicked => { root.start_bluetooth_gps(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Stop Bluetooth GPS";
-                            enabled: root.nmea_gps_running;
-                            clicked => { root.stop_nmea_gps(); }
-                        }
-                    }
 
                     Rectangle { height: 1px; background: #3f4148; }
                     Text { text: "Server account"; font-size: 18px; }
