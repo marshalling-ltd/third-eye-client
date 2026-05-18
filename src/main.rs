@@ -66,6 +66,7 @@ enum Screen {
     Map,
     Stream,
     Media,
+    Nmea,
 }
 
 impl Screen {
@@ -75,6 +76,7 @@ impl Screen {
             Self::Map => 1,
             Self::Stream => 2,
             Self::Media => 3,
+            Self::Nmea => 4,
         }
     }
 }
@@ -676,6 +678,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
+    ui.set_nmea_has_fix(state.nmea_gps.fixes_received() > 0);
     // Only populate the IP field if the user hasn't typed anything yet.
     if ui.get_nmea_local_ip().is_empty() {
         ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
@@ -1477,6 +1480,27 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.media.stop_media_stream();
         state.active_screen = Screen::Configuration;
         state.last_screen = Screen::Configuration;
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_nmea_nav = Rc::clone(&state);
+    let store_for_nmea_nav = Rc::clone(&store);
+    ui.on_navigate_nmea(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_nmea_nav.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_nmea_nav);
+        if state.last_screen == Screen::Stream {
+            state.stream_left_at_ms = current_unix_ms();
+        }
+        state.media.stop_media_stream();
+        state.active_screen = Screen::Nmea;
+        state.last_screen = Screen::Nmea;
         apply_state_to_ui(&ui, &state);
     });
 
@@ -3154,6 +3178,7 @@ fn locate_ffmpeg_binary() -> Option<PathBuf> {
 
 fn main() -> Result<()> {
     let ui = AppWindow::new().context("failed to initialize Slint window")?;
+    ui.window().set_maximized(true);
     let store = Rc::new(match AppStore::open() {
         Ok(store) => store,
         Err(err) => {
@@ -3323,6 +3348,7 @@ fn main() -> Result<()> {
             }
             ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
             ui.set_nmea_gps_running(state.nmea_gps.is_running());
+            ui.set_nmea_has_fix(state.nmea_gps.fixes_received() > 0);
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
             if poll_media_events(&mut state, &poll_store) {
                 apply_state_to_ui(&ui, &state);
