@@ -184,21 +184,16 @@ export component AppWindow inherits Window {
             VerticalBox {
                 padding: 12px;
                 spacing: 8px;
-                Image {
-                    width: 90px;
-                    height: 70px;
-                    source: @image-url("../assets/logo.png");
-                    image-fit: contain;
+                HorizontalBox {
+                    alignment: center;
+                    Image {
+                        width: 90px;
+                        height: 70px;
+                        source: @image-url("../assets/logo.png");
+                        image-fit: contain;
+                    }
                 }
 
-                Text {
-                    text: "Third Eye Client";
-                    font-size: 26px;
-                }
-                Text {
-                    text: "Navigation";
-                    color: #8f96a3;
-                }
                 Rectangle {
                     height: 1px;
                     background: #3f4148;
@@ -405,12 +400,13 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         Text {
                             text: root.nmea_gps_running
-                                ? (root.nmea_has_fix ? "\u{2713}" : "\u{23f3}")
-                                : "\u{2717}";
+                                ? (root.nmea_has_fix ? "OK" : "..")
+                                : "--";
                             color: root.nmea_gps_running
                                 ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
                                 : #ff4444;
-                            font-size: 18px;
+                            font-size: 14px;
+                            font-weight: 700;
                         }
                         Text {
                             text: root.nmea_gps_status;
@@ -1183,13 +1179,14 @@ export component AppWindow inherits Window {
                         }
                         Text {
                             text: root.nmea_gps_running
-                                ? (root.nmea_has_fix ? "\u{2713}" : "\u{23f3}")
-                                : "\u{2717}";
+                                ? (root.nmea_has_fix ? "OK" : "..")
+                                : "--";
                             color: root.nmea_gps_running
                                 ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
                                 : #ff4444;
-                            font-size: 14px;
-                            x: 44px;
+                            font-size: 11px;
+                            font-weight: 700;
+                            x: 42px;
                             vertical-alignment: center;
                         }
                     }
