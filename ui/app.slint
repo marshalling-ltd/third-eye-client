@@ -43,6 +43,7 @@ export component AppWindow inherits Window {
     in-out property <bool> nmea_gps_running: false;
     in-out property <bool> nmea_has_fix: false;
     in-out property <string> nmea_local_ip;
+    in-out property <string> nmea_serial_ports;
 
     // Server account (third-eye backend).
     in-out property <string> server_base_url;
@@ -372,6 +373,11 @@ export component AppWindow inherits Window {
                     Text {
                         text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
                         wrap: word-wrap;
+                    }
+                    if root.nmea_serial_ports != "" : Text {
+                        text: "Bluetooth ports: " + root.nmea_serial_ports;
+                        wrap: word-wrap;
+                        color: #8f96a3;
                     }
                     Text { text: "TCP listen address (auto-detected, editable):"; }
                     LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }

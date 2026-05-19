@@ -1499,6 +1499,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.stream_left_at_ms = current_unix_ms();
         }
         state.media.stop_media_stream();
+        // Refresh the BT port list when entering the Phone GPS screen.
+        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
+        let ports_text = if bt_ports.is_empty() {
+            String::new()
+        } else {
+            bt_ports.join(", ")
+        };
+        ui.set_nmea_serial_ports(ports_text.into());
         state.active_screen = Screen::Nmea;
         state.last_screen = Screen::Nmea;
         apply_state_to_ui(&ui, &state);
@@ -2296,10 +2304,18 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_nmea);
         state.nmea_gps.stop();
 
-        // Try Bluetooth first: if exactly one serial port is available, use it.
-        let serial_ports = third_eye_client::nmea::list_serial_ports();
-        if serial_ports.len() == 1 {
-            let port_path = &serial_ports[0];
+        // Try Bluetooth first: look for BT SPP ports specifically.
+        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
+        if !bt_ports.is_empty() {
+            let port_path = &bt_ports[0];
+            if bt_ports.len() > 1 {
+                state.nmea_gps.set_status(format!(
+                    "Found {} Bluetooth ports: {}. Using {}.",
+                    bt_ports.len(),
+                    bt_ports.join(", "),
+                    port_path
+                ));
+            }
             match state.nmea_gps.start_bluetooth(port_path) {
                 Ok(_msg) => {}
                 Err(err) => {
