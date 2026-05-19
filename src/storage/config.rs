@@ -20,6 +20,9 @@ pub mod keys {
     pub const SERVER_BASE_URL: &str = "server.base_url";
     pub const ROV_NETWORK_INTERFACE: &str = "client.rov_network_interface";
     pub const NMEA_GPS_PORT: &str = "client.nmea_gps_port";
+    pub const NMEA_GPS_MODE: &str = "client.nmea_gps_mode";
+    pub const NMEA_SERVER_HOST: &str = "client.nmea_server_host";
+    pub const NMEA_SERVER_PORT: &str = "client.nmea_server_port";
 }
 
 /// Persisted configuration accessor.
@@ -86,6 +89,9 @@ impl ConfigStore {
             rov_network_interface: self
                 .get_or(keys::ROV_NETWORK_INTERFACE, defaults.rov_network_interface)?,
             nmea_gps_port: self.get_or(keys::NMEA_GPS_PORT, defaults.nmea_gps_port)?,
+            nmea_gps_mode: self.get_or(keys::NMEA_GPS_MODE, defaults.nmea_gps_mode)?,
+            nmea_server_host: self.get_or(keys::NMEA_SERVER_HOST, defaults.nmea_server_host)?,
+            nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
         })
     }
 
@@ -108,6 +114,9 @@ impl ConfigStore {
                 config.rov_network_interface.as_str(),
             ),
             (keys::NMEA_GPS_PORT, config.nmea_gps_port.as_str()),
+            (keys::NMEA_GPS_MODE, config.nmea_gps_mode.as_str()),
+            (keys::NMEA_SERVER_HOST, config.nmea_server_host.as_str()),
+            (keys::NMEA_SERVER_PORT, config.nmea_server_port.as_str()),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -135,6 +144,12 @@ pub struct ClientConfig {
     pub rov_network_interface: String,
     /// Phone GPS (NMEA) TCP listen port as string. Default `"11123"`.
     pub nmea_gps_port: String,
+    /// Phone GPS mode: `"0"` = Auto (BT/TCP listen), `"1"` = Connect to server.
+    pub nmea_gps_mode: String,
+    /// Phone server host (used when mode = 1, TCP client).
+    pub nmea_server_host: String,
+    /// Phone server port (used when mode = 1, TCP client). Default `"11123"`.
+    pub nmea_server_port: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -148,6 +163,9 @@ pub struct ClientConfigDefaults<'a> {
     pub server_base_url: &'a str,
     pub rov_network_interface: &'a str,
     pub nmea_gps_port: &'a str,
+    pub nmea_gps_mode: &'a str,
+    pub nmea_server_host: &'a str,
+    pub nmea_server_port: &'a str,
 }
 
 #[cfg(test)]
@@ -164,6 +182,9 @@ mod tests {
         server_base_url: "https://third-eye.marshalling.eu",
         rov_network_interface: "",
         nmea_gps_port: "11123",
+        nmea_gps_mode: "0",
+        nmea_server_host: "",
+        nmea_server_port: "11123",
     };
 
     #[test]
@@ -201,6 +222,9 @@ mod tests {
             server_base_url: "https://api.example".into(),
             rov_network_interface: "en10".into(),
             nmea_gps_port: "11123".into(),
+            nmea_gps_mode: "1".into(),
+            nmea_server_host: "192.168.1.50".into(),
+            nmea_server_port: "4352".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();

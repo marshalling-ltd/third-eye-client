@@ -20,6 +20,9 @@ const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
     server_base_url: "https://third-eye.marshalling.eu",
     rov_network_interface: "",
     nmea_gps_port: "11123",
+    nmea_gps_mode: "0",
+    nmea_server_host: "",
+    nmea_server_port: "11123",
 };
 
 fn make_db_path(name: &str) -> PathBuf {
@@ -47,6 +50,9 @@ fn config_and_outbox_survive_reopen() {
             server_base_url: "https://api.test".into(),
             rov_network_interface: "en10".into(),
             nmea_gps_port: "11123".into(),
+            nmea_gps_mode: "0".into(),
+            nmea_server_host: "".into(),
+            nmea_server_port: "11123".into(),
         };
         store.config().save_client(&cfg).unwrap();
 

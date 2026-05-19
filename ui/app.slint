@@ -44,6 +44,10 @@ export component AppWindow inherits Window {
     in-out property <bool> nmea_has_fix: false;
     in-out property <string> nmea_local_ip;
     in-out property <string> nmea_serial_ports;
+    // 0 = Auto (BT / TCP listen), 1 = Connect to Server (TCP client).
+    in-out property <int> nmea_gps_mode: 0;
+    in-out property <string> nmea_server_host;
+    in-out property <string> nmea_server_port;
 
     // Server account (third-eye backend).
     in-out property <string> server_base_url;
@@ -147,6 +151,7 @@ export component AppWindow inherits Window {
     callback start_nmea_gps();
     callback stop_nmea_gps();
     callback use_default_nmea_gps_port();
+    callback set_nmea_gps_mode(int);
 
     callback sign_in();
     callback sign_out();
@@ -371,22 +376,92 @@ export component AppWindow inherits Window {
                         font-size: 24px;
                     }
                     Text {
-                        text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started on the detected local IP. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
+                        text: "Receive NMEA GPS data from a phone app via Bluetooth, TCP listen, or by connecting to the phone's NMEA server.";
                         wrap: word-wrap;
                     }
-                    if root.nmea_serial_ports != "" : Text {
-                        text: "Bluetooth ports: " + root.nmea_serial_ports;
-                        wrap: word-wrap;
-                        color: #8f96a3;
+
+                    // --- Mode selector (radio-style) ---
+                    Text { text: "Connection mode:"; font-size: 13px; color: #8f96a3; }
+                    HorizontalBox {
+                        spacing: 6px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 6px;
+                            border-width: root.nmea_gps_mode == 0 ? 2px : 1px;
+                            border-color: root.nmea_gps_mode == 0 ? #0a84ff : #3f4148;
+                            background: root.nmea_gps_mode == 0 ? #0a84ff18 : #1a1c22;
+                            Text {
+                                text: "Auto (BT / TCP Listen)";
+                                font-size: 13px;
+                                color: root.nmea_gps_mode == 0 ? #ffffff : #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.set_nmea_gps_mode(0); }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 6px;
+                            border-width: root.nmea_gps_mode == 1 ? 2px : 1px;
+                            border-color: root.nmea_gps_mode == 1 ? #0a84ff : #3f4148;
+                            background: root.nmea_gps_mode == 1 ? #0a84ff18 : #1a1c22;
+                            Text {
+                                text: "Connect to Server";
+                                font-size: 13px;
+                                color: root.nmea_gps_mode == 1 ? #ffffff : #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.set_nmea_gps_mode(1); }
+                            }
+                        }
                     }
-                    Text { text: "TCP listen address (auto-detected, editable):"; }
-                    LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
-                    Text { text: "TCP listen port (used when no Bluetooth port is found):"; }
-                    LineEdit { text <=> root.nmea_gps_port; }
-                    Button {
-                        text: "Use default GPS2IP port (11123)";
-                        clicked => { root.use_default_nmea_gps_port(); }
+
+                    // --- Auto mode fields ---
+                    if root.nmea_gps_mode == 0 : VerticalBox {
+                        spacing: 8px;
+                        Text {
+                            text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
+                            wrap: word-wrap;
+                            color: #8f96a3;
+                            font-size: 12px;
+                        }
+                        if root.nmea_serial_ports != "" : Text {
+                            text: "Bluetooth ports: " + root.nmea_serial_ports;
+                            wrap: word-wrap;
+                            color: #8f96a3;
+                        }
+                        Text { text: "TCP listen address (auto-detected, editable):"; }
+                        LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
+                        Text { text: "TCP listen port:"; }
+                        LineEdit { text <=> root.nmea_gps_port; }
+                        Button {
+                            text: "Use default GPS2IP port (11123)";
+                            clicked => { root.use_default_nmea_gps_port(); }
+                        }
                     }
+
+                    // --- Connect to Server mode fields ---
+                    if root.nmea_gps_mode == 1 : VerticalBox {
+                        spacing: 8px;
+                        Text {
+                            text: "Connect to a phone running an NMEA server app (e.g. GPS Forwarder, ShareGPS). The laptop connects as a TCP client to the phone's IP and port.";
+                            wrap: word-wrap;
+                            color: #8f96a3;
+                            font-size: 12px;
+                        }
+                        Text { text: "Phone server IP address:"; }
+                        LineEdit { text <=> root.nmea_server_host; placeholder-text: "e.g. 192.168.43.1"; }
+                        Text { text: "Phone server port:"; }
+                        LineEdit { text <=> root.nmea_server_port; placeholder-text: "e.g. 11123"; }
+                    }
+
+                    // --- Start / Stop ---
                     HorizontalBox {
                         spacing: 8px;
                         Button {

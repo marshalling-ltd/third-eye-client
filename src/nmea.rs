@@ -130,6 +130,37 @@ impl NmeaGpsState {
         Ok(self.status.clone())
     }
 
+    /// Connects as a TCP **client** to a phone running an NMEA server app.
+    /// The laptop dials `host:port` and reads NMEA sentences from the
+    /// connection. Automatically retries on disconnect.
+    pub fn start_client(&mut self, host: &str, port: u16) -> Result<String> {
+        let host = host.trim();
+        if host.is_empty() {
+            anyhow::bail!("Phone server host must not be empty.");
+        }
+        let addr = format!("{host}:{port}");
+        let (tx, rx) = mpsc::channel();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
+        let addr_clone = addr.clone();
+        let worker = thread::Builder::new()
+            .name("nmea-tcp-client".into())
+            .spawn(move || nmea_tcp_client_worker(addr_clone, worker_stop, tx))
+            .context("failed to spawn NMEA TCP client worker thread")?;
+
+        self.event_rx = Some(rx);
+        self.controller = Some(NmeaGpsController {
+            stop_flag,
+            worker: Some(worker),
+        });
+        self.latest_fix = None;
+        self.fixes_received = 0;
+        self.status = format!("Connecting to phone GPS server at {addr}...");
+        Ok(self.status.clone())
+    }
+
+    /// Starts a TCP **server** (listener) that accepts connections from phone
+    /// GPS apps like GPS2IP.
     pub fn start(&mut self, host: &str, port: u16) -> Result<String> {
         let host = host.trim();
         let bind_addr = if host.is_empty() {
@@ -349,6 +380,80 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
                 Err(err) => {
                     let _ = tx.send(NmeaGpsEvent::Status(format!(
                         "Phone GPS disconnected ({err}). Waiting for reconnect on {addr}..."
+                    )));
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = tx.send(NmeaGpsEvent::Ended);
+}
+
+/// Worker for TCP **client** mode: connects to the phone's NMEA server,
+/// reads lines, and retries on disconnect until the stop flag is set.
+fn nmea_tcp_client_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGpsEvent>) {
+    while !stop.load(Ordering::Relaxed) {
+        let stream = match std::net::TcpStream::connect_timeout(
+            &addr.parse().unwrap_or_else(|_| {
+                // Fallback: try to resolve via ToSocketAddrs.
+                use std::net::ToSocketAddrs;
+                addr.to_socket_addrs()
+                    .ok()
+                    .and_then(|mut iter| iter.next())
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+            }),
+            Duration::from_secs(5),
+        ) {
+            Ok(s) => {
+                let _ = tx.send(NmeaGpsEvent::Status(format!(
+                    "Connected to phone GPS server at {addr}."
+                )));
+                s
+            }
+            Err(err) => {
+                let _ = tx.send(NmeaGpsEvent::Status(format!(
+                    "Cannot reach phone GPS server at {addr}: {err}. Retrying in 3s..."
+                )));
+                // Sleep in small increments so we can check the stop flag.
+                for _ in 0..15 {
+                    if stop.load(Ordering::Relaxed) {
+                        let _ = tx.send(NmeaGpsEvent::Ended);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                continue;
+            }
+        };
+
+        let _ = stream.set_read_timeout(Some(TCP_READ_TIMEOUT));
+        let reader = BufReader::new(stream);
+        let mut last_sent: Option<(f64, f64)> = None;
+        for line_result in reader.lines() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match line_result {
+                Ok(line) => {
+                    if let Some((lat, lon)) = parse_nmea_location(&line)
+                        && position_changed(&last_sent, lat, lon)
+                    {
+                        last_sent = Some((lat, lon));
+                        if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // Read timeout — just loop and check stop flag.
+                }
+                Err(err) => {
+                    let _ = tx.send(NmeaGpsEvent::Status(format!(
+                        "Phone GPS server disconnected ({err}). Reconnecting to {addr}..."
                     )));
                     break;
                 }

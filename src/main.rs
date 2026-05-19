@@ -91,6 +91,9 @@ struct AppConfig {
     server_base_url: String,
     rov_network_interface: String,
     nmea_gps_port: String,
+    nmea_gps_mode: String,
+    nmea_server_host: String,
+    nmea_server_port: String,
 }
 
 impl Default for AppConfig {
@@ -104,6 +107,9 @@ impl Default for AppConfig {
             server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
             rov_network_interface: String::new(),
             nmea_gps_port: DEFAULT_NMEA_GPS_PORT.to_string(),
+            nmea_gps_mode: "0".to_owned(),
+            nmea_server_host: String::new(),
+            nmea_server_port: DEFAULT_NMEA_GPS_PORT.to_string(),
         }
     }
 }
@@ -130,6 +136,9 @@ impl AppConfig {
             server_base_url: self.server_base_url.clone(),
             rov_network_interface: self.rov_network_interface.clone(),
             nmea_gps_port: self.nmea_gps_port.clone(),
+            nmea_gps_mode: self.nmea_gps_mode.clone(),
+            nmea_server_host: self.nmea_server_host.clone(),
+            nmea_server_port: self.nmea_server_port.clone(),
         }
     }
 
@@ -143,6 +152,9 @@ impl AppConfig {
             server_base_url: config.server_base_url,
             rov_network_interface: config.rov_network_interface,
             nmea_gps_port: config.nmea_gps_port,
+            nmea_gps_mode: config.nmea_gps_mode,
+            nmea_server_host: config.nmea_server_host,
+            nmea_server_port: config.nmea_server_port,
         }
     }
 
@@ -183,6 +195,9 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         server_base_url: DEFAULT_SERVER_BASE_URL,
         rov_network_interface: "",
         nmea_gps_port: NMEA_GPS_PORT_DEFAULT_STR,
+        nmea_gps_mode: "0",
+        nmea_server_host: "",
+        nmea_server_port: NMEA_GPS_PORT_DEFAULT_STR,
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -404,6 +419,9 @@ impl ThirdEyeState {
                 server_base_url: defaults.server_base_url.to_owned(),
                 rov_network_interface: defaults.rov_network_interface.to_owned(),
                 nmea_gps_port: defaults.nmea_gps_port.to_owned(),
+                nmea_gps_mode: defaults.nmea_gps_mode.to_owned(),
+                nmea_server_host: defaults.nmea_server_host.to_owned(),
+                nmea_server_port: defaults.nmea_server_port.to_owned(),
             }
         });
 
@@ -676,6 +694,9 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
+    ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
+    ui.set_nmea_server_host(state.config.nmea_server_host.clone().into());
+    ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
     ui.set_nmea_has_fix(state.nmea_gps.fixes_received() > 0);
@@ -864,6 +885,9 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.osm_tile_user_agent = ui.get_osm_tile_user_agent().to_string();
     state.config.server_base_url = ui.get_server_base_url().to_string();
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
+    state.config.nmea_gps_mode = ui.get_nmea_gps_mode().to_string();
+    state.config.nmea_server_host = ui.get_nmea_server_host().to_string();
+    state.config.nmea_server_port = ui.get_nmea_server_port().to_string();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -2288,7 +2312,23 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
-    // --- NMEA GPS callback (auto-detects Bluetooth serial vs TCP) ---
+    // --- NMEA GPS callbacks ---
+
+    let ui_weak = ui.as_weak();
+    let state_for_set_nmea_mode = Rc::clone(&state);
+    let store_for_set_nmea_mode = Rc::clone(&store);
+    ui.on_set_nmea_gps_mode(move |mode| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut state = match state_for_set_nmea_mode.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.config.nmea_gps_mode = mode.to_string();
+        persist_config(&state, &store_for_set_nmea_mode);
+        ui.set_nmea_gps_mode(mode);
+    });
 
     let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);
@@ -2303,6 +2343,34 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_nmea);
         state.nmea_gps.stop();
+
+        let mode: i32 = state.config.nmea_gps_mode.trim().parse().unwrap_or(0);
+
+        if mode == 1 {
+            // --- Connect to Server mode (TCP client) ---
+            let host = state.config.nmea_server_host.clone();
+            let port_text = state.config.nmea_server_port.trim().to_owned();
+            let port: u16 = match port_text.parse() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    ui.set_nmea_gps_status("Invalid server port.".into());
+                    apply_state_to_ui(&ui, &state);
+                    return;
+                }
+            };
+            match state.nmea_gps.start_client(&host, port) {
+                Ok(_msg) => {}
+                Err(err) => {
+                    ui.set_nmea_gps_status(
+                        format!("Failed to connect to phone GPS server: {err:#}").into(),
+                    );
+                }
+            }
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+
+        // --- Auto mode (BT then TCP listen) ---
 
         // Try Bluetooth first: look for BT SPP ports specifically.
         let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
@@ -2328,7 +2396,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
 
-        // Fall back to TCP: use the IP from the UI field (user-editable).
+        // Fall back to TCP listen: use the IP from the UI field (user-editable).
         let port = match state.config.parse_nmea_gps_port() {
             Ok(port) => port,
             Err(err) => {
