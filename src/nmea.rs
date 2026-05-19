@@ -43,6 +43,44 @@ pub fn list_serial_ports() -> Vec<String> {
         .collect()
 }
 
+/// Returns only Bluetooth SPP serial port names, filtered per-platform:
+///
+/// - **Windows**: ports tagged `SerialPortType::BluetoothPort` by the driver.
+/// - **macOS**: `/dev/cu.*` ports that are *not* `PciPort` (built-in). BT SPP
+///   often shows as `Unknown` on macOS so we can't rely on the type alone.
+/// - **Linux**: `/dev/rfcomm*` ports (BT RFCOMM channels).
+///
+/// Falls back to the full `list_serial_ports()` on unsupported platforms.
+pub fn list_bluetooth_ports() -> Vec<String> {
+    let ports = serialport::available_ports().unwrap_or_default();
+    let filtered: Vec<String> = ports
+        .into_iter()
+        .filter(is_likely_bluetooth_port)
+        .map(|p| p.port_name)
+        .collect();
+    filtered
+}
+
+fn is_likely_bluetooth_port(port: &serialport::SerialPortInfo) -> bool {
+    use serialport::SerialPortType;
+    match &port.port_type {
+        SerialPortType::BluetoothPort => true,
+        #[cfg(target_os = "macos")]
+        SerialPortType::Unknown => {
+            // On macOS, /dev/cu.* Bluetooth SPP ports show as Unknown.
+            // Exclude /dev/cu.usbmodem* and /dev/cu.usbserial* (USB adapters).
+            let name = &port.port_name;
+            name.starts_with("/dev/cu.")
+                && !name.contains("usbmodem")
+                && !name.contains("usbserial")
+                && !name.contains("Bluetooth-Incoming")
+        }
+        #[cfg(target_os = "linux")]
+        SerialPortType::Unknown => port.port_name.starts_with("/dev/rfcomm"),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public state
 // ---------------------------------------------------------------------------
@@ -229,6 +267,20 @@ impl Drop for NmeaGpsController {
 
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Minimum change in degrees before we send a new Fix event (~0.1 m).
+const DEDUP_THRESHOLD: f64 = 0.000001;
+
+/// Returns true if the new position differs from the last sent position
+/// by more than [`DEDUP_THRESHOLD`] in either axis.
+fn position_changed(last: &Option<(f64, f64)>, lat: f64, lon: f64) -> bool {
+    match last {
+        None => true,
+        Some((prev_lat, prev_lon)) => {
+            (lat - prev_lat).abs() > DEDUP_THRESHOLD || (lon - prev_lon).abs() > DEDUP_THRESHOLD
+        }
+    }
+}
+
 fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGpsEvent>) {
     let listener = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
@@ -272,6 +324,7 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
 
         let _ = stream.set_read_timeout(Some(TCP_READ_TIMEOUT));
         let reader = BufReader::new(stream);
+        let mut last_sent: Option<(f64, f64)> = None;
         for line_result in reader.lines() {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -279,9 +332,12 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
             match line_result {
                 Ok(line) => {
                     if let Some((lat, lon)) = parse_nmea_location(&line)
-                        && tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err()
+                        && position_changed(&last_sent, lat, lon)
                     {
-                        return;
+                        last_sent = Some((lat, lon));
+                        if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(err)
@@ -330,6 +386,7 @@ fn nmea_serial_worker(
     )));
 
     let reader = BufReader::new(port);
+    let mut last_sent: Option<(f64, f64)> = None;
     for line_result in reader.lines() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -337,9 +394,12 @@ fn nmea_serial_worker(
         match line_result {
             Ok(line) => {
                 if let Some((lat, lon)) = parse_nmea_location(&line)
-                    && tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err()
+                    && position_changed(&last_sent, lat, lon)
                 {
-                    return;
+                    last_sent = Some((lat, lon));
+                    if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
+                        return;
+                    }
                 }
             }
             // A 2-second read timeout is normal on quiet Bluetooth links.
