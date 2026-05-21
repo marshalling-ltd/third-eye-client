@@ -23,6 +23,7 @@ const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
     nmea_gps_mode: "0",
     nmea_server_host: "",
     nmea_server_port: "11123",
+    nmea_stale_timeout: "10",
 };
 
 fn make_db_path(name: &str) -> PathBuf {
@@ -53,6 +54,7 @@ fn config_and_outbox_survive_reopen() {
             nmea_gps_mode: "0".into(),
             nmea_server_host: "".into(),
             nmea_server_port: "11123".into(),
+            nmea_stale_timeout: "10".into(),
         };
         store.config().save_client(&cfg).unwrap();
 

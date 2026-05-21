@@ -92,9 +92,6 @@ enum NmeaGpsEvent {
     Ended,
 }
 
-/// Duration after which a fix is considered stale (10 minutes).
-const FIX_STALE_MS: i64 = 600_000;
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -285,12 +282,12 @@ impl NmeaGpsState {
     }
 
     /// Returns `true` when the service is running and has received a fix
-    /// within the last 10 minutes.
+    /// within `stale_timeout_ms` milliseconds.
     #[must_use]
-    pub fn has_recent_fix(&self) -> bool {
+    pub fn has_recent_fix(&self, stale_timeout_ms: i64) -> bool {
         self.controller.is_some()
             && self.last_fix_at_ms > 0
-            && (now_ms() - self.last_fix_at_ms) < FIX_STALE_MS
+            && (now_ms() - self.last_fix_at_ms) < stale_timeout_ms
     }
 }
 

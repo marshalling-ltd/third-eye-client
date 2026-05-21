@@ -44,7 +44,7 @@ use map::{
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
-use third_eye_client::nmea::{DEFAULT_NMEA_GPS_PORT, NmeaGpsState};
+use third_eye_client::nmea::NmeaGpsState;
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -94,6 +94,7 @@ struct AppConfig {
     nmea_gps_mode: String,
     nmea_server_host: String,
     nmea_server_port: String,
+    nmea_stale_timeout: String,
 }
 
 impl Default for AppConfig {
@@ -106,10 +107,11 @@ impl Default for AppConfig {
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
             server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
             rov_network_interface: String::new(),
-            nmea_gps_port: DEFAULT_NMEA_GPS_PORT.to_string(),
+            nmea_gps_port: "11123".to_owned(),
             nmea_gps_mode: "0".to_owned(),
             nmea_server_host: String::new(),
-            nmea_server_port: DEFAULT_NMEA_GPS_PORT.to_string(),
+            nmea_server_port: "11123".to_owned(),
+            nmea_stale_timeout: "10".to_owned(),
         }
     }
 }
@@ -139,6 +141,7 @@ impl AppConfig {
             nmea_gps_mode: self.nmea_gps_mode.clone(),
             nmea_server_host: self.nmea_server_host.clone(),
             nmea_server_port: self.nmea_server_port.clone(),
+            nmea_stale_timeout: self.nmea_stale_timeout.clone(),
         }
     }
 
@@ -155,6 +158,7 @@ impl AppConfig {
             nmea_gps_mode: config.nmea_gps_mode,
             nmea_server_host: config.nmea_server_host,
             nmea_server_port: config.nmea_server_port,
+            nmea_stale_timeout: config.nmea_stale_timeout,
         }
     }
 
@@ -194,10 +198,11 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT,
         server_base_url: DEFAULT_SERVER_BASE_URL,
         rov_network_interface: "",
-        nmea_gps_port: NMEA_GPS_PORT_DEFAULT_STR,
+        nmea_gps_port: "11123",
         nmea_gps_mode: "0",
         nmea_server_host: "",
-        nmea_server_port: NMEA_GPS_PORT_DEFAULT_STR,
+        nmea_server_port: "11123",
+        nmea_stale_timeout: "10",
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -211,10 +216,6 @@ const _: () = {
     assert!(ROV_STATUS_UDP_PORT == 8500);
 };
 
-const NMEA_GPS_PORT_DEFAULT_STR: &str = "11123";
-const _: () = {
-    assert!(DEFAULT_NMEA_GPS_PORT == 11123);
-};
 
 fn parse_host_from_http_base(base: &str) -> Option<String> {
     let normalized = if base.contains("://") {
@@ -422,6 +423,7 @@ impl ThirdEyeState {
                 nmea_gps_mode: defaults.nmea_gps_mode.to_owned(),
                 nmea_server_host: defaults.nmea_server_host.to_owned(),
                 nmea_server_port: defaults.nmea_server_port.to_owned(),
+                nmea_stale_timeout: defaults.nmea_stale_timeout.to_owned(),
             }
         });
 
@@ -697,9 +699,11 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
     ui.set_nmea_server_host(state.config.nmea_server_host.clone().into());
     ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
+    ui.set_nmea_stale_timeout(state.config.nmea_stale_timeout.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
-    ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix());
+    let stale_ms = parse_stale_timeout_ms(&state.config.nmea_stale_timeout);
+    ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix(stale_ms));
     // Only populate the IP field if the user hasn't typed anything yet.
     if ui.get_nmea_local_ip().is_empty() {
         ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
@@ -888,6 +892,7 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.nmea_gps_mode = ui.get_nmea_gps_mode().to_string();
     state.config.nmea_server_host = ui.get_nmea_server_host().to_string();
     state.config.nmea_server_port = ui.get_nmea_server_port().to_string();
+    state.config.nmea_stale_timeout = ui.get_nmea_stale_timeout().to_string();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -911,6 +916,18 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
 /// internet (i.e. the adapter with the default gateway). Works cross-
 /// platform by connecting a UDP socket to a public IP — no data is sent,
 /// the OS just resolves which local address it would route through.
+/// Parses the stale-timeout config string (minutes) into milliseconds.
+/// Falls back to 10 minutes (600 000 ms) on invalid input.
+fn parse_stale_timeout_ms(value: &str) -> i64 {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|&v| v > 0.0)
+        .map(|mins| (mins * 60_000.0) as i64)
+        .unwrap_or(600_000)
+}
+
 fn detect_local_ip() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     // Connect to a well-known public IP. No packet is actually sent.
@@ -2440,22 +2457,6 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
-    let ui_weak = ui.as_weak();
-    let state_for_default_nmea_port = Rc::clone(&state);
-    let store_for_default_nmea_port = Rc::clone(&store);
-    ui.on_use_default_nmea_gps_port(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let mut state = match state_for_default_nmea_port.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        state.config.nmea_gps_port = DEFAULT_NMEA_GPS_PORT.to_string();
-        persist_config(&state, &store_for_default_nmea_port);
-        apply_state_to_ui(&ui, &state);
-    });
-
     // --- Media screen callbacks ---
 
     let ui_weak = ui.as_weak();
@@ -3437,7 +3438,8 @@ fn main() -> Result<()> {
             }
             ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
             ui.set_nmea_gps_running(state.nmea_gps.is_running());
-            ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix());
+            let stale_ms = parse_stale_timeout_ms(&state.config.nmea_stale_timeout);
+            ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix(stale_ms));
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
             if poll_media_events(&mut state, &poll_store) {
                 apply_state_to_ui(&ui, &state);
