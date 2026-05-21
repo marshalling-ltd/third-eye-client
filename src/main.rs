@@ -699,7 +699,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
     ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
     ui.set_nmea_gps_running(state.nmea_gps.is_running());
-    ui.set_nmea_has_fix(state.nmea_gps.fixes_received() > 0);
+    ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix());
     // Only populate the IP field if the user hasn't typed anything yet.
     if ui.get_nmea_local_ip().is_empty() {
         ui.set_nmea_local_ip(detect_local_ip().unwrap_or_default().into());
@@ -2370,11 +2370,16 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
 
-        // --- Auto mode (BT then TCP listen) ---
-
-        // Try Bluetooth first: look for BT SPP ports specifically.
-        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
-        if !bt_ports.is_empty() {
+        if mode == 2 {
+            // --- Bluetooth mode ---
+            let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
+            if bt_ports.is_empty() {
+                ui.set_nmea_gps_status(
+                    "No Bluetooth serial ports detected. Make sure the device is paired.".into(),
+                );
+                apply_state_to_ui(&ui, &state);
+                return;
+            }
             let port_path = &bt_ports[0];
             if bt_ports.len() > 1 {
                 state.nmea_gps.set_status(format!(
@@ -2396,7 +2401,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
 
-        // Fall back to TCP listen: use the IP from the UI field (user-editable).
+        // --- TCP Listen mode (mode == 0) ---
         let port = match state.config.parse_nmea_gps_port() {
             Ok(port) => port,
             Err(err) => {
@@ -3432,7 +3437,7 @@ fn main() -> Result<()> {
             }
             ui.set_nmea_gps_status(state.nmea_gps.status_text().to_owned().into());
             ui.set_nmea_gps_running(state.nmea_gps.is_running());
-            ui.set_nmea_has_fix(state.nmea_gps.fixes_received() > 0);
+            ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix());
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
             if poll_media_events(&mut state, &poll_store) {
                 apply_state_to_ui(&ui, &state);

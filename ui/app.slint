@@ -222,7 +222,7 @@ export component AppWindow inherits Window {
                     clicked => { root.navigate_media(); }
                 }
                 Button {
-                    text: "Phone GPS";
+                    text: "GPS (NMEA)";
                     clicked => { root.navigate_nmea(); }
                 }
                 Rectangle {
@@ -360,7 +360,7 @@ export component AppWindow inherits Window {
             }
             }
 
-            // Phone GPS (NMEA) screen
+            // GPS (NMEA) screen
             if root.active_screen == 4 : ScrollView {
                 viewport-width: self.visible-width;
 
@@ -372,11 +372,11 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     vertical-stretch: 0;
                     Text {
-                        text: "Phone GPS (NMEA)";
+                        text: "GPS (NMEA)";
                         font-size: 24px;
                     }
                     Text {
-                        text: "Receive NMEA GPS data from a phone app via Bluetooth, TCP listen, or by connecting to the phone's NMEA server.";
+                        text: "Receive NMEA GPS data from a phone app via Bluetooth, TCP listen, or by connecting to the NMEA server.";
                         wrap: word-wrap;
                     }
 
@@ -392,7 +392,7 @@ export component AppWindow inherits Window {
                             border-color: root.nmea_gps_mode == 0 ? #0a84ff : #3f4148;
                             background: root.nmea_gps_mode == 0 ? #0a84ff18 : #1a1c22;
                             Text {
-                                text: "Auto (BT / TCP Listen)";
+                                text: "TCP Listen";
                                 font-size: 13px;
                                 color: root.nmea_gps_mode == 0 ? #ffffff : #8f96a3;
                                 horizontal-alignment: center;
@@ -410,7 +410,7 @@ export component AppWindow inherits Window {
                             border-color: root.nmea_gps_mode == 1 ? #0a84ff : #3f4148;
                             background: root.nmea_gps_mode == 1 ? #0a84ff18 : #1a1c22;
                             Text {
-                                text: "Connect to Server";
+                                text: "Connect to TCP Server";
                                 font-size: 13px;
                                 color: root.nmea_gps_mode == 1 ? #ffffff : #8f96a3;
                                 horizontal-alignment: center;
@@ -420,21 +420,34 @@ export component AppWindow inherits Window {
                                 clicked => { root.set_nmea_gps_mode(1); }
                             }
                         }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 6px;
+                            border-width: root.nmea_gps_mode == 2 ? 2px : 1px;
+                            border-color: root.nmea_gps_mode == 2 ? #0a84ff : #3f4148;
+                            background: root.nmea_gps_mode == 2 ? #0a84ff18 : #1a1c22;
+                            Text {
+                                text: "Bluetooth";
+                                font-size: 13px;
+                                color: root.nmea_gps_mode == 2 ? #ffffff : #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.set_nmea_gps_mode(2); }
+                            }
+                        }
                     }
 
-                    // --- Auto mode fields ---
+                    // --- TCP Listen mode fields ---
                     if root.nmea_gps_mode == 0 : VerticalBox {
                         spacing: 8px;
                         Text {
-                            text: "Auto-detects Bluetooth serial or TCP. If a paired Bluetooth GPS port is found it is used automatically; otherwise a TCP listener is started. Apps: GPS2IP, GPSd Forwarder, Bluetooth GPS, GPS Share.";
+                            text: "The laptop listens for incoming NMEA connections from a phone GPS app (e.g. GPS2IP, GPSd Forwarder). Configure the app to connect to the address and port shown below.";
                             wrap: word-wrap;
                             color: #8f96a3;
                             font-size: 12px;
-                        }
-                        if root.nmea_serial_ports != "" : Text {
-                            text: "Bluetooth ports: " + root.nmea_serial_ports;
-                            wrap: word-wrap;
-                            color: #8f96a3;
                         }
                         Text { text: "TCP listen address (auto-detected, editable):"; }
                         LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
@@ -450,7 +463,7 @@ export component AppWindow inherits Window {
                     if root.nmea_gps_mode == 1 : VerticalBox {
                         spacing: 8px;
                         Text {
-                            text: "Connect to a phone running an NMEA server app (e.g. GPS Forwarder, ShareGPS). The laptop connects as a TCP client to the phone's IP and port.";
+                            text: "Connect to a device running an NMEA server app (e.g. Android app like GPS Tether Server, ShareGPS). The laptop connects as a TCP client to the phone's IP and port.";
                             wrap: word-wrap;
                             color: #8f96a3;
                             font-size: 12px;
@@ -458,7 +471,28 @@ export component AppWindow inherits Window {
                         Text { text: "Phone server IP address:"; }
                         LineEdit { text <=> root.nmea_server_host; placeholder-text: "e.g. 192.168.43.1"; }
                         Text { text: "Phone server port:"; }
-                        LineEdit { text <=> root.nmea_server_port; placeholder-text: "e.g. 11123"; }
+                        LineEdit { text <=> root.nmea_server_port; placeholder-text: "e.g. 8080"; }
+                    }
+
+                    // --- Bluetooth mode fields ---
+                    if root.nmea_gps_mode == 2 : VerticalBox {
+                        spacing: 8px;
+                        Text {
+                            text: "Connects to a paired Bluetooth GPS device via serial port (SPP). The phone must be paired and its virtual COM / serial port must be visible to the OS.";
+                            wrap: word-wrap;
+                            color: #8f96a3;
+                            font-size: 12px;
+                        }
+                        if root.nmea_serial_ports != "" : Text {
+                            text: "Detected Bluetooth ports: " + root.nmea_serial_ports;
+                            wrap: word-wrap;
+                        }
+                        if root.nmea_serial_ports == "" : Text {
+                            text: "No Bluetooth serial ports detected. Make sure the device is paired.";
+                            wrap: word-wrap;
+                            color: #ff6666;
+                            font-size: 12px;
+                        }
                     }
 
                     // --- Start / Stop ---
