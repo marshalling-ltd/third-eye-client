@@ -23,6 +23,7 @@ pub mod keys {
     pub const NMEA_GPS_MODE: &str = "client.nmea_gps_mode";
     pub const NMEA_SERVER_HOST: &str = "client.nmea_server_host";
     pub const NMEA_SERVER_PORT: &str = "client.nmea_server_port";
+    pub const NMEA_STALE_TIMEOUT: &str = "client.nmea_stale_timeout";
 }
 
 /// Persisted configuration accessor.
@@ -92,6 +93,7 @@ impl ConfigStore {
             nmea_gps_mode: self.get_or(keys::NMEA_GPS_MODE, defaults.nmea_gps_mode)?,
             nmea_server_host: self.get_or(keys::NMEA_SERVER_HOST, defaults.nmea_server_host)?,
             nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
+            nmea_stale_timeout: self.get_or(keys::NMEA_STALE_TIMEOUT, defaults.nmea_stale_timeout)?,
         })
     }
 
@@ -117,6 +119,7 @@ impl ConfigStore {
             (keys::NMEA_GPS_MODE, config.nmea_gps_mode.as_str()),
             (keys::NMEA_SERVER_HOST, config.nmea_server_host.as_str()),
             (keys::NMEA_SERVER_PORT, config.nmea_server_port.as_str()),
+            (keys::NMEA_STALE_TIMEOUT, config.nmea_stale_timeout.as_str()),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -150,6 +153,8 @@ pub struct ClientConfig {
     pub nmea_server_host: String,
     /// Phone server port (used when mode = 1, TCP client). Default `"11123"`.
     pub nmea_server_port: String,
+    /// Stale fix timeout in minutes. Default `"10"`.
+    pub nmea_stale_timeout: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -166,6 +171,7 @@ pub struct ClientConfigDefaults<'a> {
     pub nmea_gps_mode: &'a str,
     pub nmea_server_host: &'a str,
     pub nmea_server_port: &'a str,
+    pub nmea_stale_timeout: &'a str,
 }
 
 #[cfg(test)]
@@ -185,6 +191,7 @@ mod tests {
         nmea_gps_mode: "0",
         nmea_server_host: "",
         nmea_server_port: "11123",
+        nmea_stale_timeout: "10",
     };
 
     #[test]
@@ -225,6 +232,7 @@ mod tests {
             nmea_gps_mode: "1".into(),
             nmea_server_host: "192.168.1.50".into(),
             nmea_server_port: "4352".into(),
+            nmea_stale_timeout: "5".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();
