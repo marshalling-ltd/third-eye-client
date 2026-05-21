@@ -92,6 +92,15 @@ enum NmeaGpsEvent {
     Ended,
 }
 
+/// Duration after which a fix is considered stale (10 minutes).
+const FIX_STALE_MS: i64 = 600_000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 #[derive(Default)]
 pub struct NmeaGpsState {
     event_rx: Option<Receiver<NmeaGpsEvent>>,
@@ -99,6 +108,8 @@ pub struct NmeaGpsState {
     latest_fix: Option<(f64, f64)>,
     status: String,
     fixes_received: u64,
+    /// Unix-ms timestamp of the most recent Fix event.
+    last_fix_at_ms: i64,
 }
 
 impl NmeaGpsState {
@@ -126,6 +137,7 @@ impl NmeaGpsState {
         });
         self.latest_fix = None;
         self.fixes_received = 0;
+        self.last_fix_at_ms = 0;
         self.status = format!("Connecting to Bluetooth GPS on {port_path}...");
         Ok(self.status.clone())
     }
@@ -155,6 +167,7 @@ impl NmeaGpsState {
         });
         self.latest_fix = None;
         self.fixes_received = 0;
+        self.last_fix_at_ms = 0;
         self.status = format!("Connecting to phone GPS server at {addr}...");
         Ok(self.status.clone())
     }
@@ -184,6 +197,7 @@ impl NmeaGpsState {
         });
         self.latest_fix = None;
         self.fixes_received = 0;
+        self.last_fix_at_ms = 0;
         self.status = format!("Listening for phone GPS on {bind_addr}...");
 
         Ok(self.status.clone())
@@ -195,6 +209,8 @@ impl NmeaGpsState {
             self.status = "NMEA GPS listener stopped.".to_owned();
         }
         self.event_rx = None;
+        self.fixes_received = 0;
+        self.last_fix_at_ms = 0;
     }
 
     #[must_use]
@@ -212,6 +228,7 @@ impl NmeaGpsState {
                     Ok(NmeaGpsEvent::Fix { lat, lon }) => {
                         self.latest_fix = Some((lat, lon));
                         self.fixes_received = self.fixes_received.saturating_add(1);
+                        self.last_fix_at_ms = now_ms();
                         self.status = format!(
                             "NMEA GPS fix: {lat:.6}, {lon:.6} ({} fixes)",
                             self.fixes_received
@@ -265,6 +282,15 @@ impl NmeaGpsState {
     #[must_use]
     pub fn fixes_received(&self) -> u64 {
         self.fixes_received
+    }
+
+    /// Returns `true` when the service is running and has received a fix
+    /// within the last 10 minutes.
+    #[must_use]
+    pub fn has_recent_fix(&self) -> bool {
+        self.controller.is_some()
+            && self.last_fix_at_ms > 0
+            && (now_ms() - self.last_fix_at_ms) < FIX_STALE_MS
     }
 }
 
