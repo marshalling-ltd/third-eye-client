@@ -203,7 +203,7 @@ impl NmeaGpsState {
     pub fn stop(&mut self) {
         if let Some(mut controller) = self.controller.take() {
             controller.stop();
-            self.status = "NMEA GPS listener stopped.".to_owned();
+            self.status = "NMEA GPS listener stopped.".to_string();
         }
         self.event_rx = None;
         self.fixes_received = 0;
@@ -232,21 +232,14 @@ impl NmeaGpsState {
                         );
                         got_fix = true;
                     }
-                    Ok(NmeaGpsEvent::Status(text)) => {
+                    Ok(NmeaGpsEvent::Status(text) | NmeaGpsEvent::Error(text)) => {
                         self.status = text;
                     }
-                    Ok(NmeaGpsEvent::Error(text)) => {
-                        self.status = text;
-                    }
-                    Ok(NmeaGpsEvent::Ended) => {
+                    Ok(NmeaGpsEvent::Ended) | Err(TryRecvError::Disconnected) => {
                         disconnected = true;
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
                 }
             }
         }
@@ -254,7 +247,7 @@ impl NmeaGpsState {
             self.controller = None;
             self.event_rx = None;
             if self.status.trim().is_empty() {
-                self.status = "NMEA GPS connection ended.".to_owned();
+                self.status = "NMEA GPS connection ended.".to_string();
             }
         }
         got_fix
@@ -322,11 +315,11 @@ impl Drop for NmeaGpsController {
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum change in degrees before we send a new Fix event (~0.1 m).
-const DEDUP_THRESHOLD: f64 = 0.000001;
+const DEDUP_THRESHOLD: f64 = 0.000_001;
 
 /// Returns true if the new position differs from the last sent position
 /// by more than [`DEDUP_THRESHOLD`] in either axis.
-fn position_changed(last: &Option<(f64, f64)>, lat: f64, lon: f64) -> bool {
+fn position_changed(last: Option<&(f64, f64)>, lat: f64, lon: f64) -> bool {
     match last {
         None => true,
         Some((prev_lat, prev_lon)) => {
@@ -386,7 +379,7 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
             match line_result {
                 Ok(line) => {
                     if let Some((lat, lon)) = parse_nmea_location(&line)
-                        && position_changed(&last_sent, lat, lon)
+                        && position_changed(last_sent.as_ref(), lat, lon)
                     {
                         last_sent = Some((lat, lon));
                         if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
@@ -460,7 +453,7 @@ fn nmea_tcp_client_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<
             match line_result {
                 Ok(line) => {
                     if let Some((lat, lon)) = parse_nmea_location(&line)
-                        && position_changed(&last_sent, lat, lon)
+                        && position_changed(last_sent.as_ref(), lat, lon)
                     {
                         last_sent = Some((lat, lon));
                         if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
@@ -522,7 +515,7 @@ fn nmea_serial_worker(
         match line_result {
             Ok(line) => {
                 if let Some((lat, lon)) = parse_nmea_location(&line)
-                    && position_changed(&last_sent, lat, lon)
+                    && position_changed(last_sent.as_ref(), lat, lon)
                 {
                     last_sent = Some((lat, lon));
                     if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {

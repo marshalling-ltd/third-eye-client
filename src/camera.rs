@@ -1,8 +1,8 @@
-use std::fmt::Write;
 use anyhow::{Context, Result};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 
 /// Photo format accepted by the camera's `/v1/capture` endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -556,7 +556,7 @@ fn check_lamp_status<T>(op: &str, envelope: &LampEnvelope<T>) -> Result<()> {
         return Ok(());
     }
     let msg = if envelope.msg.is_empty() {
-        "<no msg>".to_owned()
+        "<no msg>".to_string()
     } else {
         envelope.msg.clone()
     };
@@ -625,7 +625,7 @@ mod tests {
             ]
         }"#;
         let parsed: CaptureResponse = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed.status, Some(4325377));
+        assert_eq!(parsed.status, Some(4_325_377));
         let errors = parsed.errors.expect("errors present");
         assert_eq!(errors.len(), 2);
         assert_eq!(
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn build_url_encodes_filename_segments() {
-        let client = CameraApiClient::new("http://192.168.1.88".to_owned());
+        let client = CameraApiClient::new("http://192.168.1.88".to_string());
         let url = client
             .build_url(&["v1", "medias", "a b/c.mp4", "download"])
             .unwrap();
@@ -752,7 +752,7 @@ mod tests {
     fn check_lamp_status_errors_on_non_zero() {
         let envelope = LampEnvelope::<serde_json::Value> {
             status: 1234,
-            msg: "boom".to_owned(),
+            msg: "boom".to_string(),
             data: None,
         };
         let err = check_lamp_status("set lamp brightness", &envelope).unwrap_err();

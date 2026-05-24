@@ -52,7 +52,7 @@ fn config_and_outbox_survive_reopen() {
             rov_network_interface: "en10".into(),
             nmea_gps_port: "11123".into(),
             nmea_gps_mode: "0".into(),
-            nmea_server_host: "".into(),
+            nmea_server_host: String::new(),
             nmea_server_port: "11123".into(),
             nmea_stale_timeout: "10".into(),
         };

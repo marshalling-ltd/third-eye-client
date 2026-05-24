@@ -43,6 +43,7 @@ struct Battery {
     remaining_pct: u8,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Serialize)]
 struct Imu {
     #[serde(rename = "gx")]
@@ -149,8 +150,13 @@ fn build_test_status(elapsed: Duration, seq: u64) -> Status {
     let roll = 0.35 * (t * 0.9).cos();
     let yaw = (t * 0.5).sin();
     let depth = 8.0 + (t * 0.4).sin() * 1.8;
+
+    #[allow(clippy::cast_possible_truncation)]
     let lat = 451_234_567 + ((t * 8.0).sin() * 8_000.0) as i32;
+
+    #[allow(clippy::cast_possible_truncation)]
     let lon = 161_234_567 + ((t * 7.0).cos() * 8_000.0) as i32;
+
     let temperature = 23.0 + (t * 0.2).sin() * 2.0;
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -181,8 +187,11 @@ fn build_test_status(elapsed: Duration, seq: u64) -> Status {
             },
         ],
         imu: Imu {
+            #[allow(clippy::cast_possible_truncation)]
             gyro_x: (pitch * 100.0) as i16,
+            #[allow(clippy::cast_possible_truncation)]
             gyro_y: (roll * 100.0) as i16,
+            #[allow(clippy::cast_possible_truncation)]
             gyro_z: (yaw * 100.0) as i16,
         },
     }

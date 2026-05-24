@@ -21,6 +21,7 @@
 mod map;
 
 use std::cell::RefCell;
+use std::fmt::Write;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -107,11 +108,11 @@ impl Default for AppConfig {
             osm_tile_user_agent: DEFAULT_OSM_TILE_USER_AGENT.to_owned(),
             server_base_url: DEFAULT_SERVER_BASE_URL.to_owned(),
             rov_network_interface: String::new(),
-            nmea_gps_port: "11123".to_owned(),
-            nmea_gps_mode: "0".to_owned(),
+            nmea_gps_port: "11123".to_string(),
+            nmea_gps_mode: "0".to_string(),
             nmea_server_host: String::new(),
-            nmea_server_port: "11123".to_owned(),
-            nmea_stale_timeout: "10".to_owned(),
+            nmea_server_port: "11123".to_string(),
+            nmea_stale_timeout: "10".to_string(),
         }
     }
 }
@@ -215,7 +216,6 @@ const _: () = {
     // constant ever changes, this will prevent a silent drift.
     assert!(ROV_STATUS_UDP_PORT == 8500);
 };
-
 
 fn parse_host_from_http_base(base: &str) -> Option<String> {
     let normalized = if base.contains("://") {
@@ -326,15 +326,11 @@ impl MediaUiState {
                         self.media_stream_frames = self.media_stream_frames.saturating_add(1);
                     }
                     Ok(StreamEvent::Status(_) | StreamEvent::Error(_)) => {}
-                    Ok(StreamEvent::Ended) => {
+                    Ok(StreamEvent::Ended) | Err(TryRecvError::Disconnected) => {
                         disconnected = true;
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
                 }
             }
         }
@@ -432,11 +428,11 @@ impl ThirdEyeState {
             Ok(Some(session)) => {
                 auth.is_signed_in = true;
                 auth.signed_in_as = session.email.unwrap_or_default();
-                auth.email = auth.signed_in_as.clone();
-                auth.status_text = "Signed in. Session restored from storage.".to_owned();
+                auth.email.clone_from(&auth.signed_in_as);
+                auth.status_text = "Signed in. Session restored from storage.".to_string();
             }
             Ok(None) => {
-                auth.status_text = "Not signed in. Enter credentials to authenticate.".to_owned();
+                auth.status_text = "Not signed in. Enter credentials to authenticate.".to_string();
             }
             Err(err) => {
                 auth.status_text = format!("Failed to read auth session: {err:#}");
@@ -451,7 +447,8 @@ impl ThirdEyeState {
                 media.rows = rows;
                 if media.rows.is_empty() {
                     media.status_text =
-                        "No media recorded yet. Click \"Refresh from ROV\" to populate.".to_owned();
+                        "No media recorded yet. Click \"Refresh from ROV\" to populate."
+                            .to_string();
                 } else {
                     media.status_text =
                         format!("{} media record(s) in local library.", media.rows.len());
@@ -495,7 +492,7 @@ impl ThirdEyeState {
                 self.map.status = success_status;
             }
             _ => {
-                self.map.status = "No location set. Use Detect location first.".to_owned();
+                self.map.status = "No location set. Use Detect location first.".to_string();
             }
         }
     }
@@ -507,13 +504,13 @@ impl ThirdEyeState {
         // "Detect Location" to get a fresh fix — that call is explicit
         // and the user expects it to take a moment.
         if self.map.lat.is_some() && self.map.lon.is_some() {
-            self.load_map_tile_for_current_location("Centered on last known location.".to_owned());
+            self.load_map_tile_for_current_location("Centered on last known location.".to_string());
         } else {
             // No location yet — load tiles at the current viewport
             // so at least the map renders, and prompt the user.
             self.request_visible_map_tiles();
             self.map.status =
-                "No location set. Use Detect location button to find your position.".to_owned();
+                "No location set. Use Detect location button to find your position.".to_string();
         }
     }
 
@@ -605,7 +602,7 @@ impl StreamState {
     fn stop(&mut self) {
         if let Some(mut controller) = self.controller.take() {
             controller.stop();
-            self.status = "Stream stopped.".to_owned();
+            self.status = "Stream stopped.".to_string();
         }
         self.event_rx = None;
     }
@@ -621,17 +618,14 @@ impl StreamState {
                         latest_frame = Some(frame);
                         self.frames_received = self.frames_received.saturating_add(1);
                     }
-                    Ok(StreamEvent::Status(text)) => {
-                        self.status = text;
-                    }
-                    Ok(StreamEvent::Error(text)) => {
+                    Ok(StreamEvent::Status(text) | StreamEvent::Error(text)) => {
                         self.status = text;
                     }
                     Ok(StreamEvent::Ended) => {
                         if self.status.trim().is_empty()
                             || self.status == "Streaming started. Waiting for frames..."
                         {
-                            self.status = "Stream ended.".to_owned();
+                            self.status = "Stream ended.".to_string();
                         }
                         disconnected = true;
                         break;
@@ -724,7 +718,7 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_zoom_text(state.map.zoom.to_string().into());
     let lat_lon = match (state.map.lat, state.map.lon) {
         (Some(lat), Some(lon)) => format!("{lat:.6}, {lon:.6}"),
-        _ => "n/a".to_owned(),
+        _ => "n/a".to_string(),
     };
     ui.set_lat_lon_text(lat_lon.into());
     let pin_short = match (state.map.lat, state.map.lon) {
@@ -817,9 +811,9 @@ fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
             .into(),
         );
         let batteries_text = if status.batteries.is_empty() {
-            "Batteries: no battery data in payload.".to_owned()
+            "Batteries: no battery data in payload.".to_string()
         } else {
-            let mut lines = vec!["Batteries:".to_owned()];
+            let mut lines = vec!["Batteries:".to_string()];
             for battery in &status.batteries {
                 lines.push(format!(
                     "ID {}: {} mV, {} (10mA), {}%",
@@ -849,14 +843,14 @@ fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
             if state.location_detected_at_ms > 0 && location_age_ms < 600_000 {
                 format!("{lat:.4}, {lon:.4}")
             } else {
-                "stale".to_owned()
+                "stale".to_string()
             }
         } else {
-            "\u{2014}".to_owned()
+            "\u{2014}".to_string()
         };
         ui.set_rov_coords_short(pos_text.into());
         let battery_short = if status.batteries.is_empty() {
-            "\u{2014}".to_owned()
+            "\u{2014}".to_string()
         } else {
             status
                 .batteries
@@ -924,8 +918,7 @@ fn parse_stale_timeout_ms(value: &str) -> i64 {
         .parse::<f64>()
         .ok()
         .filter(|&v| v > 0.0)
-        .map(|mins| (mins * 60_000.0) as i64)
-        .unwrap_or(600_000)
+        .map_or(600_000, |mins| (mins * 60_000.0) as i64)
 }
 
 fn detect_local_ip() -> Option<String> {
@@ -974,12 +967,12 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
     state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
     let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base) else {
         state.config.rov_network_interface.clear();
-        state.rov_info = "Could not extract host from ROV HTTP API URL.".to_owned();
+        state.rov_info = "Could not extract host from ROV HTTP API URL.".to_string();
         return;
     };
 
     if let Some(interface) = detect_rov_interface(&rov_host) {
-        state.config.rov_network_interface = interface.clone();
+        state.config.rov_network_interface.clone_from(&interface);
         let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
         if setup_external_route {
             match ensure_rov_external_route(&state.config.rov_http_base, &interface) {
@@ -987,7 +980,7 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
                     summary.push_str(" External stream route is ready.");
                 }
                 Err(err) => {
-                    summary.push_str(&format!(" External stream route is not ready yet: {err:#}"));
+                    let _ = write!(summary, " External stream route is not ready yet: {err:#}");
                 }
             }
         }
@@ -1026,7 +1019,7 @@ fn format_relative_age(ts_ms: i64) -> String {
     let now = current_unix_ms();
     let diff_secs = ((now - ts_ms).max(0) / 1000) as u64;
     if diff_secs < 10 {
-        "just now".to_owned()
+        "just now".to_string()
     } else if diff_secs < 60 {
         format!("{diff_secs}s ago")
     } else if diff_secs < 3600 {
@@ -1108,7 +1101,7 @@ fn build_details_text(record: &LocalMediaRecord) -> String {
         format_relative_age(record.last_seen_ms)
     ));
     if record.deleted_on_rov {
-        lines.push("Flagged as deleted on the ROV since last refresh.".to_owned());
+        lines.push("Flagged as deleted on the ROV since last refresh.".to_string());
     }
     if let Some(hash) = &record.local_sha256 {
         lines.push(format!("Local SHA-256: {hash}"));
@@ -1492,10 +1485,11 @@ fn attach_capture_metadata_to_latest(
     media_store.attach_capture_metadata(&media_id, &name, captured_at_ms, status, None)?;
     let mut line = format!("Attached capture metadata to {name}.");
     if let Some(status) = status {
-        line.push_str(&format!(
+        let _ = write!(
+            line,
             " depth {:.2} m, yaw {:.2} rad, lat_e7={}, lon_e7={}",
             status.depth, status.yaw, status.lat, status.lon
-        ));
+        );
     } else {
         line.push_str(" (no ROV telemetry snapshot was available - start the UDP listener to capture depth/yaw/coords)");
     }
@@ -1510,9 +1504,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_configuration.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_configuration.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_configuration);
         if state.last_screen == Screen::Stream {
@@ -1531,9 +1524,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_nmea_nav.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_nmea_nav.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_nmea_nav);
         if state.last_screen == Screen::Stream {
@@ -1560,9 +1552,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let mut state = match state_for_map_flicked.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            let Ok(mut state) = state_for_map_flicked.try_borrow_mut() else {
+                return;
             };
             if state.suppress_next_map_flick {
                 state.suppress_next_map_flick = false;
@@ -1582,9 +1573,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let mut state = match state_for_map_zoom_in.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            let Ok(mut state) = state_for_map_zoom_in.try_borrow_mut() else {
+                return;
             };
             state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
             state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
@@ -1605,9 +1595,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let mut state = match state_for_map_zoom_out.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            let Ok(mut state) = state_for_map_zoom_out.try_borrow_mut() else {
+                return;
             };
             state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
             state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
@@ -1628,9 +1617,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let mut state = match state_for_map_center_on_pin.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            let Ok(mut state) = state_for_map_center_on_pin.try_borrow_mut() else {
+                return;
             };
             state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
             state.map_tiles.fallback_zoom = None;
@@ -1638,12 +1626,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             // Non-blocking: try NMEA GPS, then CoreLocation cached fix.
             // Never call the blocking detect_location() from an event handler.
             let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
-                Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
+                Some((lat, lon, "Phone GPS (NMEA/TCP)".to_string()))
             } else {
                 #[cfg(target_os = "macos")]
                 {
                     check_corelocation_warmup_fix(&state.map)
-                        .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned()))
+                        .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_string()))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -1659,11 +1647,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 ));
             } else if state.map.lat.is_some() && state.map.lon.is_some() {
                 state.load_map_tile_for_current_location(
-                    "Centered on last known location.".to_owned(),
+                    "Centered on last known location.".to_string(),
                 );
             } else {
                 state.map.status =
-                    "No location available. Use Detect Location button first.".to_owned();
+                    "No location available. Use Detect Location button first.".to_string();
             }
             let (target_vp_x, target_vp_y, _, _) =
                 state.map_tiles.viewport_for_slint(state.map.zoom);
@@ -1689,9 +1677,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_map_navigation.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_map_navigation.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_map_navigation);
         if state.last_screen == Screen::Stream {
@@ -1716,9 +1703,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stream_navigation.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stream_navigation.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_stream_navigation);
 
@@ -1799,11 +1785,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_test_rtsp.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_test_rtsp.try_borrow_mut() else {
+            return;
         };
-        state.config.rtsp_url = DEFAULT_TEST_RTSP.to_owned();
+        DEFAULT_TEST_RTSP.clone_into(&mut state.config.rtsp_url);
         persist_config(&state, &store_for_default_test_rtsp);
         apply_state_to_ui(&ui, &state);
     });
@@ -1815,11 +1800,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_rov_rtsp.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_rov_rtsp.try_borrow_mut() else {
+            return;
         };
-        state.config.rtsp_url = DEFAULT_ROV_RTSP.to_owned();
+        DEFAULT_ROV_RTSP.clone_into(&mut state.config.rtsp_url);
         persist_config(&state, &store_for_default_rov_rtsp);
         apply_state_to_ui(&ui, &state);
     });
@@ -1831,11 +1815,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_rov_http.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_rov_http.try_borrow_mut() else {
+            return;
         };
-        state.config.rov_http_base = DEFAULT_ROV_HTTP_BASE.to_owned();
+        DEFAULT_ROV_HTTP_BASE.clone_into(&mut state.config.rov_http_base);
         state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
         persist_config(&state, &store_for_default_rov_http);
         apply_state_to_ui(&ui, &state);
@@ -1848,9 +1831,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_use_host_from_base.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_use_host_from_base.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_use_host_from_base);
         state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
@@ -1865,9 +1847,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_rov_udp_port.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_rov_udp_port.try_borrow_mut() else {
+            return;
         };
         state.config.rov_status_udp_port = ROV_STATUS_UDP_PORT.to_string();
         persist_config(&state, &store_for_default_rov_udp_port);
@@ -1881,11 +1862,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_osm_ua.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_osm_ua.try_borrow_mut() else {
+            return;
         };
-        state.config.osm_tile_user_agent = DEFAULT_OSM_TILE_USER_AGENT.to_owned();
+        DEFAULT_OSM_TILE_USER_AGENT.clone_into(&mut state.config.osm_tile_user_agent);
         persist_config(&state, &store_for_default_osm_ua);
         apply_state_to_ui(&ui, &state);
     });
@@ -1897,9 +1877,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_recalibrate.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_recalibrate.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_recalibrate);
         refresh_rov_network(&mut state, true);
@@ -1914,11 +1893,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_default_server_url.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_default_server_url.try_borrow_mut() else {
+            return;
         };
-        state.config.server_base_url = DEFAULT_SERVER_BASE_URL.to_owned();
+        DEFAULT_SERVER_BASE_URL.clone_into(&mut state.config.server_base_url);
         persist_config(&state, &store_for_default_server_url);
         apply_state_to_ui(&ui, &state);
     });
@@ -1930,9 +1908,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_list_medias.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_list_medias.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_list_medias);
         let client = CameraApiClient::new_bound(
@@ -1941,12 +1918,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         );
         let media_store = store_for_list_medias.media().clone();
         let tx = state.media.event_tx.clone();
-        state.rov_info = "Listing media on ROV...".to_owned();
+        state.rov_info = "Listing media on ROV...".to_string();
         thread::spawn(move || {
             let rov_info = match client.list_medias(None::<MediaScene>) {
                 Ok(items) => {
                     let rendered = if items.is_empty() {
-                        "No media files on camera.".to_owned()
+                        "No media files on camera.".to_string()
                     } else {
                         let mut lines = vec![format!("Media files ({}):", items.len())];
                         for item in &items {
@@ -1983,9 +1960,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_capture.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_capture.try_borrow_mut() else {
+            return;
         };
         if state.media.capture_in_progress {
             return;
@@ -2038,9 +2014,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let media_store = store_for_capture.media().clone();
         let tx = state.media.event_tx.clone();
         state.media.capture_in_progress = true;
-        state.rov_info = "Capturing photo...".to_owned();
+        state.rov_info = "Capturing photo...".to_string();
         if state.active_screen == Screen::Stream {
-            state.stream.status = "Capturing photo...".to_owned();
+            state.stream.status = "Capturing photo...".to_string();
         }
         thread::spawn(move || {
             match client.capture(PhotoFormat::Jpeg, 1) {
@@ -2082,16 +2058,15 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_sign_in.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_sign_in.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_sign_in);
         let email = state.auth.email.trim().to_owned();
         let password = state.auth.password.clone();
         let server_base = state.config.server_base_url.trim().to_owned();
         if email.is_empty() || password.is_empty() {
-            state.auth.status_text = "Email and password are required to sign in.".to_owned();
+            state.auth.status_text = "Email and password are required to sign in.".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         }
@@ -2101,11 +2076,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         {
             Ok(outcome) => {
                 state.auth.is_signed_in = true;
-                state.auth.signed_in_as = outcome.email.clone();
+                state.auth.signed_in_as.clone_from(&outcome.email);
                 // The "Signed in as <email>" line is rendered from
                 // `auth_signed_in_as`; keep the status line complementary so
                 // the UI doesn't print the email twice.
-                state.auth.status_text = "Signed in successfully.".to_owned();
+                state.auth.status_text = "Signed in successfully.".to_string();
                 // Do NOT keep the plaintext password in the state or UI.
                 state.auth.password.clear();
             }
@@ -2124,9 +2099,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_sign_out.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_sign_out.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_sign_out);
         let server_base = state.config.server_base_url.trim().to_owned();
@@ -2134,7 +2108,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Ok(()) => {
                 state.auth.is_signed_in = false;
                 state.auth.signed_in_as.clear();
-                state.auth.status_text = "Signed out.".to_owned();
+                state.auth.status_text = "Signed out.".to_string();
             }
             Err(err) => {
                 // Local session is cleared inside `logout` even on error.
@@ -2153,9 +2127,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_detect_location.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_detect_location.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_detect_location);
         state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
@@ -2165,12 +2138,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         #[cfg(target_os = "macos")]
         prime_corelocation_at_startup(&mut state.map);
         let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
-            Some((lat, lon, "Phone GPS (NMEA/TCP)".to_owned()))
+            Some((lat, lon, "Phone GPS (NMEA/TCP)".to_string()))
         } else {
             #[cfg(target_os = "macos")]
             {
                 check_corelocation_warmup_fix(&state.map)
-                    .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_owned()))
+                    .map(|(lat, lon)| (lat, lon, "macOS CoreLocation (native)".to_string()))
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -2189,7 +2162,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             // resumes polling and will apply the fix as soon as it arrives.
             state.location_detected_at_ms = 0;
             state.map.status =
-                "Detecting location in background. The map will update automatically.".to_owned();
+                "Detecting location in background. The map will update automatically.".to_string();
         }
         apply_state_to_ui(&ui, &state);
     });
@@ -2201,14 +2174,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_load_map_tile.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_load_map_tile.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_load_map_tile);
         state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
         state.load_map_tile_for_current_location(
-            "Loaded OpenStreetMap tile for detected location.".to_owned(),
+            "Loaded OpenStreetMap tile for detected location.".to_string(),
         );
         apply_state_to_ui(&ui, &state);
     });
@@ -2219,9 +2191,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_open_map.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_open_map.try_borrow_mut() else {
+            return;
         };
         state.map.status = match (state.map.lat, state.map.lon) {
             (Some(lat), Some(lon)) => {
@@ -2230,11 +2201,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     state.map.zoom
                 );
                 match webbrowser::open(&url) {
-                    Ok(()) => "Opened map in browser.".to_owned(),
+                    Ok(()) => "Opened map in browser.".to_string(),
                     Err(err) => format!("Failed to open browser map: {err:#}"),
                 }
             }
-            _ => "No location set. Use Detect location first.".to_owned(),
+            _ => "No location set. Use Detect location first.".to_string(),
         };
         apply_state_to_ui(&ui, &state);
     });
@@ -2246,9 +2217,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_start_stream.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_start_stream.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_stream);
         state.stream.stop();
@@ -2273,9 +2243,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stop_stream.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stop_stream.try_borrow_mut() else {
+            return;
         };
         state.stream.stop();
         ui.set_has_stream_image(false);
@@ -2289,9 +2258,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_start_rov_listener.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_start_rov_listener.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_rov_listener);
         state.rov_status.stop();
@@ -2321,9 +2289,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stop_rov_listener.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stop_rov_listener.try_borrow_mut() else {
+            return;
         };
         state.rov_status.stop();
         apply_state_to_ui(&ui, &state);
@@ -2338,9 +2305,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_set_nmea_mode.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_set_nmea_mode.try_borrow_mut() else {
+            return;
         };
         state.config.nmea_gps_mode = mode.to_string();
         persist_config(&state, &store_for_set_nmea_mode);
@@ -2354,9 +2320,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_start_nmea.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_start_nmea.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_nmea);
         state.nmea_gps.stop();
@@ -2449,9 +2414,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stop_nmea.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stop_nmea.try_borrow_mut() else {
+            return;
         };
         state.nmea_gps.stop();
         apply_state_to_ui(&ui, &state);
@@ -2466,9 +2430,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_nav_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_nav_media.try_borrow_mut() else {
+            return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_nav_media);
         if state.last_screen == Screen::Stream {
@@ -2477,7 +2440,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         refresh_media_rows(&mut state, &store_for_nav_media);
         if state.media.status_text.is_empty() {
             state.media.status_text = if state.media.rows.is_empty() {
-                "No media recorded yet. Click \"Refresh from ROV\" to populate.".to_owned()
+                "No media recorded yet. Click \"Refresh from ROV\" to populate.".to_string()
             } else {
                 format!(
                     "{} media record(s) in local library.",
@@ -2497,9 +2460,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_refresh_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_refresh_media.try_borrow_mut() else {
+            return;
         };
         if state.media.refresh_in_progress {
             return;
@@ -2512,7 +2474,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let media_store = store_for_refresh_media.media().clone();
         let tx = state.media.event_tx.clone();
         state.media.refresh_in_progress = true;
-        state.media.status_text = "Refreshing media from ROV...".to_owned();
+        state.media.status_text = "Refreshing media from ROV...".to_string();
         thread::spawn(move || {
             let status_text = match client.list_medias(None::<MediaScene>) {
                 Ok(items) => match media_store.apply_rov_listing(&items, None) {
@@ -2539,9 +2501,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_select_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_select_media.try_borrow_mut() else {
+            return;
         };
         let media_id_str = media_id.to_string();
         let name_str = name.to_string();
@@ -2585,15 +2546,14 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_download_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_download_media.try_borrow_mut() else {
+            return;
         };
         if state.media.download_in_progress {
             return;
         }
         let Some((media_id, name)) = state.media.selected.clone() else {
-            state.media.status_text = "Select a media entry first.".to_owned();
+            state.media.status_text = "Select a media entry first.".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         };
@@ -2637,12 +2597,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_open_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_open_media.try_borrow_mut() else {
+            return;
         };
         if state.media.local_path.is_empty() {
-            state.media.status_text = "No local copy for this media yet.".to_owned();
+            state.media.status_text = "No local copy for this media yet.".to_string();
         } else {
             match webbrowser::open(&state.media.local_path) {
                 Ok(()) => {
@@ -2663,12 +2622,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_delete_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_delete_media.try_borrow_mut() else {
+            return;
         };
         let Some((_, name)) = state.media.selected.clone() else {
-            state.media.status_text = "Select a media entry first.".to_owned();
+            state.media.status_text = "Select a media entry first.".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         };
@@ -2707,12 +2665,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stream_media.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stream_media.try_borrow_mut() else {
+            return;
         };
         let Some((_, name)) = state.media.selected.clone() else {
-            state.media.status_text = "Select a media entry first.".to_owned();
+            state.media.status_text = "Select a media entry first.".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         };
@@ -2727,10 +2684,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 return;
             }
         };
-        let ffmpeg_bin = if let Some(bin) = locate_ffmpeg_binary() {
-            bin
-        } else {
-            state.media.status_text = "ffmpeg not found. Bundle it as ./bin/ffmpeg.".to_owned();
+        let Some(ffmpeg_bin) = locate_ffmpeg_binary() else {
+            state.media.status_text = "ffmpeg not found. Bundle it as ./bin/ffmpeg.".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         };
@@ -2755,13 +2710,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let mut state = match state_for_stop_media_stream.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => return,
+        let Ok(mut state) = state_for_stop_media_stream.try_borrow_mut() else {
+            return;
         };
         state.media.stop_media_stream();
         state.media.preview_image = None;
-        state.media.status_text = "Playback stopped.".to_owned();
+        state.media.status_text = "Playback stopped.".to_string();
         apply_state_to_ui(&ui, &state);
     });
 }
@@ -2824,7 +2778,7 @@ fn stream_stderr_loop(
     let mut line_buffer = Vec::new();
     while !stop_flag.load(Ordering::Relaxed) {
         match stderr.read(&mut read_buffer) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
                 line_buffer.extend_from_slice(&read_buffer[..n]);
                 while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
@@ -2837,7 +2791,6 @@ fn stream_stderr_loop(
                     }
                 }
             }
-            Err(_) => break,
         }
     }
     if !line_buffer.is_empty()
@@ -2894,7 +2847,7 @@ fn spawn_media_stream_pipeline(
     let stdout_tx = tx.clone();
     let stdout_worker = thread::spawn(move || {
         let _ = tx.send(StreamEvent::Status(
-            "Media stream started. Waiting for frames...".to_owned(),
+            "Media stream started. Waiting for frames...".to_string(),
         ));
         stream_worker_loop(stdout, stdout_stop_flag, tx);
     });
@@ -2969,7 +2922,7 @@ fn spawn_stream_pipeline(
     let stdout_tx = tx.clone();
     let stdout_worker = thread::spawn(move || {
         let _ = tx.send(StreamEvent::Status(
-            "Streaming started. Waiting for frames...".to_owned(),
+            "Streaming started. Waiting for frames...".to_string(),
         ));
         stream_worker_loop(stdout, stdout_stop_flag, tx);
     });
@@ -3068,7 +3021,7 @@ fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()>
     let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
     let _ = client.list_medias(None::<MediaScene>);
     let host =
-        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_owned());
+        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
     let dummy_rtsp = format!("rtsp://x@{host}:8554/");
     ensure_rov_route_for_rtsp(&dummy_rtsp, interface)
 }
@@ -3310,7 +3263,7 @@ fn main() -> Result<()> {
             });
             let result = inner_rx
                 .recv_timeout(Duration::from_secs(30))
-                .unwrap_or_else(|_| Err("GPS warmup timed out after 30 s".to_owned()));
+                .unwrap_or_else(|_| Err("GPS warmup timed out after 30 s".to_string()));
             let _ = loc_tx.send(result);
         });
         state.borrow_mut().startup_location_rx = Some(loc_rx);
@@ -3340,9 +3293,8 @@ fn main() -> Result<()> {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let mut state = match poll_state.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            let Ok(mut state) = poll_state.try_borrow_mut() else {
+                return;
             };
             // Tear down stream + telemetry after 10 min away from the stream screen.
             if state.stream_left_at_ms > 0 && current_unix_ms() - state.stream_left_at_ms > 600_000
@@ -3406,7 +3358,7 @@ fn main() -> Result<()> {
                     state.location_detected_at_ms = current_unix_ms();
                     if state.active_screen == Screen::Map {
                         state.load_map_tile_for_current_location(
-                            "Location detected (CoreLocation).".to_owned(),
+                            "Location detected (CoreLocation).".to_string(),
                         );
                         apply_map_runtime_to_ui(&ui, &state);
                     }
@@ -3428,7 +3380,7 @@ fn main() -> Result<()> {
                             state.location_detected_at_ms = current_unix_ms();
                             if state.active_screen == Screen::Map {
                                 state.load_map_tile_for_current_location(
-                                    "Location detected (Windows GPS).".to_owned(),
+                                    "Location detected (Windows GPS).".to_string(),
                                 );
                                 apply_map_runtime_to_ui(&ui, &state);
                             }

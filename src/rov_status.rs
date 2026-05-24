@@ -106,7 +106,7 @@ impl UdpStatusState {
     pub fn stop(&mut self) {
         if let Some(mut controller) = self.controller.take() {
             controller.stop();
-            self.status = "ROV status listener stopped.".to_owned();
+            self.status = "ROV status listener stopped.".to_string();
         }
         self.event_rx = None;
     }
@@ -124,20 +124,16 @@ impl UdpStatusState {
                     Ok(UdpStatusEvent::Status(status)) => {
                         self.latest_status = Some(status);
                         self.packets_received = self.packets_received.saturating_add(1);
-                        self.status = "Receiving ROV status packets.".to_owned();
+                        self.status = "Receiving ROV status packets.".to_string();
                     }
                     Ok(UdpStatusEvent::Error(err)) => {
                         self.status = err;
                     }
-                    Ok(UdpStatusEvent::Ended) => {
+                    Ok(UdpStatusEvent::Ended) | Err(TryRecvError::Disconnected) => {
                         disconnected = true;
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
                 }
             }
         }
@@ -146,7 +142,7 @@ impl UdpStatusState {
             self.controller = None;
             self.event_rx = None;
             if self.status.trim().is_empty() || self.status == "Receiving ROV status packets." {
-                self.status = "ROV status listener ended.".to_owned();
+                self.status = "ROV status listener ended.".to_string();
             }
         }
     }
@@ -196,7 +192,7 @@ fn udp_status_worker_loop(
     stop_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<UdpStatusEvent>,
 ) {
-    let mut datagram = [0_u8; 65_507];
+    let mut datagram = vec![0_u8; 65_507].into_boxed_slice();
     while !stop_flag.load(Ordering::Relaxed) {
         match socket.recv_from(&mut datagram) {
             Ok((bytes_received, _source)) => match parse_status_packet(&datagram[..bytes_received])

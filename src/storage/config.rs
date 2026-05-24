@@ -93,7 +93,8 @@ impl ConfigStore {
             nmea_gps_mode: self.get_or(keys::NMEA_GPS_MODE, defaults.nmea_gps_mode)?,
             nmea_server_host: self.get_or(keys::NMEA_SERVER_HOST, defaults.nmea_server_host)?,
             nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
-            nmea_stale_timeout: self.get_or(keys::NMEA_STALE_TIMEOUT, defaults.nmea_stale_timeout)?,
+            nmea_stale_timeout: self
+                .get_or(keys::NMEA_STALE_TIMEOUT, defaults.nmea_stale_timeout)?,
         })
     }
 

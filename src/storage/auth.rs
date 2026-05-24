@@ -8,7 +8,7 @@
 //! The refresh token is set by the server as an `HttpOnly` cookie. A persisted
 //! cookie jar ([`PersistentCookieJar`]) mirrors those cookies to `SQLite` so the
 //! session survives restarts without the user re-entering credentials.
-
+use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -497,9 +497,9 @@ impl StoredCookie {
             ts.saturating_mul(1000)
         });
         let same_site = cookie.same_site().map(|s| match s {
-            SameSite::Strict => "Strict".to_owned(),
-            SameSite::Lax => "Lax".to_owned(),
-            SameSite::None => "None".to_owned(),
+            SameSite::Strict => "Strict".to_string(),
+            SameSite::Lax => "Lax".to_string(),
+            SameSite::None => "None".to_string(),
         });
         Self {
             domain,
@@ -530,7 +530,7 @@ impl StoredCookie {
             // one in seconds (rounded down, clamped to 0).
             let now = now_ms();
             let max_age_secs = ((expires_ms - now) / 1000).max(0);
-            header.push_str(&format!("; Max-Age={max_age_secs}"));
+            let _ = write!(header, "; Max-Age={max_age_secs}");
         }
         if self.secure {
             header.push_str("; Secure");

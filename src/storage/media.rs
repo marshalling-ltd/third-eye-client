@@ -5,7 +5,7 @@
 //! `media_sync` table so the UI can show media another user captured on the
 //! same ROV, track whether we've downloaded them locally, and annotate them
 //! with capture-time ROV telemetry.
-
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -450,11 +450,10 @@ pub fn download_to_local(
         .with_context(|| format!("writing {}", target.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&payload.bytes);
-    let sha_hex = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let sha_hex = hasher.finalize().iter().fold(String::new(), |mut acc, b| {
+        write!(&mut acc, "{b:02x}").unwrap();
+        acc
+    });
     store.set_local_path(media_id, name, &target, Some(&sha_hex))?;
     // Persist image dimensions into the DB so the UI can show them without
     // re-reading the file every time.
@@ -473,27 +472,27 @@ fn guess_mime(name: &str) -> Option<String> {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("jpeg"))
     {
-        Some("image/jpeg".to_owned())
+        Some("image/jpeg".to_string())
     } else if std::path::Path::new(&lower)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
     {
-        Some("image/x-adobe-dng".to_owned())
+        Some("image/x-adobe-dng".to_string())
     } else if std::path::Path::new(&lower)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
     {
-        Some("image/png".to_owned())
+        Some("image/png".to_string())
     } else if std::path::Path::new(&lower)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
     {
-        Some("video/mp4".to_owned())
+        Some("video/mp4".to_string())
     } else if std::path::Path::new(&lower)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
     {
-        Some("video/quicktime".to_owned())
+        Some("video/quicktime".to_string())
     } else {
         None
     }
