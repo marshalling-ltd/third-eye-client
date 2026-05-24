@@ -1,6 +1,65 @@
 # third-eye-client
 
-Rust client for connecting to and controlling an ROV via USB ethernet.
+Cross-platform desktop client for controlling and interacting with Chasing underwater ROVs. Built with Rust and [Slint](https://slint.dev/) for a native GUI on macOS, Windows, and Linux.
+
+## Features
+
+### Live Video Stream
+- Real-time RTSP video from the ROV camera decoded via a bundled ffmpeg
+- Full-screen stream view with a heads-up telemetry overlay (depth, temperature, heading, attitude, GPS coordinates, battery)
+- Auto-starts telemetry and stream when navigating to the Stream screen
+
+### ROV Telemetry
+- Receives ROV status broadcasts over UDP (configurable port, default 8500)
+- Displays attitude (pitch / roll / yaw), depth, water temperature, IMU gyroscope, battery levels, and GPS coordinates
+- Binds the UDP socket to a specific network interface when configured
+
+### Photo & Video Capture
+- Triggers the ROV camera shutter remotely (JPEG, DNG, or JPEG+DNG; burst 1–5)
+- Automatically attaches a telemetry snapshot (depth, attitude, coordinates, battery state) to each capture as metadata
+- Refreshes the device GPS fix before every capture so coordinates are as fresh as possible
+
+### Media Library
+- Syncs the ROV's on-device file list into a local SQLite registry
+- Browse, download, preview (images with thumbnails), and stream (video via ffmpeg) any file on the ROV
+- Delete media from the ROV directly from the UI
+- Tracks local download state, SHA-256 checksums, and capture metadata per file
+- Auto-downloads image previews on selection
+
+### Interactive Map
+- Slippy-map viewer backed by OpenStreetMap tiles with zoom (3–19), pan, and a location pin
+- Scale bar and coordinate readout
+- Animated viewport transitions when re-centering
+
+### GPS / Location Detection
+- **macOS**: native CoreLocation (non-blocking; permission prompt on first launch)
+- **Windows**: Windows Location Services (background thread with 30 s timeout)
+- **External GPS (NMEA)**: reads standard NMEA-0183 sentences from any GPS source in three modes:
+  - **TCP Listen** – the app listens on a TCP port; a phone app or network GPS device connects as a client (GPS2IP, GPSd Forwarder, ShareGPS)
+  - **TCP Client** – the app dials an NMEA server running on a phone or remote host
+  - **Serial / Bluetooth** – reads from any serial port (`/dev/cu.*`, `/dev/rfcomm*`, `COM*`), covering standalone Bluetooth GPS receivers, USB GPS dongles, and phone GPS apps that expose an SPP channel
+- Stale-timeout configurable per session; the map auto-centers on the latest fix
+
+### ROV Network Interface Binding
+- Auto-detects the wired USB-ethernet adapter on the same subnet as the ROV
+- Binds HTTP, UDP, and (on Unix) socket-level traffic to that interface via `IP_BOUND_IF` / `SO_BINDTODEVICE`
+- Sets up an OS-level host route so ffmpeg (an external process that can't use `IP_BOUND_IF`) reaches the ROV through the correct adapter
+  - macOS: `osascript` with administrator privileges (one-time password prompt)
+  - Windows: ARP cache pre-population via an HTTP probe before launching ffmpeg
+
+### Server Authentication
+- Sign in / out against the third-eye backend (`POST /api/v1/account/login`, refresh-token cookie)
+- JWT access-token with automatic expiry tracking
+- Persistent cookie jar stored in SQLite so sessions survive restarts
+
+### Persistent Storage
+- Single SQLite database (via `rusqlite`) stores configuration, auth sessions, media sync state, capture metadata, and a durable REST outbox
+- Background outbox worker retries failed server requests with exponential backoff
+
+### Build Targets
+- **macOS** – universal binary (arm64 + x86_64) `.app` bundle with ad-hoc code signing (`scripts/build_macos_app.sh`)
+- **Windows** – cross-compiled from macOS via MinGW, packaged as a zip (`scripts/build_windows.sh`)
+- **Linux** – native build packaged as an AppImage (`scripts/build_linux.sh`, must run on Linux)
 
 ## Network Setup (USB Ethernet to ROV)
 
