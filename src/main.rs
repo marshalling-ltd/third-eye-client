@@ -3123,6 +3123,7 @@ fn ensure_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
 
 /// Checks whether a valid host route
 /// on the specified interface.
+#[cfg(target_os = "macos")]
 fn has_valid_rov_route(host: &str, interface: &str) -> bool {
     // Check ARP: must have a real MAC (not incomplete, not adapter's own MAC)
     // on the correct interface.
@@ -3141,6 +3142,7 @@ fn has_valid_rov_route(host: &str, interface: &str) -> bool {
 /// ARP-cache entries show up as `UHLSI` (scoped) and don't override the subnet
 /// route for processes that don't use `IP_BOUND_IF`. We need `UHLS` (no `I`)
 /// created by `route add -host -interface`.
+#[cfg(target_os = "macos")]
 fn has_host_route(host: &str, interface: &str) -> bool {
     let output = Command::new("netstat")
         .args(["-rn", "-f", "inet"])
@@ -3160,6 +3162,7 @@ fn has_host_route(host: &str, interface: &str) -> bool {
 }
 
 /// Returns the MAC address of a network interface (e.g. en10's own MAC).
+#[cfg(target_os = "macos")]
 fn get_interface_mac(interface: &str) -> Option<String> {
     let output = Command::new("ifconfig").arg(interface).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -3174,6 +3177,7 @@ fn get_interface_mac(interface: &str) -> Option<String> {
 
 /// Reads the MAC address for `host` from the ARP table, filtered to entries
 /// on the specified interface.
+#[cfg(target_os = "macos")]
 fn read_arp_mac_on_interface(host: &str, interface: &str) -> Option<String> {
     let output = Command::new("arp").arg("-an").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);

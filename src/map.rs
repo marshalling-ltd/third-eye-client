@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-#[cfg(target_os = "windows")]
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
@@ -496,7 +494,7 @@ pub(crate) fn detect_location_from_windows_location_blocking() -> Result<(f64, f
 
     let access = Geolocator::RequestAccessAsync()
         .context("RequestAccessAsync failed")?
-        .get()
+        .join()
         .context("waiting for location access")?;
 
     if access != GeolocationAccessStatus::Allowed {
@@ -506,7 +504,7 @@ pub(crate) fn detect_location_from_windows_location_blocking() -> Result<(f64, f
     let position = locator
         .GetGeopositionAsync()
         .context("GetGeopositionAsync failed")?
-        .get()
+        .join()
         .context("waiting for GPS position")?;
 
     let coordinate = position.Coordinate().context("no coordinate in position")?;
