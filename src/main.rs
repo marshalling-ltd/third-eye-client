@@ -96,6 +96,8 @@ struct AppConfig {
     nmea_server_host: String,
     nmea_server_port: String,
     nmea_stale_timeout: String,
+    use_saved_map_tiles: String,
+    max_tile_storage_mb: String,
 }
 
 impl Default for AppConfig {
@@ -113,6 +115,8 @@ impl Default for AppConfig {
             nmea_server_host: String::new(),
             nmea_server_port: "11123".to_string(),
             nmea_stale_timeout: "10".to_string(),
+            use_saved_map_tiles: "false".to_string(),
+            max_tile_storage_mb: "1024".to_string(),
         }
     }
 }
@@ -143,6 +147,8 @@ impl AppConfig {
             nmea_server_host: self.nmea_server_host.clone(),
             nmea_server_port: self.nmea_server_port.clone(),
             nmea_stale_timeout: self.nmea_stale_timeout.clone(),
+            use_saved_map_tiles: self.use_saved_map_tiles.clone(),
+            max_tile_storage_mb: self.max_tile_storage_mb.clone(),
         }
     }
 
@@ -160,7 +166,21 @@ impl AppConfig {
             nmea_server_host: config.nmea_server_host,
             nmea_server_port: config.nmea_server_port,
             nmea_stale_timeout: config.nmea_stale_timeout,
+            use_saved_map_tiles: config.use_saved_map_tiles,
+            max_tile_storage_mb: config.max_tile_storage_mb,
         }
+    }
+
+    fn use_saved_map_tiles(&self) -> bool {
+        self.use_saved_map_tiles.trim().eq_ignore_ascii_case("true")
+    }
+
+    fn max_tile_storage_bytes(&self) -> u64 {
+        self.max_tile_storage_mb
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(1024)
+            .saturating_mul(1024 * 1024)
     }
 
     fn parse_nmea_gps_port(&self) -> Result<u16> {
@@ -204,6 +224,8 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
+        use_saved_map_tiles: "false",
+        max_tile_storage_mb: "1024",
     };
     (udp_bind_static.to_owned(), defaults)
 }
@@ -389,6 +411,8 @@ struct ThirdEyeState {
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
+    /// Human-readable current tile cache size (e.g. "42.3 MB").
+    tile_cache_size_text: String,
     media: MediaUiState,
     /// Unix-ms timestamp of the last successful location fix.
     location_detected_at_ms: i64,
@@ -420,6 +444,8 @@ impl ThirdEyeState {
                 nmea_server_host: defaults.nmea_server_host.to_owned(),
                 nmea_server_port: defaults.nmea_server_port.to_owned(),
                 nmea_stale_timeout: defaults.nmea_stale_timeout.to_owned(),
+                use_saved_map_tiles: defaults.use_saved_map_tiles.to_owned(),
+                max_tile_storage_mb: defaults.max_tile_storage_mb.to_owned(),
             }
         });
 
@@ -459,16 +485,25 @@ impl ThirdEyeState {
             }
         }
 
+        let config = AppConfig::from_client_config(client_config);
+        let mut map_tiles = MapTilesState::new();
+        if config.use_saved_map_tiles() {
+            map_tiles.set_disk_cache(
+                Some(store.tile_cache().clone()),
+                config.max_tile_storage_bytes(),
+            );
+        }
+
         Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
             suppress_next_map_flick: false,
-            config: AppConfig::from_client_config(client_config),
+            config,
             map: MapState {
                 zoom: DEFAULT_ZOOM,
                 ..MapState::default()
             },
-            map_tiles: MapTilesState::new(),
+            map_tiles,
             rov_info: String::new(),
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
@@ -476,6 +511,7 @@ impl ThirdEyeState {
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
+            tile_cache_size_text: String::new(),
             media,
             location_detected_at_ms: 0,
             stream_left_at_ms: 0,
@@ -708,6 +744,9 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_auth_signed_in_as(state.auth.signed_in_as.clone().into());
     ui.set_auth_is_signed_in(state.auth.is_signed_in);
     ui.set_attached_metadata_text(state.attached_metadata_text.clone().into());
+    ui.set_use_saved_map_tiles(state.config.use_saved_map_tiles());
+    ui.set_max_tile_storage_mb(state.config.max_tile_storage_mb.clone().into());
+    ui.set_tile_cache_size_text(state.tile_cache_size_text.clone().into());
     apply_map_runtime_to_ui(ui, state);
     apply_stream_and_rov_runtime_to_ui(ui, state);
     apply_media_runtime_to_ui(ui, state);
@@ -887,6 +926,35 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.nmea_server_host = ui.get_nmea_server_host().to_string();
     state.config.nmea_server_port = ui.get_nmea_server_port().to_string();
     state.config.nmea_stale_timeout = ui.get_nmea_stale_timeout().to_string();
+    state.config.use_saved_map_tiles = if ui.get_use_saved_map_tiles() {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    };
+    state.config.max_tile_storage_mb = ui.get_max_tile_storage_mb().to_string();
+    // Update the disk cache on the fly so changes take effect immediately.
+    if state.config.use_saved_map_tiles() {
+        state.map_tiles.set_disk_cache(
+            Some(store.tile_cache().clone()),
+            state.config.max_tile_storage_bytes(),
+        );
+    } else {
+        state.map_tiles.set_disk_cache(None, 0);
+    }
+    // Refresh the human-readable cache size for the config UI.
+    state.tile_cache_size_text = store
+        .tile_cache()
+        .total_size()
+        .ok()
+        .map(|bytes| {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            if mb < 0.1 {
+                format!("{} KB", bytes / 1024)
+            } else {
+                format!("{mb:.1} MB")
+            }
+        })
+        .unwrap_or_default();
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {

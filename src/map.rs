@@ -10,6 +10,7 @@ use objc2::rc::Retained;
 use objc2_core_location::{CLAuthorizationStatus, CLLocationManager, kCLLocationAccuracyBest};
 use reqwest::blocking::Client;
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use third_eye_client::storage::tile_cache::TileCacheStore;
 
 pub const DEFAULT_ZOOM: u32 = 14;
 pub const MIN_ZOOM: u32 = 3;
@@ -95,6 +96,11 @@ pub struct MapTilesState {
     visible_height: f64,
     offset_x: f64,
     offset_y: f64,
+    /// Persistent disk tile cache (SQLite-backed). `None` when tile saving is
+    /// disabled.
+    disk_cache: Option<TileCacheStore>,
+    /// Maximum bytes allowed for the disk tile cache.
+    disk_cache_max_bytes: u64,
 }
 
 impl MapTilesState {
@@ -112,7 +118,15 @@ impl MapTilesState {
             visible_height: f64::from(MAP_IMAGE_SIZE_PX),
             offset_x: 0.0,
             offset_y: 0.0,
+            disk_cache: None,
+            disk_cache_max_bytes: 0,
         }
+    }
+
+    /// Configures the persistent disk tile cache. Pass `None` to disable.
+    pub fn set_disk_cache(&mut self, store: Option<TileCacheStore>, max_bytes: u64) {
+        self.disk_cache = store;
+        self.disk_cache_max_bytes = max_bytes;
     }
 
     pub fn world_size_px(zoom_level: u32) -> f64 {
@@ -306,10 +320,19 @@ impl MapTilesState {
                 let tx = self.tile_result_tx.clone();
                 let user_agent = user_agent.clone();
                 let tx_for_thread = tx.clone();
+                let disk_cache = self.disk_cache.clone();
+                let disk_cache_max_bytes = self.disk_cache_max_bytes;
                 let spawn_result = thread::Builder::new()
                     .name(format!("osm-tile-{}-{}-{}", coord.z, coord.x, coord.y))
                     .spawn(move || {
-                        let outcome = load_osm_tile(client, coord, &user_agent).map_or_else(
+                        let outcome = load_osm_tile_cached(
+                            client,
+                            coord,
+                            &user_agent,
+                            disk_cache.as_ref(),
+                            disk_cache_max_bytes,
+                        )
+                        .map_or_else(
                             |err| TileLoadResult {
                                 coord,
                                 frame: None,
@@ -635,7 +658,23 @@ pub fn check_corelocation_warmup_fix(map: &MapState) -> Option<(f64, f64)> {
 // OSM tile loading
 // ---------------------------------------------------------------------------
 
-fn load_osm_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Result<RgbaFrame> {
+/// Loads a tile, checking the persistent disk cache first when available.
+/// On a cache miss the tile is fetched from the network and saved to disk.
+fn load_osm_tile_cached(
+    client: Client,
+    coord: TileCoordinate,
+    user_agent: &str,
+    disk_cache: Option<&TileCacheStore>,
+    disk_cache_max_bytes: u64,
+) -> Result<RgbaFrame> {
+    // --- Disk cache hit path ---
+    if let Some(cache) = disk_cache
+        && let Ok(Some(png_data)) = cache.get_tile(coord.z, coord.x as i64, coord.y as i64)
+    {
+        return decode_png_to_frame(&png_data);
+    }
+
+    // --- Network fetch ---
     let tile_base_url =
         std::env::var("OSM_TILES_URL").unwrap_or_else(|_| "https://tile.openstreetmap.org".into());
     let url = format!("{tile_base_url}/{}/{}/{}.png", coord.z, coord.x, coord.y);
@@ -647,8 +686,21 @@ fn load_osm_tile(client: Client, coord: TileCoordinate, user_agent: &str) -> Res
         .error_for_status()
         .with_context(|| format!("tile request returned non-success for {url}"))?;
     let bytes = response.bytes().context("tile bytes missing")?;
-    let image = image::load_from_memory(&bytes)
-        .with_context(|| format!("tile decode failed for {url}"))?
+
+    // --- Persist to disk cache ---
+    if let Some(cache) = disk_cache {
+        // Save raw PNG bytes; errors are non-fatal.
+        let _ = cache.put_tile(coord.z, coord.x as i64, coord.y as i64, &bytes);
+        // Run LRU eviction in the background (cheap if under budget).
+        let _ = cache.evict_lru(disk_cache_max_bytes);
+    }
+
+    decode_png_to_frame(&bytes)
+}
+
+fn decode_png_to_frame(bytes: &[u8]) -> Result<RgbaFrame> {
+    let image = image::load_from_memory(bytes)
+        .context("tile decode failed")?
         .resize_exact(
             MAP_TILE_SIZE_PX as u32,
             MAP_TILE_SIZE_PX as u32,

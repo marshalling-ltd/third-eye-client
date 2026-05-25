@@ -24,6 +24,8 @@ const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
     nmea_server_host: "",
     nmea_server_port: "11123",
     nmea_stale_timeout: "10",
+    use_saved_map_tiles: "false",
+    max_tile_storage_mb: "1024",
 };
 
 fn make_db_path(name: &str) -> PathBuf {
@@ -55,6 +57,8 @@ fn config_and_outbox_survive_reopen() {
             nmea_server_host: String::new(),
             nmea_server_port: "11123".into(),
             nmea_stale_timeout: "10".into(),
+            use_saved_map_tiles: "false".into(),
+            max_tile_storage_mb: "1024".into(),
         };
         store.config().save_client(&cfg).unwrap();
 

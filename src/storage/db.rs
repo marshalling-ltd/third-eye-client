@@ -14,6 +14,7 @@ use rusqlite_migration::{M, Migrations};
 /// SQL for migration v1. The file is embedded at compile time so the binary
 /// is self-contained.
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
+const MIGRATION_V2: &str = include_str!("migrations/002_map_tile_cache.sql");
 
 /// Shared, thread-safe `SQLite` handle. Every storage submodule takes one of
 /// these by `Arc::clone`.
@@ -67,7 +68,7 @@ fn apply_pragmas(connection: &Connection, persistent: bool) -> Result<()> {
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<()> {
-    let migrations = Migrations::new(vec![M::up(MIGRATION_V1)]);
+    let migrations = Migrations::new(vec![M::up(MIGRATION_V1), M::up(MIGRATION_V2)]);
     migrations
         .to_latest(connection)
         .context("running schema migrations")?;

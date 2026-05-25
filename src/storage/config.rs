@@ -24,6 +24,8 @@ pub mod keys {
     pub const NMEA_SERVER_HOST: &str = "client.nmea_server_host";
     pub const NMEA_SERVER_PORT: &str = "client.nmea_server_port";
     pub const NMEA_STALE_TIMEOUT: &str = "client.nmea_stale_timeout";
+    pub const USE_SAVED_MAP_TILES: &str = "client.use_saved_map_tiles";
+    pub const MAX_TILE_STORAGE_MB: &str = "client.max_tile_storage_mb";
 }
 
 /// Persisted configuration accessor.
@@ -95,6 +97,10 @@ impl ConfigStore {
             nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
             nmea_stale_timeout: self
                 .get_or(keys::NMEA_STALE_TIMEOUT, defaults.nmea_stale_timeout)?,
+            use_saved_map_tiles: self
+                .get_or(keys::USE_SAVED_MAP_TILES, defaults.use_saved_map_tiles)?,
+            max_tile_storage_mb: self
+                .get_or(keys::MAX_TILE_STORAGE_MB, defaults.max_tile_storage_mb)?,
         })
     }
 
@@ -121,6 +127,14 @@ impl ConfigStore {
             (keys::NMEA_SERVER_HOST, config.nmea_server_host.as_str()),
             (keys::NMEA_SERVER_PORT, config.nmea_server_port.as_str()),
             (keys::NMEA_STALE_TIMEOUT, config.nmea_stale_timeout.as_str()),
+            (
+                keys::USE_SAVED_MAP_TILES,
+                config.use_saved_map_tiles.as_str(),
+            ),
+            (
+                keys::MAX_TILE_STORAGE_MB,
+                config.max_tile_storage_mb.as_str(),
+            ),
         ] {
             tx.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -156,6 +170,10 @@ pub struct ClientConfig {
     pub nmea_server_port: String,
     /// Stale fix timeout in minutes. Default `"10"`.
     pub nmea_stale_timeout: String,
+    /// Whether to persist map tiles to disk for offline use. `"true"` or `"false"`.
+    pub use_saved_map_tiles: String,
+    /// Maximum disk storage for cached map tiles, in megabytes. Default `"1024"` (1 GB).
+    pub max_tile_storage_mb: String,
 }
 
 /// Compiled-in defaults used when a setting is missing from the database.
@@ -173,6 +191,8 @@ pub struct ClientConfigDefaults<'a> {
     pub nmea_server_host: &'a str,
     pub nmea_server_port: &'a str,
     pub nmea_stale_timeout: &'a str,
+    pub use_saved_map_tiles: &'a str,
+    pub max_tile_storage_mb: &'a str,
 }
 
 #[cfg(test)]
@@ -193,6 +213,8 @@ mod tests {
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
+        use_saved_map_tiles: "false",
+        max_tile_storage_mb: "1024",
     };
 
     #[test]
@@ -234,6 +256,8 @@ mod tests {
             nmea_server_host: "192.168.1.50".into(),
             nmea_server_port: "4352".into(),
             nmea_stale_timeout: "5".into(),
+            use_saved_map_tiles: "true".into(),
+            max_tile_storage_mb: "512".into(),
         };
         store.save_client(&cfg).unwrap();
         let reloaded = store.load_client(&DEFAULTS).unwrap();

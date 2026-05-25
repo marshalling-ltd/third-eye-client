@@ -1,4 +1,4 @@
-import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct MapTile {
     x: length,
@@ -35,6 +35,9 @@ export component AppWindow inherits Window {
     in-out property <string> rov_http_base;
     in-out property <string> rov_status_udp_port;
     in-out property <string> osm_tile_user_agent;
+    in-out property <bool> use_saved_map_tiles: false;
+    in-out property <string> max_tile_storage_mb: "1024";
+    in-out property <string> tile_cache_size_text;
     in-out property <string> rov_info;
 
     // Phone GPS (NMEA — auto-detects Bluetooth or TCP).
@@ -306,6 +309,37 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
 
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Offline map tiles"; font-size: 18px; }
+                    Text {
+                        text: "Cache map tiles to disk for offline use. When enabled, tiles are saved as you browse and served from local storage when no Internet is available.";
+                        wrap: word-wrap;
+                    }
+                    CheckBox {
+                        text: "Save map tiles for offline use";
+                        checked <=> root.use_saved_map_tiles;
+                    }
+                    Text {
+                        text: "Max tile cache size (MB):";
+                        color: root.use_saved_map_tiles ? #ffffff : #555555;
+                    }
+                    LineEdit {
+                        text <=> root.max_tile_storage_mb;
+                        enabled: root.use_saved_map_tiles;
+                    }
+                    Text {
+                        text: "Least recently used tiles are deleted first when the cache exceeds this limit. Default 1024 MB (1 GB).";
+                        wrap: word-wrap;
+                        color: #8f96a3;
+                        font-size: 12px;
+                    }
+                    if root.tile_cache_size_text != "" : Text {
+                        text: "Current tile cache size on disk: " + root.tile_cache_size_text + ".";
+                        color: #8f96a3;
+                        font-size: 12px;
+                    }
+
+                    Rectangle { height: 1px; background: #3f4148; }
                     Button {
                         text: "Recalibrate ROV network";
                         clicked => { root.recalibrate_rov_network(); }

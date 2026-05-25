@@ -21,12 +21,14 @@ pub mod config;
 pub mod db;
 pub mod media;
 pub mod outbox;
+pub mod tile_cache;
 
 use crate::storage::auth::AuthClient;
 use crate::storage::config::ConfigStore;
 use crate::storage::db::SharedDb;
 use crate::storage::media::MediaStore;
 use crate::storage::outbox::{OutboxStore, OutboxWorker};
+use crate::storage::tile_cache::TileCacheStore;
 
 /// Qualifier / organisation / application triple used with `directories`.
 pub const PROJECT_QUALIFIER: &str = "eu";
@@ -43,6 +45,7 @@ pub struct AppStore {
     config: ConfigStore,
     auth: AuthClient,
     media: MediaStore,
+    tile_cache: TileCacheStore,
     outbox: OutboxStore,
     worker: Mutex<Option<OutboxWorker>>,
     data_path: Option<PathBuf>,
@@ -76,6 +79,7 @@ impl AppStore {
         let config = ConfigStore::new(db.clone());
         let auth = AuthClient::new(db.clone())?;
         let media = MediaStore::new(db.clone());
+        let tile_cache = TileCacheStore::new(db.clone());
         let outbox = OutboxStore::new(db.clone());
         let worker = if start_worker {
             Some(OutboxWorker::spawn(outbox.clone()))
@@ -87,6 +91,7 @@ impl AppStore {
             config,
             auth,
             media,
+            tile_cache,
             outbox,
             worker: Mutex::new(worker),
             data_path,
@@ -103,6 +108,10 @@ impl AppStore {
 
     pub fn media(&self) -> &MediaStore {
         &self.media
+    }
+
+    pub fn tile_cache(&self) -> &TileCacheStore {
+        &self.tile_cache
     }
 
     pub fn outbox(&self) -> &OutboxStore {
