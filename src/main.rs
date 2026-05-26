@@ -303,6 +303,8 @@ struct MediaUiState {
     capture_battery: String,
     /// Compact subtitle: "793 KB \u{2022} image/jpeg \u{2022} 1920\u{00d7}1080"
     info_subtitle: String,
+    /// Formatted capture date/time for the selected media.
+    capture_datetime: String,
 }
 
 impl MediaUiState {
@@ -334,6 +336,7 @@ impl MediaUiState {
             capture_coords: String::new(),
             capture_battery: String::new(),
             info_subtitle: String::new(),
+            capture_datetime: String::new(),
         }
     }
 
@@ -1099,6 +1102,53 @@ fn format_relative_age(ts_ms: i64) -> String {
     }
 }
 
+/// Formats an epoch-millis timestamp as a local `YYYY-MM-DD HH:MM:SS` string.
+#[allow(clippy::many_single_char_names)]
+fn format_epoch_ms_datetime(ts_ms: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let st = UNIX_EPOCH + Duration::from_millis(ts_ms as u64);
+    // Convert to local time via the `Into<chrono>` path is not available
+    // (no chrono dep), so use libc `localtime_r` on unix and fallback to
+    // UTC on other platforms.
+    #[cfg(unix)]
+    {
+        let secs = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: localtime_r is thread-safe and writes into our stack `tm`.
+        let res = unsafe { libc::localtime_r(&raw const secs, &raw mut tm) };
+        if !res.is_null() {
+            return format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+            );
+        }
+    }
+    // Fallback: UTC.
+    let secs = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = secs / 86_400;
+    let day_secs = secs % 86_400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    // Civil date from day count (algorithm from Howard Hinnant).
+    let z = days as i64 + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if mo <= 2 { y + 1 } else { y };
+    format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
 fn origin_label(record: &LocalMediaRecord) -> &'static str {
     match record.mime.as_deref() {
         Some(mime) if mime.starts_with("image/") => "image",
@@ -1336,6 +1386,7 @@ fn build_info_subtitle(record: &LocalMediaRecord) -> String {
 }
 
 fn populate_capture_overlay(state: &mut ThirdEyeState, meta: &StoredCaptureMetadata) {
+    state.media.capture_datetime = format_epoch_ms_datetime(meta.captured_at_ms);
     state.media.capture_depth = meta
         .depth_m
         .map(|d| format!("{d:.1} m"))
@@ -1386,6 +1437,7 @@ fn clear_capture_overlay(state: &mut ThirdEyeState) {
     state.media.capture_attitude.clear();
     state.media.capture_coords.clear();
     state.media.capture_battery.clear();
+    state.media.capture_datetime.clear();
 }
 
 fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore) {
@@ -1465,6 +1517,11 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
                 ),
                 thumbnail: thumb.cloned().unwrap_or_else(|| empty_img.clone()),
                 has_thumbnail: thumb.is_some(),
+                captured_at_text: r
+                    .captured_at_ms
+                    .map(format_epoch_ms_datetime)
+                    .unwrap_or_default()
+                    .into(),
             }
         })
         .collect();
@@ -1486,6 +1543,13 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_media_selected_is_video(selected_is_video);
     ui.set_media_stream_active(state.media.media_stream_active);
     ui.set_media_info_subtitle(state.media.info_subtitle.clone().into());
+    ui.set_media_capture_datetime(state.media.capture_datetime.clone().into());
+    let selected_is_image = state
+        .media
+        .selected
+        .as_ref()
+        .is_some_and(|(_, name)| is_image_name(name));
+    ui.set_media_selected_is_image(selected_is_image);
     ui.set_media_capture_depth(state.media.capture_depth.clone().into());
     ui.set_media_capture_temp(state.media.capture_temp.clone().into());
     ui.set_media_capture_heading(state.media.capture_heading.clone().into());
@@ -2684,6 +2748,65 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_open_with_telemetry = Rc::clone(&state);
+    let store_for_open_with_telemetry = Rc::clone(&store);
+    ui.on_open_with_telemetry(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_open_with_telemetry.try_borrow_mut() else {
+            return;
+        };
+        if state.media.local_path.is_empty() {
+            state.media.status_text = "No local copy for this media yet.".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        let Some((media_id, name)) = state.media.selected.clone() else {
+            state.media.status_text = "Select a media entry first.".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        };
+        let meta = match store_for_open_with_telemetry
+            .media()
+            .get_capture_metadata(&media_id, &name)
+        {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                state.media.status_text =
+                    "No capture telemetry available for this media.".to_string();
+                apply_state_to_ui(&ui, &state);
+                return;
+            }
+            Err(err) => {
+                state.media.status_text = format!("Failed to read capture metadata: {err:#}");
+                apply_state_to_ui(&ui, &state);
+                return;
+            }
+        };
+        let local_path = state.media.local_path.clone();
+        match render_image_with_telemetry(&local_path, &meta) {
+            Ok(output_path) => {
+                let display = output_path.display().to_string();
+                match webbrowser::open(&display) {
+                    Ok(()) => {
+                        state.media.status_text =
+                            format!("Opened {display} with telemetry overlay.");
+                    }
+                    Err(err) => {
+                        state.media.status_text =
+                            format!("Saved {display} but failed to open: {err:#}");
+                    }
+                }
+            }
+            Err(err) => {
+                state.media.status_text = format!("Failed to render telemetry overlay: {err:#}");
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
     let state_for_delete_media = Rc::clone(&state);
     let store_for_delete_media = Rc::clone(&store);
     ui.on_delete_selected_media_from_rov(move || {
@@ -3060,6 +3183,112 @@ fn extract_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let frame = buffer[..=end].to_vec();
     buffer.drain(..=end);
     Some(frame)
+}
+
+/// Renders a copy of the source image with a semi-transparent telemetry bar
+/// burned into the bottom. Returns the path to the saved `_telemetry.jpg` file.
+fn render_image_with_telemetry(source_path: &str, meta: &StoredCaptureMetadata) -> Result<PathBuf> {
+    use ab_glyph::FontRef;
+    use image::{Rgba, RgbaImage};
+    use imageproc::drawing::draw_text_mut;
+
+    let mut img: RgbaImage = image::open(source_path)
+        .with_context(|| format!("opening {source_path}"))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+
+    // Try to load a system monospace font; if none found, fall back to the
+    // first available system font. The font search order covers macOS,
+    // Windows, and common Linux distributions.
+    let font_candidates: &[&str] = &[
+        // macOS
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/SFMono-Regular.otf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        // Windows
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+    ];
+    let font_bytes = font_candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+        .context("no suitable system font found for telemetry overlay")?;
+    let font = FontRef::try_from_slice(&font_bytes).context("failed to parse system font")?;
+
+    // Build the telemetry text lines.
+    let datetime = format_epoch_ms_datetime(meta.captured_at_ms);
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(datetime);
+    if let Some(depth) = meta.depth_m {
+        parts.push(format!("Depth: {depth:.1}m"));
+    }
+    if let Some(temp) = meta.temperature_c {
+        parts.push(format!("Temp: {temp:.1}\u{00b0}C"));
+    }
+    if let Some(yaw) = meta.yaw {
+        parts.push(format!(
+            "Hdg: {:.0}\u{00b0}",
+            yaw.to_degrees().rem_euclid(360.0)
+        ));
+    }
+    if let (Some(lat), Some(lon)) = (meta.lat_e7, meta.lon_e7) {
+        let lat_deg = lat as f64 / 1e7;
+        let lon_deg = lon as f64 / 1e7;
+        parts.push(format!("Pos: {lat_deg:.5},{lon_deg:.5}"));
+    }
+    let telemetry_line = parts.join("  |  ");
+
+    // Scale font to ~2% of image height, clamped to a readable range.
+    let font_height = (h as f32 * 0.02).clamp(16.0, 48.0);
+    let bar_height = (font_height * 1.8) as u32;
+    let bar_y = h.saturating_sub(bar_height);
+
+    // Draw the semi-transparent dark bar.
+    let bar_color = Rgba([13u8, 26, 42, 200]);
+    for y in bar_y..h {
+        for x in 0..w {
+            let pixel = img.get_pixel_mut(x, y);
+            // Alpha-blend the bar over the image.
+            let alpha = u16::from(bar_color[3]);
+            let inv = 255 - alpha;
+            for c in 0..3 {
+                pixel[c] =
+                    ((u16::from(pixel[c]) * inv + u16::from(bar_color[c]) * alpha) / 255) as u8;
+            }
+        }
+    }
+
+    // Draw the text.
+    let text_y = bar_y as i32 + ((bar_height as f32 - font_height) / 2.0) as i32;
+    let text_x = (w as f32 * 0.02) as i32;
+    let text_color = Rgba([255u8, 255, 255, 255]);
+    let scale = ab_glyph::PxScale::from(font_height);
+    draw_text_mut(
+        &mut img,
+        text_color,
+        text_x,
+        text_y,
+        scale,
+        &font,
+        &telemetry_line,
+    );
+
+    // Convert RGBA to RGB — JPEG does not support an alpha channel.
+    let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+
+    // Save next to the original as `<stem>_telemetry.jpg`.
+    let source = std::path::Path::new(source_path);
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    let output_name = format!("{stem}_telemetry.jpg");
+    let output_path = source.with_file_name(&output_name);
+    rgb_img
+        .save(&output_path)
+        .with_context(|| format!("saving {}", output_path.display()))?;
+    Ok(output_path)
 }
 
 fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {

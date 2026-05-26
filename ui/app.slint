@@ -19,6 +19,7 @@ export struct MediaRow {
     selected: bool,
     thumbnail: image,
     has_thumbnail: bool,
+    captured_at_text: string,
 }
 
 export component AppWindow inherits Window {
@@ -88,6 +89,10 @@ export component AppWindow inherits Window {
     in-out property <string> media_capture_battery;
     // Compact subtitle: "793 KB \u{2022} image/jpeg \u{2022} 1920\u{00d7}1080"
     in-out property <string> media_info_subtitle;
+    // Formatted capture date/time for the selected media (empty if no metadata).
+    in-out property <string> media_capture_datetime;
+    // True when the selected media is an image (not a video).
+    in-out property <bool> media_selected_is_image: false;
 
     in-out property <string> map_status;
     in-out property <string> corelocation_debug;
@@ -151,6 +156,7 @@ export component AppWindow inherits Window {
     callback delete_selected_media_from_rov();
     callback stream_selected_media();
     callback stop_media_stream();
+    callback open_with_telemetry();
 
     callback start_nmea_gps();
     callback stop_nmea_gps();
@@ -661,7 +667,12 @@ export component AppWindow inherits Window {
                                                     color: #8f96a3;
                                                     overflow: elide;
                                                 }
-                                                Text {
+                                                if row.captured_at_text != "" : Text {
+                                                    text: "\u{1f4f7} " + row.captured_at_text;
+                                                    font-size: 10px;
+                                                    color: #5a9fff;
+                                                }
+                                                if row.captured_at_text == "" : Text {
                                                     text: row.seen_text;
                                                     font-size: 10px;
                                                     color: #666666;
@@ -742,6 +753,12 @@ export component AppWindow inherits Window {
                                             color: #8f96a3;
                                             overflow: elide;
                                         }
+                                        if root.media_capture_datetime != "" : Text {
+                                            text: "\u{1f4f7} Captured: " + root.media_capture_datetime;
+                                            font-size: 11px;
+                                            color: #5a9fff;
+                                            overflow: elide;
+                                        }
 
                                         // Capture telemetry bar
                                         if root.media_selected_has_capture_meta : Rectangle {
@@ -809,6 +826,12 @@ export component AppWindow inherits Window {
                                                 text: "Open";
                                                 enabled: root.media_selected_local_path != "";
                                                 clicked => { root.open_selected_local_media(); }
+                                            }
+                                            if root.media_selected_is_image && root.media_selected_has_capture_meta : Button {
+                                                horizontal-stretch: 1;
+                                                text: "\u{1f4f7} + Telemetry";
+                                                enabled: root.media_selected_local_path != "";
+                                                clicked => { root.open_with_telemetry(); }
                                             }
                                             if root.media_selected_is_video && !root.media_stream_active : Button {
                                                 horizontal-stretch: 1;
