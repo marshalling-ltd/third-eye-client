@@ -43,6 +43,10 @@ pub struct LocalMediaRecord {
     pub local_sha256: Option<String>,
     pub rov_stat: Option<i32>,
     pub deleted_on_rov: bool,
+    /// Epoch-millis timestamp from `capture_metadata`, if available.
+    /// `None` when the capture was taken on a different machine and no
+    /// local metadata row exists.
+    pub captured_at_ms: Option<i64>,
 }
 
 /// Projection of a `capture_metadata` row. All numeric fields are optional
@@ -397,16 +401,20 @@ impl MediaStore {
 }
 
 const LIST_SELECT: &str =
-    "SELECT media_id, name, size_bytes, duration_s, width, height, mime, scene,
-            first_seen_ms, last_seen_ms, local_path, local_sha256, rov_stat, deleted_on_rov
-     FROM media_sync
-     ORDER BY last_seen_ms DESC, name ASC";
+    "SELECT m.media_id, m.name, m.size_bytes, m.duration_s, m.width, m.height, m.mime, m.scene,
+            m.first_seen_ms, m.last_seen_ms, m.local_path, m.local_sha256, m.rov_stat,
+            m.deleted_on_rov, c.captured_at_ms
+     FROM media_sync m
+     LEFT JOIN capture_metadata c ON c.media_id = m.media_id AND c.name = m.name
+     ORDER BY (c.captured_at_ms IS NULL) ASC, c.captured_at_ms DESC, m.last_seen_ms DESC, m.name ASC";
 
 const LIST_QUERY_RECENT: &str = concat!(
-    "SELECT media_id, name, size_bytes, duration_s, width, height, mime, scene,\n",
-    "       first_seen_ms, last_seen_ms, local_path, local_sha256, rov_stat, deleted_on_rov\n",
-    "FROM media_sync\n",
-    "ORDER BY last_seen_ms DESC, name ASC\n",
+    "SELECT m.media_id, m.name, m.size_bytes, m.duration_s, m.width, m.height, m.mime, m.scene,\n",
+    "       m.first_seen_ms, m.last_seen_ms, m.local_path, m.local_sha256, m.rov_stat,\n",
+    "       m.deleted_on_rov, c.captured_at_ms\n",
+    "FROM media_sync m\n",
+    "LEFT JOIN capture_metadata c ON c.media_id = m.media_id AND c.name = m.name\n",
+    "ORDER BY (c.captured_at_ms IS NULL) ASC, c.captured_at_ms DESC, m.last_seen_ms DESC, m.name ASC\n",
     "LIMIT ?1",
 );
 
@@ -428,6 +436,7 @@ fn map_local_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMediaRecord> 
         local_sha256: row.get(11)?,
         rov_stat: row.get(12)?,
         deleted_on_rov: row.get::<_, i64>(13)? != 0,
+        captured_at_ms: row.get(14)?,
     })
 }
 
