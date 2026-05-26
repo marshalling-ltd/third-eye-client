@@ -589,13 +589,9 @@ export component AppWindow inherits Window {
                 padding: 14px;
                 spacing: 10px;
                 Text {
-                    text: "Media library (ROV + local)";
+                    text: "Media";
                     font-size: 24px;
                 }
-                    Text {
-                        text: "Camera HTTP base: " + root.rov_http_base;
-                        wrap: word-wrap;
-                    }
                     HorizontalBox {
                         spacing: 8px;
                         Button {
@@ -661,21 +657,21 @@ export component AppWindow inherits Window {
                                                     font-size: 13px;
                                                     overflow: elide;
                                                 }
-                                                Text {
-                                                    text: row.size_text + " \u{2022} " + row.state_text;
-                                                    font-size: 11px;
-                                                    color: #8f96a3;
-                                                    overflow: elide;
-                                                }
                                                 if row.captured_at_text != "" : Text {
-                                                    text: "\u{1f4f7} " + row.captured_at_text;
+                                                    text: row.captured_at_text;
                                                     font-size: 10px;
-                                                    color: #5a9fff;
+                                                    color: #8f96a3;
                                                 }
                                                 if row.captured_at_text == "" : Text {
                                                     text: row.seen_text;
                                                     font-size: 10px;
                                                     color: #666666;
+                                                }
+                                                Text {
+                                                    text: row.size_text + " \u{2022} " + row.state_text;
+                                                    font-size: 11px;
+                                                    color: #8f96a3;
+                                                    overflow: elide;
                                                 }
                                             }
                                         }
@@ -748,15 +744,9 @@ export component AppWindow inherits Window {
                                             overflow: elide;
                                         }
                                         Text {
-                                            text: root.media_info_subtitle;
+                                            text: root.media_capture_datetime != "" ? root.media_capture_datetime + " \u{2022} " + root.media_info_subtitle : root.media_info_subtitle;
                                             font-size: 11px;
                                             color: #8f96a3;
-                                            overflow: elide;
-                                        }
-                                        if root.media_capture_datetime != "" : Text {
-                                            text: "\u{1f4f7} Captured: " + root.media_capture_datetime;
-                                            font-size: 11px;
-                                            color: #5a9fff;
                                             overflow: elide;
                                         }
 
