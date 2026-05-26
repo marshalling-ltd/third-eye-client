@@ -1571,14 +1571,14 @@ fn current_unix_ms() -> i64 {
 }
 
 /// Reconciles the ROV media list and writes a `capture_metadata` row for the
-/// file that was most recently seen. Returns the summary text the UI should
-/// render, or `None` if nothing could be attached.
+/// file that was most recently seen. Returns `(summary_text, media_id, name)`
+/// so the caller can also download the file immediately.
 fn attach_capture_metadata_to_latest(
     client: &CameraApiClient,
     media_store: &MediaStore,
     status: Option<&RovUdpStatus>,
     captured_at_ms: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String, String)>> {
     // Snapshot existing media names so we can detect the newly captured file
     // after the ROV listing is applied (apply_rov_listing sets all rows'
     // last_seen_ms to the same value, breaking list_recent ordering).
@@ -1625,7 +1625,7 @@ fn attach_capture_metadata_to_latest(
     } else {
         line.push_str(" (no ROV telemetry snapshot was available - start the UDP listener to capture depth/yaw/coords)");
     }
-    Ok(Some(line))
+    Ok(Some((line, media_id, name)))
 }
 
 fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: Rc<AppStore>) {
@@ -2145,6 +2145,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         );
         let media_store = store_for_capture.media().clone();
         let tx = state.media.event_tx.clone();
+        let data_root = match store_for_capture.data_path().and_then(|p| p.parent()) {
+            Some(dir) => dir.to_path_buf(),
+            None => std::env::temp_dir().join("third-eye-client"),
+        };
         state.media.capture_in_progress = true;
         state.rov_info = "Capturing photo...".to_string();
         if state.active_screen == Screen::Stream {
@@ -2163,7 +2167,20 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                         status_snapshot.as_ref(),
                         captured_at_ms,
                     ) {
-                        Ok(Some(line)) => line,
+                        Ok(Some((line, media_id, name))) => {
+                            // Auto-download the freshly captured image so it's
+                            // available locally right away (optimised JPEG).
+                            if let Err(err) = download_to_local(
+                                &media_store,
+                                &client,
+                                &data_root,
+                                &media_id,
+                                &name,
+                            ) {
+                                eprintln!("auto-download of {name} after capture failed: {err:#}");
+                            }
+                            line
+                        }
                         Ok(None) => String::new(),
                         Err(err) => format!("Capture metadata attach failed: {err:#}"),
                     };
