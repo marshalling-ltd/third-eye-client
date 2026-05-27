@@ -3658,6 +3658,12 @@ fn main() -> Result<()> {
                 state.map.lat = Some(lat);
                 state.map.lon = Some(lon);
                 state.location_detected_at_ms = current_unix_ms();
+                // Update pin position without re-centering the viewport;
+                // the user can press the center-on-pin button manually.
+                if state.active_screen == Screen::Map {
+                    state.map.status = format!("NMEA GPS fix: {lat:.6}, {lon:.6}");
+                    apply_map_runtime_to_ui(&ui, &state);
+                }
             }
             // Apply background location warmup result.
             // Only applied if no location has been set yet (user may have
