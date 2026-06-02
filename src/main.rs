@@ -2087,7 +2087,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         // Refresh location from the best non-blocking source before capture so
         // the freshest possible coordinates are attached to the photo metadata.
         {
-            let fresh_fix: Option<(f64, f64)> = state.nmea_gps.latest_location().or_else(|| {
+            let fresh_fix: Option<(f64, f64)> = state.nmea_gps.latest_location().or({
                 #[cfg(target_os = "macos")]
                 {
                     check_corelocation_warmup_fix(&state.map)
