@@ -28,8 +28,9 @@ jobs:
             libudev-dev pkg-config build-essential
 
       - name: Install Rust components
-        run: |
-          rustup component add rustfmt clippy
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -66,6 +67,10 @@ jobs:
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
             libudev-dev pkg-config build-essential
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked
 
@@ -89,6 +94,10 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
             libudev-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
 
       - name: Install tools
         run: |
