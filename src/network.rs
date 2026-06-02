@@ -67,3 +67,68 @@ pub fn detect_rov_interface(rov_host: &str) -> Option<String> {
     #[cfg(not(target_os = "macos"))]
     candidates.into_iter().next()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_full_url() {
+        assert_eq!(
+            parse_host_from_http_base("http://192.168.1.88"),
+            Some("192.168.1.88".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_bare_ip() {
+        assert_eq!(
+            parse_host_from_http_base("192.168.1.88"),
+            Some("192.168.1.88".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_with_port_and_path() {
+        assert_eq!(
+            parse_host_from_http_base("http://10.0.0.1:8080/v1/api"),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_whitespace() {
+        assert_eq!(
+            parse_host_from_http_base("  http://10.0.0.1  "),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_empty() {
+        assert_eq!(parse_host_from_http_base(""), None);
+    }
+
+    #[test]
+    fn parse_host_hostname() {
+        assert_eq!(
+            parse_host_from_http_base("http://rov.local"),
+            Some("rov.local".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_interface_unreachable() {
+        assert!(detect_rov_interface("1.2.3.4").is_none());
+    }
+
+    #[test]
+    fn detect_interface_invalid_ip() {
+        assert!(detect_rov_interface("not-an-ip").is_none());
+    }
+
+    #[test]
+    fn detect_interface_empty() {
+        assert!(detect_rov_interface("").is_none());
+    }
+}

@@ -1,3 +1,5 @@
+# --- Developer targets (require extra tools) ---
+
 code:
 	@echo "third-eye-client: code check\n"
 	@rustup update
@@ -14,24 +16,45 @@ code:
 
 check: code nextest
 
-clean:
-	cargo clean
+# --- CI-friendly targets (no extra tools beyond rustup components) ---
+
+ci: lint nextest
+	@echo "third-eye-client: CI passed ✓"
+
+lint:
+	@echo "third-eye-client: lint\n"
+	@cargo fmt --check
+	@cargo clippy --all-targets --all-features -- -W clippy::pedantic -D warnings
+
+# --- Test targets ---
 
 nextest:
-	@echo "third-eye-platform: test\n"
+	@echo "third-eye-client: test (nextest)\n"
 	@cargo nextest run
 
-nextest-cov:
-	@echo "third-eye-platform: code coverage\n"
-	@cargo llvm-cov --open nextest
-
 test:
-	@echo "third-eye-platform: test\n"
+	@echo "third-eye-client: test\n"
 	@cargo test
 
+# --- Code coverage ---
+
+nextest-cov:
+	@echo "third-eye-client: code coverage (nextest)\n"
+	@cargo llvm-cov --open nextest
+
 test-cov:
-	@echo "third-eye-platform: code coverage\n"
+	@echo "third-eye-client: code coverage\n"
 	@cargo llvm-cov --open
+
+coverage:
+	@echo "third-eye-client: code coverage (lcov)\n"
+	@cargo llvm-cov --lcov --output-path lcov.info nextest
+	@echo "Coverage report written to lcov.info"
+
+# --- Misc ---
+
+clean:
+	cargo clean
 
 upgrade:
 	cargo upgrade --verbose
