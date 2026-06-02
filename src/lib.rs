@@ -15,6 +15,7 @@
 )]
 
 pub mod camera;
+pub mod network;
 pub mod nmea;
 pub mod rov_status;
 pub mod storage;
