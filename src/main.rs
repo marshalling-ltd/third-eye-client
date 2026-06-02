@@ -281,6 +281,9 @@ struct MediaUiState {
     preview_image: Option<slint::Image>,
     /// Cache of thumbnail images keyed by media name.
     thumbnail_cache: std::collections::HashMap<String, slint::Image>,
+    /// True when the selected media row has `deleted_on_rov` set, meaning
+    /// the file no longer exists on the ROV camera.
+    selected_deleted_on_rov: bool,
     /// Active media playback stream (ffmpeg decoding an MP4 from the ROV).
     media_stream_controller: Option<StreamController>,
     media_stream_event_rx: Option<Receiver<StreamEvent>>,
@@ -313,6 +316,7 @@ impl MediaUiState {
             download_in_progress: false,
             refresh_in_progress: false,
             capture_in_progress: false,
+            selected_deleted_on_rov: false,
             event_tx,
             event_rx,
             preview_image: None,
@@ -1292,6 +1296,37 @@ fn build_capture_text(meta: &StoredCaptureMetadata) -> String {
     lines.join("\n")
 }
 
+/// Spawns a background download for the given media item.
+///
+/// Shared by the auto-download on selection and the explicit Download button.
+fn start_media_download(
+    state: &mut ThirdEyeState,
+    store: &AppStore,
+    media_id: &str,
+    name: &str,
+    status_text: String,
+) {
+    let data_root = match store.data_path().and_then(|p| p.parent()) {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::temp_dir().join("third-eye-client"),
+    };
+    let camera = CameraApiClient::new_bound(
+        state.config.rov_http_base.clone(),
+        state.config.rov_interface(),
+    );
+    let tx = state.media.event_tx.clone();
+    state.media.download_in_progress = true;
+    state.media.status_text = status_text;
+    let media_store = store.media().clone();
+    let mid = media_id.to_owned();
+    let nm = name.to_owned();
+    thread::spawn(move || {
+        let result = download_to_local(&media_store, &camera, &data_root, &mid, &nm)
+            .map_err(|err| format!("{err:#}"));
+        let _ = tx.send(MediaEvent::Download { name: nm, result });
+    });
+}
+
 fn refresh_media_rows(state: &mut ThirdEyeState, store: &AppStore) {
     match store.media().list_all() {
         Ok(rows) => {
@@ -1451,6 +1486,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         state.media.local_path.clear();
         state.media.preview_image = None;
         state.media.info_subtitle.clear();
+        state.media.selected_deleted_on_rov = false;
         clear_capture_overlay(state);
         return;
     };
@@ -1463,6 +1499,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         state.media.details_text = build_details_text(record);
         state.media.info_subtitle = build_info_subtitle(record);
         state.media.local_path = record.local_path.clone().unwrap_or_default();
+        state.media.selected_deleted_on_rov = record.deleted_on_rov;
         // Load preview from local file if it's an image.
         if is_image_name(&name) && !state.media.local_path.is_empty() {
             state.media.preview_image = load_image_preview(&state.media.local_path, 800);
@@ -1476,6 +1513,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         state.media.info_subtitle.clear();
         state.media.local_path.clear();
         state.media.preview_image = None;
+        state.media.selected_deleted_on_rov = false;
     }
     match store.media().get_capture_metadata(&media_id, &name) {
         Ok(Some(meta)) => {
@@ -1538,6 +1576,7 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_media_selected_local_path(state.media.local_path.clone().into());
     ui.set_media_selected_has_capture_meta(state.media.has_capture_meta);
     ui.set_media_download_in_progress(state.media.download_in_progress);
+    ui.set_media_selected_deleted_on_rov(state.media.selected_deleted_on_rov);
     let selected_is_video = state
         .media
         .selected
@@ -2675,30 +2714,20 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.media.selected = Some((media_id_str.clone(), name_str.clone()));
         recompute_media_selection_details(&mut state, &store_for_select_media);
 
-        // Auto-download images that don't have a local copy yet.
+        // Auto-download images that don't have a local copy yet and
+        // are still present on the ROV.
         if is_image_name(&name_str)
             && state.media.local_path.is_empty()
             && !state.media.download_in_progress
+            && !state.media.selected_deleted_on_rov
         {
-            let data_root = match store_for_select_media.data_path().and_then(|p| p.parent()) {
-                Some(dir) => dir.to_path_buf(),
-                None => std::env::temp_dir().join("third-eye-client"),
-            };
-            let camera = CameraApiClient::new_bound(
-                state.config.rov_http_base.clone(),
-                state.config.rov_interface(),
+            start_media_download(
+                &mut state,
+                &store_for_select_media,
+                &media_id_str,
+                &name_str,
+                format!("Fetching preview for {name_str}..."),
             );
-            let tx = state.media.event_tx.clone();
-            state.media.download_in_progress = true;
-            state.media.status_text = format!("Fetching preview for {name_str}...");
-            let media_store = store_for_select_media.media().clone();
-            let mid = media_id_str.clone();
-            let nm = name_str.clone();
-            thread::spawn(move || {
-                let result = download_to_local(&media_store, &camera, &data_root, &mid, &nm)
-                    .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(MediaEvent::Download { name: nm, result });
-            });
         }
 
         apply_state_to_ui(&ui, &state);
@@ -2722,37 +2751,19 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         };
-        let data_root = match store_for_download_media
-            .data_path()
-            .and_then(|p| p.parent())
-        {
-            Some(dir) => dir.to_path_buf(),
-            None => std::env::temp_dir().join("third-eye-client"),
-        };
-        let camera = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
+        if state.media.selected_deleted_on_rov {
+            state.media.status_text =
+                "Cannot download: file has been deleted from the ROV.".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        start_media_download(
+            &mut state,
+            &store_for_download_media,
+            &media_id,
+            &name,
+            format!("Downloading {name} from ROV..."),
         );
-        let tx = state.media.event_tx.clone();
-        state.media.download_in_progress = true;
-        state.media.status_text = format!("Downloading {name} from ROV...");
-        let media_store = store_for_download_media.media().clone();
-        let media_id_thread = media_id.clone();
-        let name_thread = name.clone();
-        thread::spawn(move || {
-            let result = download_to_local(
-                &media_store,
-                &camera,
-                &data_root,
-                &media_id_thread,
-                &name_thread,
-            )
-            .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(MediaEvent::Download {
-                name: name_thread,
-                result,
-            });
-        });
         apply_state_to_ui(&ui, &state);
     });
 

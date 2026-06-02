@@ -75,6 +75,7 @@ export component AppWindow inherits Window {
     in-out property <string> media_selected_local_path;
     in-out property <bool> media_selected_has_capture_meta: false;
     in-out property <bool> media_download_in_progress: false;
+    in-out property <bool> media_selected_deleted_on_rov: false;
     in-out property <image> media_preview_image;
     in-out property <bool> has_media_preview: false;
     in-out property <bool> media_selected_is_video: false;
@@ -808,7 +809,8 @@ export component AppWindow inherits Window {
                                                     : (root.media_selected_local_path == ""
                                                         ? "Download"
                                                         : "Re-download");
-                                                enabled: !root.media_download_in_progress;
+                                                enabled: !root.media_download_in_progress
+                                                    && !root.media_selected_deleted_on_rov;
                                                 clicked => { root.download_selected_media(); }
                                             }
                                             Button {
@@ -871,7 +873,7 @@ export component AppWindow inherits Window {
                 // Top-right: status info
                 Rectangle {
                     width: 300px;
-                    height: 92px;
+                    height: 112px;
                     x: parent.width - self.width - 10px;
                     y: 10px;
                     border-radius: 12px;
@@ -903,6 +905,27 @@ export component AppWindow inherits Window {
                             text: "Packets: " + root.rov_packets_received_text;
                             color: #aaaaaa;
                             font-size: 11px;
+                        }
+                        HorizontalBox {
+                            spacing: 4px;
+                            Text {
+                                text: root.nmea_gps_running
+                                    ? (root.nmea_has_fix ? "\u{25cf}" : "\u{25cb}")
+                                    : "\u{25cb}";
+                                color: root.nmea_gps_running
+                                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                                    : #555555;
+                                font-size: 12px;
+                            }
+                            Text {
+                                text: root.nmea_gps_running
+                                    ? (root.nmea_has_fix ? "GPS fix" : "GPS ...")
+                                    : "GPS off";
+                                color: root.nmea_gps_running
+                                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                                    : #555555;
+                                font-size: 11px;
+                            }
                         }
                     }
                 }
