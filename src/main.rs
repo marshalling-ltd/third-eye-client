@@ -2087,10 +2087,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         // Refresh location from the best non-blocking source before capture so
         // the freshest possible coordinates are attached to the photo metadata.
         {
-            let fresh_fix: Option<(f64, f64)> = if let Some(fix) = state.nmea_gps.latest_location()
-            {
-                Some(fix)
-            } else {
+            let fresh_fix: Option<(f64, f64)> = state.nmea_gps.latest_location().or_else(|| {
                 #[cfg(target_os = "macos")]
                 {
                     check_corelocation_warmup_fix(&state.map)
@@ -2099,7 +2096,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 {
                     None
                 }
-            };
+            });
             if let Some((lat, lon)) = fresh_fix {
                 state.map.lat = Some(lat);
                 state.map.lon = Some(lon);
@@ -3459,6 +3456,7 @@ fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[allow(clippy::unnecessary_wraps)]
 fn ensure_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
     Ok(())
 }

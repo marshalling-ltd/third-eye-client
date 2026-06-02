@@ -2,4 +2,4 @@
 # reqwest::blocking::Client spawns a background tokio runtime whose threads
 # may briefly outlive individual test processes. This is harmless — increase
 # the leak threshold so nextest doesn't flag it.
-leak-timeout-ms = 2000
+leak-timeout = "2s"
