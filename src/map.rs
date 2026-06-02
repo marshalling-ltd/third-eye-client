@@ -713,3 +713,102 @@ fn decode_png_to_frame(bytes: &[u8]) -> Result<RgbaFrame> {
         rgba: image.into_raw(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_size_zoom_0() {
+        assert!((MapTilesState::world_size_px(0) - 256.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn world_size_zoom_1() {
+        assert!((MapTilesState::world_size_px(1) - 512.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn world_size_zoom_14() {
+        let expected = 256.0 * f64::exp2(14.0);
+        assert!((MapTilesState::world_size_px(14) - expected).abs() < 1.0);
+    }
+
+    #[test]
+    fn lat_lon_null_island() {
+        let (x, y) = lat_lon_to_world_px(0.0, 0.0, 14);
+        let world = MapTilesState::world_size_px(14) as f32;
+        assert!((x - world / 2.0).abs() < 1.0);
+        assert!((y - world / 2.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn lat_lon_london() {
+        let (x, y) = lat_lon_to_world_px(51.5, -0.12, 14);
+        let world = MapTilesState::world_size_px(14) as f32;
+        assert!(x > 0.0 && x < world);
+        assert!(y > 0.0 && y < world / 2.0);
+    }
+
+    #[test]
+    fn lat_lon_sydney() {
+        let (x, y) = lat_lon_to_world_px(-33.8, 151.2, 14);
+        let world = MapTilesState::world_size_px(14) as f32;
+        assert!(x > world / 2.0);
+        assert!(y > world / 2.0);
+    }
+
+    #[test]
+    fn lat_lon_clamping_at_poles() {
+        let (_, y_north) = lat_lon_to_world_px(90.0, 0.0, 14);
+        let (_, y_south) = lat_lon_to_world_px(-90.0, 0.0, 14);
+        assert!(y_north >= 0.0);
+        let world = MapTilesState::world_size_px(14) as f32;
+        assert!(y_south <= world);
+    }
+
+    #[test]
+    fn ease_out_cubic_boundaries() {
+        assert!((ease_out_cubic(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ease_out_cubic_midpoint() {
+        let mid = ease_out_cubic(0.5);
+        assert!(mid > 0.5);
+        assert!(mid < 1.0);
+    }
+
+    #[test]
+    fn compute_scale_bar_returns_known_unit() {
+        let (_, label) = compute_scale_bar(14, 45.0);
+        assert!(label.ends_with(" m") || label.ends_with(" km"));
+    }
+
+    #[test]
+    fn compute_scale_bar_high_zoom() {
+        let (_, label) = compute_scale_bar(19, 45.0);
+        assert!(label.ends_with(" m"));
+    }
+
+    #[test]
+    fn compute_scale_bar_low_zoom() {
+        let (_, label) = compute_scale_bar(3, 45.0);
+        assert!(label.ends_with(" km"));
+    }
+
+    #[test]
+    fn center_lat_lon_round_trip() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 14);
+        state.center_on_location(51.5, -0.12, 14);
+        let (lat, lon) = state.center_lat_lon(14).expect("should have center");
+        assert!((lat - 51.5).abs() < 0.01);
+        assert!((lon - (-0.12)).abs() < 0.01);
+    }
+}

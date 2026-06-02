@@ -341,3 +341,84 @@ pub fn parse_status_packet(datagram: &[u8]) -> Result<Status> {
         &datagram[ROV_STATUS_PACKET_HEADER_SIZE..(ROV_STATUS_PACKET_HEADER_SIZE + payload_len)];
     serde_json::from_slice(payload).context("invalid JSON payload for ROV status")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_status_json() -> String {
+        serde_json::json!({
+            "pitch": 0.0_f32, "roll": 0.0_f32, "yaw": 0.0_f32,
+            "depth": 0.0_f32, "lat": 0_i32, "lon": 0_i32,
+            "temperature": 20.0_f32
+        })
+        .to_string()
+    }
+
+    fn build_packet(payload_json: &str) -> Vec<u8> {
+        let payload = payload_json.as_bytes();
+        let mut packet = Vec::with_capacity(ROV_STATUS_PACKET_HEADER_SIZE + payload.len());
+        packet.push(ROV_STATUS_PACKET_ID);
+        packet.push(1);
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        packet.push(ROV_STATUS_PACKET_TYPE);
+        packet.extend_from_slice(&[0, 0, 0]);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn parse_minimal_valid_packet() {
+        let packet = build_packet(&minimal_status_json());
+        let status = parse_status_packet(&packet).unwrap();
+        assert!((status.temperature - 20.0).abs() < f32::EPSILON);
+        assert!(status.batteries.is_empty());
+    }
+
+    #[test]
+    fn parse_truncated_packet() {
+        assert!(parse_status_packet(&[0x03, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_empty_packet() {
+        assert!(parse_status_packet(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_wrong_packet_id() {
+        let mut packet = build_packet(&minimal_status_json());
+        packet[0] = 0xFF;
+        assert!(parse_status_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn parse_wrong_packet_type() {
+        let mut packet = build_packet(&minimal_status_json());
+        packet[8] = 0xFF;
+        assert!(parse_status_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn parse_missing_optional_fields() {
+        let json = serde_json::json!({
+            "pitch": 0.1_f32, "roll": 0.2_f32, "yaw": 1.0_f32,
+            "depth": 5.0_f32, "lat": 451_234_567_i32, "lon": 161_234_567_i32,
+            "temperature": 22.5_f32
+        })
+        .to_string();
+        let packet = build_packet(&json);
+        let status = parse_status_packet(&packet).unwrap();
+        assert_eq!(status.lat, 451_234_567);
+        assert!(status.batteries.is_empty());
+        assert_eq!(status.imu.gyro_x, 0);
+    }
+
+    #[test]
+    fn parse_payload_length_mismatch() {
+        let mut packet = build_packet(&minimal_status_json());
+        packet[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_status_packet(&packet).is_err());
+    }
+}

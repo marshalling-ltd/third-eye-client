@@ -45,6 +45,9 @@ use map::{
 use reqwest::Url;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
+use third_eye_client::formatting::{
+    format_bytes, format_epoch_ms_datetime, parse_stale_timeout_ms,
+};
 use third_eye_client::network::{
     RecalibrateResult, detect_rov_interface, parse_host_from_http_base,
 };
@@ -979,17 +982,6 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     }
 }
 
-/// Parses the stale-timeout config string (minutes) into milliseconds.
-/// Falls back to 10 minutes (600 000 ms) on invalid input.
-fn parse_stale_timeout_ms(value: &str) -> i64 {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|&v| v > 0.0)
-        .map_or(600_000, |mins| (mins * 60_000.0) as i64)
-}
-
 /// Returns the local IPv4 address that the OS would use to reach the
 /// internet (i.e. the adapter with the default gateway).  Works cross-
 /// platform by connecting a UDP socket to a public IP — no data is sent,
@@ -1077,22 +1069,6 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
 // Media screen helpers
 // -------------------------------------------------------------------------
 
-fn format_bytes(bytes: i64) -> String {
-    let bytes = bytes.max(0) as f64;
-    let units = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < units.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes as i64, units[unit])
-    } else {
-        format!("{:.1} {}", value, units[unit])
-    }
-}
-
 fn format_relative_age(ts_ms: i64) -> String {
     let now = current_unix_ms();
     let diff_secs = ((now - ts_ms).max(0) / 1000) as u64;
@@ -1107,53 +1083,6 @@ fn format_relative_age(ts_ms: i64) -> String {
     } else {
         format!("{}d ago", diff_secs / 86_400)
     }
-}
-
-/// Formats an epoch-millis timestamp as a local `YYYY-MM-DD HH:MM:SS` string.
-#[allow(clippy::many_single_char_names)]
-fn format_epoch_ms_datetime(ts_ms: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let st = UNIX_EPOCH + Duration::from_millis(ts_ms as u64);
-    // Convert to local time via the `Into<chrono>` path is not available
-    // (no chrono dep), so use libc `localtime_r` on unix and fallback to
-    // UTC on other platforms.
-    #[cfg(unix)]
-    {
-        let secs = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        // SAFETY: localtime_r is thread-safe and writes into our stack `tm`.
-        let res = unsafe { libc::localtime_r(&raw const secs, &raw mut tm) };
-        if !res.is_null() {
-            return format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec,
-            );
-        }
-    }
-    // Fallback: UTC.
-    let secs = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = secs / 86_400;
-    let day_secs = secs % 86_400;
-    let h = day_secs / 3600;
-    let m = (day_secs % 3600) / 60;
-    let s = day_secs % 60;
-    // Civil date from day count (algorithm from Howard Hinnant).
-    let z = days as i64 + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let yr = if mo <= 2 { y + 1 } else { y };
-    format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
 fn origin_label(record: &LocalMediaRecord) -> &'static str {
