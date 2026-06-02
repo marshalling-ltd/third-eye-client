@@ -18,6 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -26,9 +32,6 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
             libudev-dev pkg-config build-essential
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -56,6 +59,11 @@ jobs:
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -85,6 +93,11 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Install system dependencies
         run: |
