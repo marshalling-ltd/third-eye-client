@@ -51,7 +51,7 @@ use third_eye_client::formatting::{
 use third_eye_client::network::{
     RecalibrateResult, detect_rov_interface, parse_host_from_http_base,
 };
-use third_eye_client::nmea::NmeaGpsState;
+use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
 use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -102,6 +102,7 @@ struct AppConfig {
     nmea_server_host: String,
     nmea_server_port: String,
     nmea_stale_timeout: String,
+    nmea_gps_protocol: String,
     use_saved_map_tiles: String,
     max_tile_storage_mb: String,
 }
@@ -121,6 +122,7 @@ impl Default for AppConfig {
             nmea_server_host: String::new(),
             nmea_server_port: "11123".to_string(),
             nmea_stale_timeout: "10".to_string(),
+            nmea_gps_protocol: "0".to_string(),
             use_saved_map_tiles: "false".to_string(),
             max_tile_storage_mb: "1024".to_string(),
         }
@@ -153,6 +155,7 @@ impl AppConfig {
             nmea_server_host: self.nmea_server_host.clone(),
             nmea_server_port: self.nmea_server_port.clone(),
             nmea_stale_timeout: self.nmea_stale_timeout.clone(),
+            nmea_gps_protocol: self.nmea_gps_protocol.clone(),
             use_saved_map_tiles: self.use_saved_map_tiles.clone(),
             max_tile_storage_mb: self.max_tile_storage_mb.clone(),
         }
@@ -172,6 +175,7 @@ impl AppConfig {
             nmea_server_host: config.nmea_server_host,
             nmea_server_port: config.nmea_server_port,
             nmea_stale_timeout: config.nmea_stale_timeout,
+            nmea_gps_protocol: config.nmea_gps_protocol,
             use_saved_map_tiles: config.use_saved_map_tiles,
             max_tile_storage_mb: config.max_tile_storage_mb,
         }
@@ -230,6 +234,7 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
+        nmea_gps_protocol: "0",
         use_saved_map_tiles: "false",
         max_tile_storage_mb: "1024",
     };
@@ -453,6 +458,7 @@ impl ThirdEyeState {
                 nmea_server_host: defaults.nmea_server_host.to_owned(),
                 nmea_server_port: defaults.nmea_server_port.to_owned(),
                 nmea_stale_timeout: defaults.nmea_stale_timeout.to_owned(),
+                nmea_gps_protocol: defaults.nmea_gps_protocol.to_owned(),
                 use_saved_map_tiles: defaults.use_saved_map_tiles.to_owned(),
                 max_tile_storage_mb: defaults.max_tile_storage_mb.to_owned(),
             }
@@ -741,6 +747,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_rov_info(state.rov_info.clone().into());
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
+    ui.set_nmea_gps_protocol(state.config.nmea_gps_protocol.trim().parse().unwrap_or(0));
     ui.set_nmea_server_host(state.config.nmea_server_host.clone().into());
     ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
     ui.set_nmea_stale_timeout(state.config.nmea_stale_timeout.clone().into());
@@ -829,9 +836,11 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
 fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_stream_status(state.stream.status.clone().into());
     ui.set_frames_received_text(state.stream.frames_received.to_string().into());
+    ui.set_stream_is_active(state.stream.controller.is_some());
 
     ui.set_rov_status_text(state.rov_status.status_text().to_owned().into());
     ui.set_rov_packets_received_text(state.rov_status.packets_received().to_string().into());
+    ui.set_rov_listener_running(state.rov_status.is_running());
 
     if let Some(status) = state.rov_status.latest_status() {
         ui.set_has_rov_status(true);
@@ -937,6 +946,7 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.server_base_url = ui.get_server_base_url().to_string();
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
     state.config.nmea_gps_mode = ui.get_nmea_gps_mode().to_string();
+    state.config.nmea_gps_protocol = ui.get_nmea_gps_protocol().to_string();
     state.config.nmea_server_host = ui.get_nmea_server_host().to_string();
     state.config.nmea_server_port = ui.get_nmea_server_port().to_string();
     state.config.nmea_stale_timeout = ui.get_nmea_stale_timeout().to_string();
@@ -2444,6 +2454,21 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_set_nmea_protocol = Rc::clone(&state);
+    let store_for_set_nmea_protocol = Rc::clone(&store);
+    ui.on_set_nmea_gps_protocol(move |protocol| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_set_nmea_protocol.try_borrow_mut() else {
+            return;
+        };
+        state.config.nmea_gps_protocol = protocol.to_string();
+        persist_config(&state, &store_for_set_nmea_protocol);
+        ui.set_nmea_gps_protocol(protocol);
+    });
+
+    let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);
     let store_for_start_nmea = Rc::clone(&store);
     ui.on_start_nmea_gps(move || {
@@ -2457,6 +2482,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.nmea_gps.stop();
 
         let mode: i32 = state.config.nmea_gps_mode.trim().parse().unwrap_or(0);
+        let protocol = GpsProtocol::from_config(&state.config.nmea_gps_protocol);
 
         if mode == 1 {
             // --- Connect to Server mode (TCP client) ---
@@ -2470,7 +2496,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     return;
                 }
             };
-            match state.nmea_gps.start_client(&host, port) {
+            match state.nmea_gps.start_client(&host, port, protocol) {
                 Ok(_msg) => {}
                 Err(err) => {
                     ui.set_nmea_gps_status(
@@ -2501,7 +2527,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     port_path
                 ));
             }
-            match state.nmea_gps.start_bluetooth(port_path) {
+            match state.nmea_gps.start_bluetooth(port_path, protocol) {
                 Ok(_msg) => {}
                 Err(err) => {
                     ui.set_nmea_gps_status(
@@ -2529,7 +2555,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         } else {
             host
         };
-        match state.nmea_gps.start(&host, port) {
+        match state.nmea_gps.start(&host, port, protocol) {
             Ok(_msg) => {}
             Err(err) => {
                 ui.set_nmea_gps_status(format!("Failed to start NMEA GPS: {err:#}").into());

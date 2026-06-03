@@ -41,7 +41,7 @@ export component AppWindow inherits Window {
     in-out property <string> tile_cache_size_text;
     in-out property <string> rov_info;
 
-    // Phone GPS (NMEA — auto-detects Bluetooth or TCP).
+    // Phone GPS (NMEA/TAIP — auto-detects Bluetooth or TCP).
     in-out property <string> nmea_gps_port;
     in-out property <string> nmea_gps_status;
     in-out property <bool> nmea_gps_running: false;
@@ -50,9 +50,15 @@ export component AppWindow inherits Window {
     in-out property <string> nmea_serial_ports;
     // 0 = Auto (BT / TCP listen), 1 = Connect to Server (TCP client).
     in-out property <int> nmea_gps_mode: 0;
+    // 0 = NMEA, 1 = TAIP.
+    in-out property <int> nmea_gps_protocol: 0;
     in-out property <string> nmea_server_host;
     in-out property <string> nmea_server_port;
     in-out property <string> nmea_stale_timeout: "10";
+
+    // Stream status for the overlay.
+    in-out property <bool> stream_is_active: false;
+    in-out property <bool> rov_listener_running: false;
 
     // Server account (third-eye backend).
     in-out property <string> server_base_url;
@@ -162,6 +168,7 @@ export component AppWindow inherits Window {
     callback start_nmea_gps();
     callback stop_nmea_gps();
     callback set_nmea_gps_mode(int);
+    callback set_nmea_gps_protocol(int);
 
     callback sign_in();
     callback sign_out();
@@ -232,7 +239,7 @@ export component AppWindow inherits Window {
                     clicked => { root.navigate_media(); }
                 }
                 Button {
-                    text: "GPS (NMEA)";
+                    text: "Phone GPS";
                     clicked => { root.navigate_nmea(); }
                 }
                 Rectangle {
@@ -401,7 +408,7 @@ export component AppWindow inherits Window {
             }
             }
 
-            // GPS (NMEA) screen
+            // Phone GPS screen
             if root.active_screen == 4 : ScrollView {
                 viewport-width: self.visible-width;
 
@@ -413,15 +420,57 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     vertical-stretch: 0;
                     Text {
-                        text: "GPS (NMEA)";
+                        text: "Phone GPS";
                         font-size: 24px;
                     }
                     Text {
-                        text: "Receive NMEA GPS data from a phone app via Bluetooth, TCP listen, or by connecting to the NMEA server.";
+                        text: "Receive GPS data from a phone app via Bluetooth, TCP listen, or by connecting to a server.";
                         wrap: word-wrap;
                     }
 
-                    // --- Mode selector (radio-style) ---
+                    // --- Protocol selector ---
+                    Text { text: "GPS protocol:"; font-size: 13px; color: #8f96a3; }
+                    HorizontalBox {
+                        spacing: 6px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 6px;
+                            border-width: root.nmea_gps_protocol == 0 ? 2px : 1px;
+                            border-color: root.nmea_gps_protocol == 0 ? #0a84ff : #3f4148;
+                            background: root.nmea_gps_protocol == 0 ? #0a84ff18 : #1a1c22;
+                            Text {
+                                text: "NMEA";
+                                font-size: 13px;
+                                color: root.nmea_gps_protocol == 0 ? #ffffff : #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.set_nmea_gps_protocol(0); }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 6px;
+                            border-width: root.nmea_gps_protocol == 1 ? 2px : 1px;
+                            border-color: root.nmea_gps_protocol == 1 ? #0a84ff : #3f4148;
+                            background: root.nmea_gps_protocol == 1 ? #0a84ff18 : #1a1c22;
+                            Text {
+                                text: "TAIP";
+                                font-size: 13px;
+                                color: root.nmea_gps_protocol == 1 ? #ffffff : #8f96a3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.set_nmea_gps_protocol(1); }
+                            }
+                        }
+                    }
+
+                    // --- Connection mode selector ---
                     Text { text: "Connection mode:"; font-size: 13px; color: #8f96a3; }
                     HorizontalBox {
                         spacing: 6px;
@@ -870,10 +919,10 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                 }
 
-                // Top-right: status info
+                // Top-right: compact status indicators
                 Rectangle {
-                    width: 300px;
-                    height: 112px;
+                    width: 130px;
+                    height: 60px;
                     x: parent.width - self.width - 10px;
                     y: 10px;
                     border-radius: 12px;
@@ -882,50 +931,31 @@ export component AppWindow inherits Window {
                     border-color: #0a84ff44;
 
                     VerticalBox {
-                        padding: 10px;
-                        spacing: 4px;
+                        padding: 8px;
+                        spacing: 3px;
                         Text {
-                            text: root.stream_status;
-                            color: #ffffff;
+                            text: "STREAM";
+                            color: root.stream_is_active
+                                ? (root.has_stream_image ? #22cc44 : #ffaa00)
+                                : #ff4444;
                             font-size: 12px;
-                            overflow: elide;
+                            font-weight: 700;
                         }
                         Text {
-                            text: "Frames: " + root.frames_received_text;
-                            color: #aaaaaa;
-                            font-size: 11px;
-                        }
-                        Text {
-                            text: root.rov_status_text;
-                            color: #ffffff;
+                            text: "DATA";
+                            color: root.has_rov_status
+                                ? #22cc44
+                                : (root.rov_listener_running ? #ffaa00 : #ff4444);
                             font-size: 12px;
-                            overflow: elide;
+                            font-weight: 700;
                         }
                         Text {
-                            text: "Packets: " + root.rov_packets_received_text;
-                            color: #aaaaaa;
-                            font-size: 11px;
-                        }
-                        HorizontalBox {
-                            spacing: 4px;
-                            Text {
-                                text: root.nmea_gps_running
-                                    ? (root.nmea_has_fix ? "\u{25cf}" : "\u{25cb}")
-                                    : "\u{25cb}";
-                                color: root.nmea_gps_running
-                                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
-                                    : #555555;
-                                font-size: 12px;
-                            }
-                            Text {
-                                text: root.nmea_gps_running
-                                    ? (root.nmea_has_fix ? "GPS fix" : "GPS ...")
-                                    : "GPS off";
-                                color: root.nmea_gps_running
-                                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
-                                    : #555555;
-                                font-size: 11px;
-                            }
+                            text: "GPS";
+                            color: root.nmea_gps_running
+                                ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                                : #ff4444;
+                            font-size: 12px;
+                            font-weight: 700;
                         }
                     }
                 }

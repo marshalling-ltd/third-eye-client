@@ -24,6 +24,7 @@ pub mod keys {
     pub const NMEA_SERVER_HOST: &str = "client.nmea_server_host";
     pub const NMEA_SERVER_PORT: &str = "client.nmea_server_port";
     pub const NMEA_STALE_TIMEOUT: &str = "client.nmea_stale_timeout";
+    pub const NMEA_GPS_PROTOCOL: &str = "client.nmea_gps_protocol";
     pub const USE_SAVED_MAP_TILES: &str = "client.use_saved_map_tiles";
     pub const MAX_TILE_STORAGE_MB: &str = "client.max_tile_storage_mb";
 }
@@ -97,6 +98,7 @@ impl ConfigStore {
             nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
             nmea_stale_timeout: self
                 .get_or(keys::NMEA_STALE_TIMEOUT, defaults.nmea_stale_timeout)?,
+            nmea_gps_protocol: self.get_or(keys::NMEA_GPS_PROTOCOL, defaults.nmea_gps_protocol)?,
             use_saved_map_tiles: self
                 .get_or(keys::USE_SAVED_MAP_TILES, defaults.use_saved_map_tiles)?,
             max_tile_storage_mb: self
@@ -127,6 +129,7 @@ impl ConfigStore {
             (keys::NMEA_SERVER_HOST, config.nmea_server_host.as_str()),
             (keys::NMEA_SERVER_PORT, config.nmea_server_port.as_str()),
             (keys::NMEA_STALE_TIMEOUT, config.nmea_stale_timeout.as_str()),
+            (keys::NMEA_GPS_PROTOCOL, config.nmea_gps_protocol.as_str()),
             (
                 keys::USE_SAVED_MAP_TILES,
                 config.use_saved_map_tiles.as_str(),
@@ -170,6 +173,8 @@ pub struct ClientConfig {
     pub nmea_server_port: String,
     /// Stale fix timeout in minutes. Default `"10"`.
     pub nmea_stale_timeout: String,
+    /// GPS protocol: `"0"` = NMEA, `"1"` = TAIP. Default `"0"`.
+    pub nmea_gps_protocol: String,
     /// Whether to persist map tiles to disk for offline use. `"true"` or `"false"`.
     pub use_saved_map_tiles: String,
     /// Maximum disk storage for cached map tiles, in megabytes. Default `"1024"` (1 GB).
@@ -191,6 +196,7 @@ pub struct ClientConfigDefaults<'a> {
     pub nmea_server_host: &'a str,
     pub nmea_server_port: &'a str,
     pub nmea_stale_timeout: &'a str,
+    pub nmea_gps_protocol: &'a str,
     pub use_saved_map_tiles: &'a str,
     pub max_tile_storage_mb: &'a str,
 }
@@ -213,6 +219,7 @@ mod tests {
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
+        nmea_gps_protocol: "0",
         use_saved_map_tiles: "false",
         max_tile_storage_mb: "1024",
     };
@@ -256,6 +263,7 @@ mod tests {
             nmea_server_host: "192.168.1.50".into(),
             nmea_server_port: "4352".into(),
             nmea_stale_timeout: "5".into(),
+            nmea_gps_protocol: "1".into(),
             use_saved_map_tiles: "true".into(),
             max_tile_storage_mb: "512".into(),
         };

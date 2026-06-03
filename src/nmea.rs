@@ -113,7 +113,7 @@ impl NmeaGpsState {
     /// Opens a Bluetooth (SPP) or wired serial port and starts reading NMEA
     /// sentences. `port_path` is e.g. `/dev/cu.GPS-SPPSlave` (macOS) or
     /// `COM5` (Windows). The baud rate defaults to [`DEFAULT_BT_BAUD_RATE`].
-    pub fn start_bluetooth(&mut self, port_path: &str) -> Result<String> {
+    pub fn start_bluetooth(&mut self, port_path: &str, protocol: GpsProtocol) -> Result<String> {
         let port_path = port_path.trim().to_owned();
         if port_path.is_empty() {
             anyhow::bail!("Serial port path must not be empty.");
@@ -124,7 +124,9 @@ impl NmeaGpsState {
         let path_clone = port_path.clone();
         let worker = thread::Builder::new()
             .name("nmea-bt".into())
-            .spawn(move || nmea_serial_worker(path_clone, DEFAULT_BT_BAUD_RATE, worker_stop, tx))
+            .spawn(move || {
+                nmea_serial_worker(path_clone, DEFAULT_BT_BAUD_RATE, worker_stop, tx, protocol);
+            })
             .context("failed to spawn Bluetooth GPS worker thread")?;
 
         self.event_rx = Some(rx);
@@ -142,7 +144,7 @@ impl NmeaGpsState {
     /// Connects as a TCP **client** to a phone running an NMEA server app.
     /// The laptop dials `host:port` and reads NMEA sentences from the
     /// connection. Automatically retries on disconnect.
-    pub fn start_client(&mut self, host: &str, port: u16) -> Result<String> {
+    pub fn start_client(&mut self, host: &str, port: u16, protocol: GpsProtocol) -> Result<String> {
         let host = host.trim();
         if host.is_empty() {
             anyhow::bail!("Phone server host must not be empty.");
@@ -154,7 +156,7 @@ impl NmeaGpsState {
         let addr_clone = addr.clone();
         let worker = thread::Builder::new()
             .name("nmea-tcp-client".into())
-            .spawn(move || nmea_tcp_client_worker(addr_clone, worker_stop, tx))
+            .spawn(move || nmea_tcp_client_worker(addr_clone, worker_stop, tx, protocol))
             .context("failed to spawn NMEA TCP client worker thread")?;
 
         self.event_rx = Some(rx);
@@ -171,7 +173,7 @@ impl NmeaGpsState {
 
     /// Starts a TCP **server** (listener) that accepts connections from phone
     /// GPS apps like GPS2IP.
-    pub fn start(&mut self, host: &str, port: u16) -> Result<String> {
+    pub fn start(&mut self, host: &str, port: u16, protocol: GpsProtocol) -> Result<String> {
         let host = host.trim();
         let bind_addr = if host.is_empty() {
             format!("0.0.0.0:{port}")
@@ -184,7 +186,7 @@ impl NmeaGpsState {
         let addr_clone = bind_addr.clone();
         let worker = thread::Builder::new()
             .name("nmea-gps".into())
-            .spawn(move || nmea_tcp_worker(addr_clone, worker_stop, tx))
+            .spawn(move || nmea_tcp_worker(addr_clone, worker_stop, tx, protocol))
             .context("failed to spawn NMEA GPS worker thread")?;
 
         self.event_rx = Some(rx);
@@ -328,7 +330,12 @@ fn position_changed(last: Option<&(f64, f64)>, lat: f64, lon: f64) -> bool {
     }
 }
 
-fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGpsEvent>) {
+fn nmea_tcp_worker(
+    addr: String,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<NmeaGpsEvent>,
+    protocol: GpsProtocol,
+) {
     let listener = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(err) => {
@@ -378,7 +385,7 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
             }
             match line_result {
                 Ok(line) => {
-                    if let Some((lat, lon)) = parse_nmea_location(&line)
+                    if let Some((lat, lon)) = parse_gps_location(&line, protocol)
                         && position_changed(last_sent.as_ref(), lat, lon)
                     {
                         last_sent = Some((lat, lon));
@@ -408,7 +415,12 @@ fn nmea_tcp_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGps
 
 /// Worker for TCP **client** mode: connects to the phone's NMEA server,
 /// reads lines, and retries on disconnect until the stop flag is set.
-fn nmea_tcp_client_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<NmeaGpsEvent>) {
+fn nmea_tcp_client_worker(
+    addr: String,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<NmeaGpsEvent>,
+    protocol: GpsProtocol,
+) {
     while !stop.load(Ordering::Relaxed) {
         let stream = match std::net::TcpStream::connect_timeout(
             &addr.parse().unwrap_or_else(|_| {
@@ -452,7 +464,7 @@ fn nmea_tcp_client_worker(addr: String, stop: Arc<AtomicBool>, tx: mpsc::Sender<
             }
             match line_result {
                 Ok(line) => {
-                    if let Some((lat, lon)) = parse_nmea_location(&line)
+                    if let Some((lat, lon)) = parse_gps_location(&line, protocol)
                         && position_changed(last_sent.as_ref(), lat, lon)
                     {
                         last_sent = Some((lat, lon));
@@ -487,6 +499,7 @@ fn nmea_serial_worker(
     baud_rate: u32,
     stop: Arc<AtomicBool>,
     tx: mpsc::Sender<NmeaGpsEvent>,
+    protocol: GpsProtocol,
 ) {
     let port = match serialport::new(&port_path, baud_rate)
         .timeout(Duration::from_secs(2))
@@ -514,7 +527,7 @@ fn nmea_serial_worker(
         }
         match line_result {
             Ok(line) => {
-                if let Some((lat, lon)) = parse_nmea_location(&line)
+                if let Some((lat, lon)) = parse_gps_location(&line, protocol)
                     && position_changed(last_sent.as_ref(), lat, lon)
                 {
                     last_sent = Some((lat, lon));
@@ -542,9 +555,47 @@ fn nmea_serial_worker(
     let _ = tx.send(NmeaGpsEvent::Ended);
 }
 
+/// GPS protocol selector for worker threads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpsProtocol {
+    #[default]
+    Nmea,
+    Taip,
+}
+
+impl GpsProtocol {
+    /// Parses the protocol from a config string: `"0"` = NMEA, `"1"` = TAIP.
+    #[must_use]
+    pub fn from_config(value: &str) -> Self {
+        match value.trim() {
+            "1" => Self::Taip,
+            _ => Self::Nmea,
+        }
+    }
+
+    /// Returns the config string for persistence.
+    #[must_use]
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Nmea => "0",
+            Self::Taip => "1",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// NMEA sentence parsing
+// GPS sentence parsing (NMEA + TAIP)
 // ---------------------------------------------------------------------------
+
+/// Attempts to parse a lat/lon fix from a line, trying the protocol-specific
+/// parser first. Falls back to the other protocol if the first fails.
+#[must_use]
+pub fn parse_gps_location(line: &str, protocol: GpsProtocol) -> Option<(f64, f64)> {
+    match protocol {
+        GpsProtocol::Nmea => parse_nmea_location(line).or_else(|| parse_taip_location(line)),
+        GpsProtocol::Taip => parse_taip_location(line).or_else(|| parse_nmea_location(line)),
+    }
+}
 
 /// Attempts to parse a lat/lon fix from a single NMEA sentence.
 /// Supports `$GPGGA`, `$GNGGA`, `$GPRMC`, and `$GNRMC`.
@@ -613,12 +664,84 @@ fn parse_nmea_coordinate(value: &str, hemisphere: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// TAIP sentence parsing
+// ---------------------------------------------------------------------------
+
+/// Attempts to parse a lat/lon fix from a TAIP RPV (Position/Velocity) sentence.
+///
+/// Format: `>RPV{time5}{±lat8}{±lon9}{spd3}{hdg3}{fix1}{age1}[;ID=...][;*xx]<`
+///
+/// Latitude is `±DD.DDDDD` (sign + 2-digit degrees + 5-digit decimal fraction).
+/// Longitude is `±DDD.DDDDD` (sign + 3-digit degrees + 5-digit decimal fraction).
+/// Fix mode `9` means no fix.
+#[must_use]
+pub fn parse_taip_location(line: &str) -> Option<(f64, f64)> {
+    let line = line.trim();
+
+    // Strip optional `>` / `<` delimiters.
+    let body = line.strip_prefix('>').unwrap_or(line).split('<').next()?;
+
+    // Must start with RPV.
+    let data = body.strip_prefix("RPV")?;
+
+    // Strip optional `;ID=...` and `;*xx` suffixes — only keep the fixed-length data.
+    let data = data.split(';').next()?;
+
+    // Minimum data length: time(5) + lat(8) + lon(9) + spd(3) + hdg(3) + fix(1) + age(1) = 30
+    if data.len() < 30 {
+        return None;
+    }
+
+    // Fix mode at offset 25 (after time5 + lat8 + lon9 + spd3 = 25, then hdg3 = 28, fix at 28).
+    // Offsets: time=[0..5], lat=[5..13], lon=[13..22], spd=[22..25], hdg=[25..28], fix=[28], age=[29]
+    let fix_mode = data.as_bytes().get(28)?;
+    if *fix_mode == b'9' {
+        return None; // no fix
+    }
+
+    let lat_str = &data[5..13]; // ±DDFFFFF (8 chars)
+    let lon_str = &data[13..22]; // ±DDDFFFFF (9 chars)
+
+    let lat = parse_taip_coordinate(lat_str, 2)?;
+    let lon = parse_taip_coordinate(lon_str, 3)?;
+
+    if lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+    {
+        Some((lat, lon))
+    } else {
+        None
+    }
+}
+
+/// Parses a TAIP coordinate: sign + `degree_digits` digits of degrees + 5 digits
+/// of decimal fraction → `±DD.DDDDD` or `±DDD.DDDDD`.
+fn parse_taip_coordinate(s: &str, degree_digits: usize) -> Option<f64> {
+    if s.len() < 1 + degree_digits + 5 {
+        return None;
+    }
+    let sign = match s.as_bytes()[0] {
+        b'+' => 1.0,
+        b'-' => -1.0,
+        _ => return None,
+    };
+    let degrees: f64 = s[1..=degree_digits].parse().ok()?;
+    let fraction: f64 = s[1 + degree_digits..].parse().ok()?;
+    let scale = 10_f64.powi(s[(1 + degree_digits)..].len() as i32);
+    Some(sign * (degrees + fraction / scale))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- NMEA tests -------------------------------------------------------
 
     #[test]
     fn parse_gga_valid() {
@@ -669,5 +792,126 @@ mod tests {
         assert!(parse_nmea_location("hello world").is_none());
         assert!(parse_nmea_location("").is_none());
         assert!(parse_nmea_location("$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48").is_none());
+    }
+
+    // ---- TAIP tests -------------------------------------------------------
+
+    #[test]
+    fn taip_valid_rpv() {
+        // >RPV15714+3739438-1220384601512612<
+        let line = ">RPV15714+3739438-1220384601512612<";
+        let (lat, lon) = parse_taip_location(line).unwrap();
+        assert!((lat - 37.39438).abs() < 0.00001, "lat={lat}");
+        assert!((lon - (-122.03846)).abs() < 0.00001, "lon={lon}");
+    }
+
+    #[test]
+    fn taip_with_id_and_checksum() {
+        let line = ">RPV15714+3739438-1220384601512612;ID=1234;*7F<";
+        let (lat, lon) = parse_taip_location(line).unwrap();
+        assert!((lat - 37.39438).abs() < 0.00001);
+        assert!((lon - (-122.03846)).abs() < 0.00001);
+    }
+
+    #[test]
+    fn taip_no_fix_mode_9() {
+        let line = ">RPV15714+3739438-1220384601512692<";
+        assert!(parse_taip_location(line).is_none());
+    }
+
+    #[test]
+    fn taip_negative_latitude() {
+        // Southern hemisphere: lat = -33.86000
+        let line = ">RPV00000-3386000+1511200000000012<";
+        let (lat, lon) = parse_taip_location(line).unwrap();
+        assert!(lat < 0.0, "lat should be negative: {lat}");
+        assert!((lat - (-33.86)).abs() < 0.001);
+        assert!(lon > 0.0);
+    }
+
+    #[test]
+    fn taip_too_short() {
+        assert!(parse_taip_location(">RPV123<").is_none());
+        assert!(parse_taip_location("").is_none());
+        assert!(parse_taip_location("RPV").is_none());
+    }
+
+    #[test]
+    fn taip_without_delimiters() {
+        // Some devices send without > <
+        let line = "RPV15714+3739438-1220384601512612";
+        let (lat, lon) = parse_taip_location(line).unwrap();
+        assert!((lat - 37.39438).abs() < 0.00001);
+        assert!((lon - (-122.03846)).abs() < 0.00001);
+    }
+
+    #[test]
+    fn taip_rejects_non_rpv() {
+        assert!(parse_taip_location(">RAL15714+3739438-1220384601512612<").is_none());
+        assert!(parse_taip_location("hello world").is_none());
+    }
+
+    #[test]
+    fn taip_zero_coordinates() {
+        let line = ">RPV00000+0000000+0000000000000012<";
+        let (lat, lon) = parse_taip_location(line).unwrap();
+        assert!((lat).abs() < 0.001);
+        assert!((lon).abs() < 0.001);
+    }
+
+    // ---- Unified parser tests ---------------------------------------------
+
+    #[test]
+    fn gps_location_nmea_protocol_parses_nmea() {
+        let line = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47";
+        assert!(parse_gps_location(line, GpsProtocol::Nmea).is_some());
+    }
+
+    #[test]
+    fn gps_location_taip_protocol_parses_taip() {
+        let line = ">RPV15714+3739438-1220384601512612<";
+        assert!(parse_gps_location(line, GpsProtocol::Taip).is_some());
+    }
+
+    #[test]
+    fn gps_location_fallback_nmea_to_taip() {
+        // TAIP input with NMEA protocol selected — should fall back.
+        let line = ">RPV15714+3739438-1220384601512612<";
+        assert!(parse_gps_location(line, GpsProtocol::Nmea).is_some());
+    }
+
+    #[test]
+    fn gps_location_fallback_taip_to_nmea() {
+        // NMEA input with TAIP protocol selected — should fall back.
+        let line = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47";
+        assert!(parse_gps_location(line, GpsProtocol::Taip).is_some());
+    }
+
+    #[test]
+    fn gps_location_garbage() {
+        assert!(parse_gps_location("hello", GpsProtocol::Nmea).is_none());
+        assert!(parse_gps_location("hello", GpsProtocol::Taip).is_none());
+    }
+
+    // ---- GpsProtocol tests ------------------------------------------------
+
+    #[test]
+    fn protocol_from_config() {
+        assert_eq!(GpsProtocol::from_config("0"), GpsProtocol::Nmea);
+        assert_eq!(GpsProtocol::from_config("1"), GpsProtocol::Taip);
+        assert_eq!(GpsProtocol::from_config(""), GpsProtocol::Nmea);
+        assert_eq!(GpsProtocol::from_config("garbage"), GpsProtocol::Nmea);
+    }
+
+    #[test]
+    fn protocol_config_roundtrip() {
+        assert_eq!(
+            GpsProtocol::from_config(GpsProtocol::Nmea.as_config_str()),
+            GpsProtocol::Nmea
+        );
+        assert_eq!(
+            GpsProtocol::from_config(GpsProtocol::Taip.as_config_str()),
+            GpsProtocol::Taip
+        );
     }
 }

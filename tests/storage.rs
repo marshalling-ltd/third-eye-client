@@ -24,6 +24,7 @@ const DEFAULTS: ClientConfigDefaults<'static> = ClientConfigDefaults {
     nmea_server_host: "",
     nmea_server_port: "11123",
     nmea_stale_timeout: "10",
+    nmea_gps_protocol: "0",
     use_saved_map_tiles: "false",
     max_tile_storage_mb: "1024",
 };
@@ -57,6 +58,7 @@ fn config_and_outbox_survive_reopen() {
             nmea_server_host: String::new(),
             nmea_server_port: "11123".into(),
             nmea_stale_timeout: "10".into(),
+            nmea_gps_protocol: "0".into(),
             use_saved_map_tiles: "false".into(),
             max_tile_storage_mb: "1024".into(),
         };
