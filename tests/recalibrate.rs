@@ -58,6 +58,7 @@ fn parse_host_handles_hostname() {
 // ---- detect_rov_interface ------------------------------------------------
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn detect_interface_returns_none_for_unreachable_subnet() {
     // 1.2.3.4 is guaranteed to not be on any local interface subnet.
     assert!(detect_rov_interface("1.2.3.4").is_none());
@@ -97,18 +98,18 @@ fn recalibrate_result_delivered_from_background_thread() {
 
     thread::spawn(move || {
         // Simulate the blocking recalibration work.
-        let host = parse_host_from_http_base("http://1.2.3.4");
+        let host = parse_host_from_http_base("http://not-an-ip");
         let interface = host
             .as_deref()
             .and_then(detect_rov_interface)
             .unwrap_or_default();
         let rov_info = if interface.is_empty() {
             format!(
-                "No dedicated wired ROV interface detected for {}. Using OS routing.",
+                "No ROV interface detected for {}. Using OS routing.",
                 host.as_deref().unwrap_or("?")
             )
         } else {
-            format!("Detected wired ROV interface {interface}.")
+            format!("Detected ROV interface {interface}.")
         };
         let _ = tx.send(RecalibrateResult {
             interface,
@@ -121,6 +122,6 @@ fn recalibrate_result_delivered_from_background_thread() {
         .expect("background thread should deliver result within 5 s");
 
     assert!(result.interface.is_empty());
-    assert!(result.rov_info.contains("1.2.3.4"));
-    assert!(result.rov_info.contains("No dedicated wired ROV interface"));
+    assert!(result.rov_info.contains("not-an-ip"));
+    assert!(result.rov_info.contains("No ROV interface"));
 }
