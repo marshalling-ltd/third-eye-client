@@ -63,6 +63,10 @@ const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
 const DEFAULT_SERVER_BASE_URL: &str = "https://third-eye.marshalling.eu";
+#[cfg(target_os = "macos")]
+const DEFAULT_ROV_CLIENT_IP: &str = "192.168.1.103";
+#[cfg(target_os = "macos")]
+const DEFAULT_ROV_CLIENT_NETMASK: &str = "255.255.255.0";
 const DEFAULT_ROV_UDP_BIND_HOST: &str = "0.0.0.0";
 
 slint::include_modules!();
@@ -992,16 +996,18 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     }
 }
 
-/// Returns the local IPv4 address that the OS would use to reach the
-/// internet (i.e. the adapter with the default gateway).  Works cross-
-/// platform by connecting a UDP socket to a public IP — no data is sent,
-/// the OS just resolves which local address it would route through.
+/// Returns the first non-loopback IPv4 address on this machine.
 fn detect_local_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    // Connect to a well-known public IP. No packet is actually sent.
-    socket.connect("8.8.8.8:80").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-    Some(local_addr.ip().to_string())
+    if_addrs::get_if_addrs().ok()?.iter().find_map(|iface| {
+        if iface.is_loopback() {
+            return None;
+        }
+        if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+            Some(v4.ip.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Runs the slow parts of ROV network recalibration on a background thread.
@@ -1017,10 +1023,9 @@ fn recalibrate_rov_network_blocking(rov_http_base: &str) -> RecalibrateResult {
             rov_info: "Could not extract host from ROV HTTP API URL.".to_string(),
         };
     };
-
     if let Some(interface) = detect_rov_interface(&rov_host) {
-        let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
-        match ensure_rov_external_route(rov_http_base, &interface) {
+        let mut summary = format!("Using ROV interface {interface} for {rov_host}.");
+        match force_rov_external_route(rov_http_base, &interface) {
             Ok(()) => {
                 summary.push_str(" External stream route is ready.");
             }
@@ -1028,32 +1033,63 @@ fn recalibrate_rov_network_blocking(rov_http_base: &str) -> RecalibrateResult {
                 let _ = write!(summary, " External stream route is not ready yet: {err:#}");
             }
         }
+        // Only store the interface for HTTP client binding (IP_BOUND_IF)
+        // when it actually has an IPv4 address on the ROV subnet.
+        // Otherwise leave empty so the HTTP client uses OS routing.
+        let bindable = if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
+            interface
+        } else {
+            summary.push_str(" (HTTP via OS routing — interface has no IPv4)");
+            String::new()
+        };
         RecalibrateResult {
-            interface,
+            interface: bindable,
             rov_info: summary,
         }
     } else {
         cleanup_stale_rov_route(&rov_host);
         RecalibrateResult {
             interface: String::new(),
-            rov_info: format!(
-                "No dedicated wired ROV interface detected for {rov_host}. Using OS routing."
-            ),
+            rov_info: format!("No ROV interface detected for {rov_host}. Using OS routing."),
         }
     }
+}
+
+/// Returns `true` when `interface` has an IPv4 address on the same subnet
+/// as `rov_host`.  Used to decide whether the HTTP client should bind to
+/// the interface via `IP_BOUND_IF` (only safe when there is a usable IPv4).
+fn interface_has_rov_subnet_ipv4(interface: &str, rov_host: &str) -> bool {
+    let Ok(rov_ip) = rov_host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return false;
+    };
+    interfaces.iter().any(|iface| {
+        iface.name == interface
+            && !iface.is_loopback()
+            && matches!(&iface.addr, if_addrs::IfAddr::V4(v4) if {
+                let mask = u32::from(v4.netmask);
+                (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask)
+            })
+    })
 }
 
 fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
     state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
     let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base) else {
-        state.config.rov_network_interface.clear();
         state.rov_info = "Could not extract host from ROV HTTP API URL.".to_string();
         return;
     };
 
     if let Some(interface) = detect_rov_interface(&rov_host) {
-        state.config.rov_network_interface.clone_from(&interface);
-        let mut summary = format!("Detected wired ROV interface {interface} for {rov_host}.");
+        // Only bind HTTP/UDP to the interface when it has a usable IPv4.
+        if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
+            state.config.rov_network_interface.clone_from(&interface);
+        } else {
+            state.config.rov_network_interface.clear();
+        }
+        let mut summary = format!("Using ROV interface {interface} for {rov_host}.");
         if setup_external_route {
             match ensure_rov_external_route(&state.config.rov_http_base, &interface) {
                 Ok(()) => {
@@ -1066,12 +1102,10 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
         }
         state.rov_info = summary;
     } else {
-        state.config.rov_network_interface.clear();
         // Remove any stale host route from a previous cable session so
-        // ffmpeg falls back to the default OS routing (e.g. ROV WiFi).
+        // ffmpeg falls back to the default OS routing.
         cleanup_stale_rov_route(&rov_host);
-        state.rov_info =
-            format!("No dedicated wired ROV interface detected for {rov_host}. Using OS routing.");
+        state.rov_info = format!("No ROV interface detected for {rov_host}. Using OS routing.");
     }
 }
 
@@ -3311,12 +3345,36 @@ type TcpProxyGuard = ();
 /// is detected. Returns `Ok(())` when the route is ready, or an error
 /// if ARP/route setup failed (e.g. ROV is off).
 fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
-    let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
-    let _ = client.list_medias(None::<MediaScene>);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
+        let _ = client.list_medias(None::<MediaScene>);
+    }
     let host =
         parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
     let dummy_rtsp = format!("rtsp://x@{host}:8554/");
     ensure_rov_route_for_rtsp(&dummy_rtsp, interface)
+}
+
+/// Like [`ensure_rov_external_route`] but always re-runs the osascript admin
+/// prompt, even when a valid route already exists. Used by the Recalibrate
+/// button so the user can force a re-setup after changing network conditions.
+///
+/// On macOS: does NOT block on an HTTP probe — the route setup itself is
+/// what makes the ROV reachable, so we run osascript immediately.
+/// On Windows: performs the HTTP probe (to populate ARP) then runs the
+/// normal `route ADD` / UAC elevation path.
+fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
+    // On non-macOS platforms, the HTTP probe is still useful for ARP.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
+        let _ = client.list_medias(None::<MediaScene>);
+    }
+    let host =
+        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
+    let dummy_rtsp = format!("rtsp://x@{host}:8554/");
+    force_rov_route_for_rtsp(&dummy_rtsp, interface)
 }
 
 /// Removes a stale host route for `rov_host` that may have been created by a
@@ -3349,7 +3407,6 @@ fn cleanup_stale_rov_route(rov_host: &str) {
     let _ = Command::new("osascript")
         .arg("-e")
         .arg(&script)
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 }
@@ -3404,6 +3461,58 @@ fn cleanup_stale_rov_route(rov_host: &str) {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn cleanup_stale_rov_route(_rov_host: &str) {}
 
+/// Resolves a macOS BSD interface name (e.g. `"en5"`) to its network service
+/// name (e.g. `"USB 10/100 LAN"`) by parsing `networksetup -listnetworkserviceorder`.
+/// Returns `None` when the interface has no registered service.
+#[cfg(target_os = "macos")]
+fn find_network_service_for_interface(interface: &str) -> Option<String> {
+    let output = Command::new("networksetup")
+        .arg("-listnetworkserviceorder")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut last_service: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Service lines look like: (1) AX88179A
+        if let Some(rest) = trimmed.strip_prefix('(') {
+            if let Some(after_num) = rest.find(") ") {
+                last_service = Some(rest[after_num + 2..].to_string());
+            }
+        }
+        // Device lines look like: (Hardware Port: AX88179A, Device: en7)
+        if trimmed.starts_with("(Hardware Port:") {
+            if let Some(dev_pos) = trimmed.find("Device: ") {
+                let dev = trimmed[dev_pos + 8..].trim_end_matches(')');
+                if dev == interface {
+                    return last_service;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Builds the shell command to assign an IPv4 address to the interface.
+/// Prefers `networksetup -setmanual` (works with configd) and falls back
+/// to `ifconfig` when the interface has no registered network service.
+#[cfg(target_os = "macos")]
+fn build_ip_assign_command(interface: &str) -> String {
+    if let Some(service) = find_network_service_for_interface(interface) {
+        format!(
+            "/usr/sbin/networksetup -setmanual '{}' {} {} || true",
+            service, DEFAULT_ROV_CLIENT_IP, DEFAULT_ROV_CLIENT_NETMASK
+        )
+    } else {
+        // Use `alias` to ADD an address without first deleting (avoids
+        // SIOCDIFADDR permission-denied on interfaces managed by configd).
+        format!(
+            "/sbin/ifconfig {} alias {} netmask {} || true",
+            interface, DEFAULT_ROV_CLIENT_IP, DEFAULT_ROV_CLIENT_NETMASK
+        )
+    }
+}
+
 /// Sets up an OS-level host route + ARP entry so that ffmpeg's TCP connections
 /// to the ROV go through the correct network interface.
 ///
@@ -3412,48 +3521,111 @@ fn cleanup_stale_rov_route(_rov_host: &str) {}
 /// admin privileges with a native password dialog.
 #[cfg(target_os = "macos")]
 fn run_rov_route_osascript(rov_host: &str, interface: &str, rov_mac: &str) -> Result<()> {
+    let ip_cmd = build_ip_assign_command(interface);
     let script = format!(
         r#"do shell script "
-/sbin/route delete -host {rov_host} 2>/dev/null; 
-/sbin/route add -host {rov_host} -interface {interface}; 
-/usr/sbin/arp -d {rov_host} 2>/dev/null; 
-/usr/sbin/arp -s {rov_host} {rov_mac} ifscope {interface}
+{ip_cmd}; 
+/sbin/route delete -host {rov_host} 2>/dev/null || true; 
+/sbin/route add -host {rov_host} -interface {interface} || exit $?; 
+/usr/sbin/arp -d {rov_host} 2>/dev/null || true; 
+/usr/sbin/arp -s {rov_host} {rov_mac} ifscope {interface} || true
 " with administrator privileges"#
     );
 
-    let status = Command::new("osascript")
+    let output = Command::new("osascript")
         .arg("-e")
         .arg(&script)
-        .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .context("failed to run osascript for route setup")?;
-
-    if !status.success() {
-        anyhow::bail!("route setup via osascript failed (status {status})");
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "route setup via osascript failed (status {}): stdout={}, stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_rov_host_and_mac(rtsp_url: &str, interface: &str) -> Result<(String, String)> {
+fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
     let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
     let rov_host = parsed
         .host_str()
         .context("RTSP URL has no host")?
         .to_owned();
-    let rov_mac = read_arp_mac_on_interface(&rov_host, interface)
-        .context("ROV MAC not found in ARP table. Make an HTTP request first so the app populates the ARP entry via IP_BOUND_IF.")?;
-    Ok((rov_host, rov_mac))
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let (rov_host, rov_mac) = resolve_rov_host_and_mac(rtsp_url, interface)?;
     if has_valid_rov_route(&rov_host, interface) {
         return Ok(());
     }
-    run_rov_route_osascript(&rov_host, interface, &rov_mac)
+    match read_arp_mac_on_interface(&rov_host, interface) {
+        Some(rov_mac) => run_rov_route_osascript(&rov_host, interface, &rov_mac),
+        None => run_rov_route_only_osascript(&rov_host, interface),
+    }
+}
+
+/// Always runs the osascript admin prompt, even when a valid route already
+/// exists. Used by the Recalibrate button so the user can force a re-setup
+/// after changing the ROV IP, interface, or network.
+///
+/// If the ROV's MAC is available in the ARP table, the full route + ARP
+/// setup is performed.  Otherwise, only the host route is created (the OS
+/// will resolve ARP dynamically once traffic flows through the interface).
+#[cfg(target_os = "macos")]
+fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
+    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
+    let rov_host = parsed
+        .host_str()
+        .context("RTSP URL has no host")?
+        .to_owned();
+    match read_arp_mac_on_interface(&rov_host, interface) {
+        Some(rov_mac) => run_rov_route_osascript(&rov_host, interface, &rov_mac),
+        None => run_rov_route_only_osascript(&rov_host, interface),
+    }
+}
+
+/// Sets up the host route via osascript without a static ARP entry.
+/// Used when the ROV's MAC is not yet in the ARP table (e.g. first
+/// connection on WiFi before any HTTP probe has succeeded).
+#[cfg(target_os = "macos")]
+fn run_rov_route_only_osascript(rov_host: &str, interface: &str) -> Result<()> {
+    let ip_cmd = build_ip_assign_command(interface);
+    let script = format!(
+        r#"do shell script "
+{ip_cmd}; 
+/sbin/route delete -host {rov_host} 2>/dev/null || true; 
+/sbin/route add -host {rov_host} -interface {interface} || exit $?; 
+/usr/sbin/arp -d {rov_host} 2>/dev/null || true
+" with administrator privileges"#
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run osascript for route setup")?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "route setup via osascript failed (status {}): stdout={}, stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
+    // No macOS-specific osascript needed; delegate to the normal route setup
+    // which handles Windows `route ADD` / UAC elevation.
+    ensure_rov_route_for_rtsp(rtsp_url, interface)
 }
 
 /// Windows implementation: adds a /32 host route via `route ADD` so that
