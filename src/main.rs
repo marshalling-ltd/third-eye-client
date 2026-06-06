@@ -1011,17 +1011,13 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
 /// routing query fails.
 fn detect_local_ip() -> Option<String> {
     use std::net::UdpSocket;
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                if let std::net::IpAddr::V4(v4) = addr.ip() {
-                    if !v4.is_loopback() && !v4.is_unspecified() {
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+            && let Ok(addr) = socket.local_addr()
+                && let std::net::IpAddr::V4(v4) = addr.ip()
+                    && !v4.is_loopback() && !v4.is_unspecified() {
                         return Some(v4.to_string());
                     }
-                }
-            }
-        }
-    }
     // Fallback: first non-loopback IPv4 (no internet access / VPN edge cases).
     if_addrs::get_if_addrs().ok()?.iter().find_map(|iface| {
         if iface.is_loopback() {
@@ -1929,11 +1925,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                         // IP was assigned by osascript; re-check binding eligibility.
                         if let Some(rov_host) =
                             parse_host_from_http_base(&state.config.rov_http_base)
-                        {
-                            if interface_has_rov_subnet_ipv4(&iface, &rov_host) {
+                            && interface_has_rov_subnet_ipv4(&iface, &rov_host) {
                                 state.config.rov_network_interface.clone_from(&iface);
                             }
-                        }
                     }
                     Err(err) => {
                         state.rov_info = format!(
@@ -3534,20 +3528,18 @@ fn find_network_service_for_interface(interface: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         // Service lines look like: (1) AX88179A
-        if let Some(rest) = trimmed.strip_prefix('(') {
-            if let Some(after_num) = rest.find(") ") {
+        if let Some(rest) = trimmed.strip_prefix('(')
+            && let Some(after_num) = rest.find(") ") {
                 last_service = Some(rest[after_num + 2..].to_string());
             }
-        }
         // Device lines look like: (Hardware Port: AX88179A, Device: en7)
-        if trimmed.starts_with("(Hardware Port:") {
-            if let Some(dev_pos) = trimmed.find("Device: ") {
+        if trimmed.starts_with("(Hardware Port:")
+            && let Some(dev_pos) = trimmed.find("Device: ") {
                 let dev = trimmed[dev_pos + 8..].trim_end_matches(')');
                 if dev == interface {
                     return last_service;
                 }
             }
-        }
     }
     None
 }
@@ -3560,17 +3552,13 @@ fn find_network_service_for_interface(interface: &str) -> Option<String> {
 /// networksetup service called "ROV USB LAN" and uses that.
 #[cfg(target_os = "macos")]
 fn build_ip_assign_command(interface: &str) -> String {
-    let service = find_network_service_for_interface(interface)
-        .unwrap_or_else(|| "ROV USB LAN".to_string());
+    let service =
+        find_network_service_for_interface(interface).unwrap_or_else(|| "ROV USB LAN".to_string());
     format!(
         // Create the service if it doesn't exist yet (idempotent — the
         // error on a duplicate name is silenced by `|| true`).
         "/usr/sbin/networksetup -createnetworkservice '{service}' {interface} 2>/dev/null || true; \
-/usr/sbin/networksetup -setmanual '{service}' {ip} {mask} || true",
-        service = service,
-        interface = interface,
-        ip = DEFAULT_ROV_CLIENT_IP,
-        mask = DEFAULT_ROV_CLIENT_NETMASK,
+/usr/sbin/networksetup -setmanual '{service}' {DEFAULT_ROV_CLIENT_IP} {DEFAULT_ROV_CLIENT_NETMASK} || true",
     )
 }
 
