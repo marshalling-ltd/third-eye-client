@@ -1013,11 +1013,13 @@ fn detect_local_ip() -> Option<String> {
     use std::net::UdpSocket;
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
         && socket.connect("8.8.8.8:80").is_ok()
-            && let Ok(addr) = socket.local_addr()
-                && let std::net::IpAddr::V4(v4) = addr.ip()
-                    && !v4.is_loopback() && !v4.is_unspecified() {
-                        return Some(v4.to_string());
-                    }
+        && let Ok(addr) = socket.local_addr()
+        && let std::net::IpAddr::V4(v4) = addr.ip()
+        && !v4.is_loopback()
+        && !v4.is_unspecified()
+    {
+        return Some(v4.to_string());
+    }
     // Fallback: first non-loopback IPv4 (no internet access / VPN edge cases).
     if_addrs::get_if_addrs().ok()?.iter().find_map(|iface| {
         if iface.is_loopback() {
@@ -3529,17 +3531,19 @@ fn find_network_service_for_interface(interface: &str) -> Option<String> {
         let trimmed = line.trim();
         // Service lines look like: (1) AX88179A
         if let Some(rest) = trimmed.strip_prefix('(')
-            && let Some(after_num) = rest.find(") ") {
-                last_service = Some(rest[after_num + 2..].to_string());
-            }
+            && let Some(after_num) = rest.find(") ")
+        {
+            last_service = Some(rest[after_num + 2..].to_string());
+        }
         // Device lines look like: (Hardware Port: AX88179A, Device: en7)
         if trimmed.starts_with("(Hardware Port:")
-            && let Some(dev_pos) = trimmed.find("Device: ") {
-                let dev = trimmed[dev_pos + 8..].trim_end_matches(')');
-                if dev == interface {
-                    return last_service;
-                }
+            && let Some(dev_pos) = trimmed.find("Device: ")
+        {
+            let dev = trimmed[dev_pos + 8..].trim_end_matches(')');
+            if dev == interface {
+                return last_service;
             }
+        }
     }
     None
 }
