@@ -437,6 +437,11 @@ struct ThirdEyeState {
     recalibrate_rx: mpsc::Receiver<RecalibrateResult>,
     /// True while a background recalibration is in flight.
     recalibrate_in_progress: bool,
+    /// Raw interface name detected by `detect_rov_interface`, regardless of
+    /// whether it has an IPv4 yet.  Used so stream start can call
+    /// `ensure_rov_external_route` (which assigns the IP via osascript) even
+    /// when `rov_network_interface` is empty.
+    rov_detected_interface: String,
     /// Background startup location warmup (Windows only). A background thread
     /// calls the blocking GPS API and sends the result here; the timer loop
     /// picks it up and applies it without blocking the UI.
@@ -539,6 +544,7 @@ impl ThirdEyeState {
             recalibrate_tx,
             recalibrate_rx,
             recalibrate_in_progress: false,
+            rov_detected_interface: String::new(),
             #[cfg(target_os = "windows")]
             startup_location_rx: None,
         }
@@ -996,8 +1002,27 @@ fn persist_config(state: &ThirdEyeState, store: &AppStore) {
     }
 }
 
-/// Returns the first non-loopback IPv4 address on this machine.
+/// Returns the local IPv4 address on the interface that has the default gateway.
+///
+/// Uses the UDP-connect trick: connecting a UDP socket (without sending any
+/// data) to an external address forces the OS to select the outgoing interface
+/// via the routing table — the same interface that a DHCP-assigned default
+/// gateway uses.  Falls back to the first non-loopback IPv4 address if the
+/// routing query fails.
 fn detect_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    if !v4.is_loopback() && !v4.is_unspecified() {
+                        return Some(v4.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: first non-loopback IPv4 (no internet access / VPN edge cases).
     if_addrs::get_if_addrs().ok()?.iter().find_map(|iface| {
         if iface.is_loopback() {
             return None;
@@ -1033,14 +1058,23 @@ fn recalibrate_rov_network_blocking(rov_http_base: &str) -> RecalibrateResult {
                 let _ = write!(summary, " External stream route is not ready yet: {err:#}");
             }
         }
-        // Only store the interface for HTTP client binding (IP_BOUND_IF)
-        // when it actually has an IPv4 address on the ROV subnet.
-        // Otherwise leave empty so the HTTP client uses OS routing.
-        let bindable = if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
-            interface
-        } else {
-            summary.push_str(" (HTTP via OS routing — interface has no IPv4)");
-            String::new()
+        // Wait up to 3 s for networksetup/configd to apply the IPv4
+        // (networksetup -setmanual is asynchronous via configd).
+        let bindable = {
+            let mut found = false;
+            for _ in 0..6 {
+                if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
+                    found = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if found {
+                interface
+            } else {
+                summary.push_str(" (HTTP via OS routing — interface has no IPv4)");
+                String::new()
+            }
         };
         RecalibrateResult {
             interface: bindable,
@@ -1083,6 +1117,8 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
     };
 
     if let Some(interface) = detect_rov_interface(&rov_host) {
+        // Always remember the detected interface for route setup on stream start.
+        state.rov_detected_interface.clone_from(&interface);
         // Only bind HTTP/UDP to the interface when it has a usable IPv4.
         if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
             state.config.rov_network_interface.clone_from(&interface);
@@ -1876,12 +1912,35 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.rov_status.stop();
         {
             // Set up external route for ffmpeg now that we know the interface.
-            if let Some(iface) = state.config.rov_interface()
-                && let Err(err) = ensure_rov_external_route(&state.config.rov_http_base, iface)
-            {
-                state.rov_info = format!(
-                    "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
-                );
+            // Use the bindable interface if available; otherwise fall back to
+            // the raw detected interface (which may not have an IPv4 yet —
+            // ensure_rov_external_route will assign one via osascript).
+            let iface_for_route = state
+                .config
+                .rov_interface()
+                .map(str::to_owned)
+                .or_else(|| {
+                    let d = state.rov_detected_interface.trim();
+                    if d.is_empty() { None } else { Some(d.to_owned()) }
+                });
+            if let Some(iface) = iface_for_route {
+                match ensure_rov_external_route(&state.config.rov_http_base, &iface) {
+                    Ok(()) => {
+                        // IP was assigned by osascript; re-check binding eligibility.
+                        if let Some(rov_host) =
+                            parse_host_from_http_base(&state.config.rov_http_base)
+                        {
+                            if interface_has_rov_subnet_ipv4(&iface, &rov_host) {
+                                state.config.rov_network_interface.clone_from(&iface);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        state.rov_info = format!(
+                            "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
+                        );
+                    }
+                }
             }
             state.stream.stop();
             let rtsp_url = state.config.rtsp_url.clone();
@@ -3494,23 +3553,25 @@ fn find_network_service_for_interface(interface: &str) -> Option<String> {
 }
 
 /// Builds the shell command to assign an IPv4 address to the interface.
-/// Prefers `networksetup -setmanual` (works with configd) and falls back
-/// to `ifconfig` when the interface has no registered network service.
+///
+/// Prefers `networksetup -setmanual` via an existing registered service.
+/// When no service exists (e.g. Apple USB-C Ethernet adapters that macOS
+/// refuses to configure via `ifconfig SIOCAIFADDR`), creates a transient
+/// networksetup service called "ROV USB LAN" and uses that.
 #[cfg(target_os = "macos")]
 fn build_ip_assign_command(interface: &str) -> String {
-    if let Some(service) = find_network_service_for_interface(interface) {
-        format!(
-            "/usr/sbin/networksetup -setmanual '{}' {} {} || true",
-            service, DEFAULT_ROV_CLIENT_IP, DEFAULT_ROV_CLIENT_NETMASK
-        )
-    } else {
-        // Use `alias` to ADD an address without first deleting (avoids
-        // SIOCDIFADDR permission-denied on interfaces managed by configd).
-        format!(
-            "/sbin/ifconfig {} alias {} netmask {} || true",
-            interface, DEFAULT_ROV_CLIENT_IP, DEFAULT_ROV_CLIENT_NETMASK
-        )
-    }
+    let service = find_network_service_for_interface(interface)
+        .unwrap_or_else(|| "ROV USB LAN".to_string());
+    format!(
+        // Create the service if it doesn't exist yet (idempotent — the
+        // error on a duplicate name is silenced by `|| true`).
+        "/usr/sbin/networksetup -createnetworkservice '{service}' {interface} 2>/dev/null || true; \
+/usr/sbin/networksetup -setmanual '{service}' {ip} {mask} || true",
+        service = service,
+        interface = interface,
+        ip = DEFAULT_ROV_CLIENT_IP,
+        mask = DEFAULT_ROV_CLIENT_NETMASK,
+    )
 }
 
 /// Sets up an OS-level host route + ARP entry so that ffmpeg's TCP connections
