@@ -104,9 +104,22 @@ else
   echo "Warning: ffmpeg was not found. Stream feature may fail inside the .app bundle."
 fi
 
+# Bundle blueutil for Bluetooth device management.
+BLUEUTIL_SOURCE="$ROOT_DIR/macos/blueutil"
+if [[ -x "$BLUEUTIL_SOURCE" ]]; then
+  cp "$BLUEUTIL_SOURCE" "$MACOS_DIR/blueutil"
+  chmod 755 "$MACOS_DIR/blueutil"
+  echo "Bundled blueutil from: $BLUEUTIL_SOURCE"
+else
+  echo "Warning: blueutil not found at $BLUEUTIL_SOURCE; Bluetooth prepare will fall back to system blueutil."
+fi
+
 if command -v codesign >/dev/null 2>&1; then
   if [[ -f "$MACOS_DIR/bin/ffmpeg" ]]; then
     codesign --force --sign - "$MACOS_DIR/bin/ffmpeg" >/dev/null
+  fi
+  if [[ -f "$MACOS_DIR/blueutil" ]]; then
+    codesign --force --sign - "$MACOS_DIR/blueutil" >/dev/null
   fi
   codesign --force --sign - "$APP_BINARY_DEST" >/dev/null
   codesign --force --sign - "$APP_BUNDLE_DIR" >/dev/null

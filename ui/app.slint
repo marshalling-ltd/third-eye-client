@@ -167,8 +167,10 @@ export component AppWindow inherits Window {
 
     callback start_nmea_gps();
     callback stop_nmea_gps();
+    callback prepare_bluetooth();
     callback set_nmea_gps_mode(int);
     callback set_nmea_gps_protocol(int);
+    in-out property <bool> bt_prepared: false;
 
     callback sign_in();
     callback sign_out();
@@ -570,11 +572,11 @@ export component AppWindow inherits Window {
                             font-size: 12px;
                         }
                         if root.nmea_serial_ports != "" : Text {
-                            text: "Detected Bluetooth ports: " + root.nmea_serial_ports;
+                            text: "Paired Bluetooth ports: " + root.nmea_serial_ports + " (device must be powered on to connect)";
                             wrap: word-wrap;
                         }
                         if root.nmea_serial_ports == "" : Text {
-                            text: "No Bluetooth serial ports detected. Make sure the device is paired.";
+                            text: "No paired Bluetooth serial ports found. Pair the device in System Settings \u{2192} Bluetooth first.";
                             wrap: word-wrap;
                             color: #ff6666;
                             font-size: 12px;
@@ -593,8 +595,35 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // --- Start / Stop ---
-                    HorizontalBox {
+                    // --- Prepare / Start / Stop ---
+                    if root.nmea_gps_mode == 2 : HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Prepare Bluetooth";
+                            enabled: !root.nmea_gps_running;
+                            clicked => {
+                                root.prepare_bluetooth();
+                                root.bt_prepared = true;
+                            }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Start GPS";
+                            enabled: !root.nmea_gps_running && root.bt_prepared;
+                            clicked => { root.start_nmea_gps(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Stop";
+                            enabled: root.nmea_gps_running;
+                            clicked => {
+                                root.stop_nmea_gps();
+                                root.bt_prepared = false;
+                            }
+                        }
+                    }
+                    if root.nmea_gps_mode != 2 : HorizontalBox {
                         spacing: 8px;
                         Button {
                             horizontal-stretch: 1;
