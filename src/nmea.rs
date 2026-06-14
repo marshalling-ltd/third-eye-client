@@ -55,15 +55,21 @@ pub fn list_serial_ports() -> Vec<String> {
 /// Falls back to the full `list_serial_ports()` on unsupported platforms.
 pub fn list_bluetooth_ports() -> Vec<String> {
     let ports = serialport::available_ports().unwrap_or_default();
+
+    #[cfg(target_os = "macos")]
     let mut filtered: Vec<String> = ports
         .into_iter()
         .filter(is_likely_bluetooth_port)
         .map(|p| p.port_name)
         .collect();
 
-    // On macOS, `serialport::available_ports()` often misses Bluetooth SPP
-    // ports. Fall back to a direct `/dev/cu.*` scan and merge any ports that
-    // the crate didn't return.
+    #[cfg(not(target_os = "macos"))]
+    let filtered: Vec<String> = ports
+        .into_iter()
+        .filter(is_likely_bluetooth_port)
+        .map(|p| p.port_name)
+        .collect();
+
     #[cfg(target_os = "macos")]
     {
         if let Ok(entries) = std::fs::read_dir("/dev") {
@@ -318,7 +324,7 @@ impl NmeaGpsState {
 
     #[cfg(not(target_os = "macos"))]
     pub fn prepare_bluetooth(_port_path: &str) -> String {
-        "Bluetooth preparation is only needed on macOS.".to_string();
+        "Bluetooth preparation is only needed on macOS.".to_string()
     }
 
     #[must_use]
