@@ -16,7 +16,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: |
@@ -51,14 +51,14 @@ jobs:
         include:
           - os: macos-14
             name: macOS
-          - os: windows-latest
+          - os: windows-2025-vs2026
             name: Windows
           - os: ubuntu-latest
             name: Linux
     runs-on: ${{ matrix.os }}
     name: test (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: |
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: |

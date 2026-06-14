@@ -12,7 +12,7 @@ jobs:
   build-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -60,7 +60,7 @@ jobs:
             -ov -format UDZO \
             "Third.Eye.Client.macos-universal.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-dmg
           path: Third.Eye.Client.macos-universal.dmg
@@ -71,7 +71,7 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build
         run: cargo build --release --bin third-eye-client
@@ -110,7 +110,7 @@ jobs:
           $outFile = (Join-Path (Get-Location) "Third.Eye.Client.windows-x64-setup.exe")
           makensis /DPKG_DIR="$pkgDir" /DOUT_FILE="$outFile" installer\windows.nsi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-setup
           path: Third.Eye.Client.windows-x64-setup.exe
@@ -121,7 +121,7 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         run: |
@@ -205,19 +205,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: macos-dmg
           path: artifacts/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-setup
           path: artifacts/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-appimage
           path: artifacts/
