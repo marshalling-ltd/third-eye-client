@@ -48,16 +48,41 @@ pub fn list_serial_ports() -> Vec<String> {
 /// - **Windows**: ports tagged `SerialPortType::BluetoothPort` by the driver.
 /// - **macOS**: `/dev/cu.*` ports that are *not* `PciPort` (built-in). BT SPP
 ///   often shows as `Unknown` on macOS so we can't rely on the type alone.
+///   Falls back to a direct `/dev/cu.*` filesystem scan when the `serialport`
+///   crate misses Bluetooth ports (common on newer macOS).
 /// - **Linux**: `/dev/rfcomm*` ports (BT RFCOMM channels).
 ///
 /// Falls back to the full `list_serial_ports()` on unsupported platforms.
 pub fn list_bluetooth_ports() -> Vec<String> {
     let ports = serialport::available_ports().unwrap_or_default();
-    let filtered: Vec<String> = ports
+    let mut filtered: Vec<String> = ports
         .into_iter()
         .filter(is_likely_bluetooth_port)
         .map(|p| p.port_name)
         .collect();
+
+    // On macOS, `serialport::available_ports()` often misses Bluetooth SPP
+    // ports. Fall back to a direct `/dev/cu.*` scan and merge any ports that
+    // the crate didn't return.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("cu.") {
+                    continue;
+                }
+                let full = format!("/dev/{name}");
+                if filtered.contains(&full) {
+                    continue;
+                }
+                if is_likely_bluetooth_dev_name(&name) {
+                    filtered.push(full);
+                }
+            }
+        }
+    }
+
     filtered
 }
 
@@ -68,17 +93,34 @@ fn is_likely_bluetooth_port(port: &serialport::SerialPortInfo) -> bool {
         #[cfg(target_os = "macos")]
         SerialPortType::Unknown => {
             // On macOS, /dev/cu.* Bluetooth SPP ports show as Unknown.
-            // Exclude /dev/cu.usbmodem* and /dev/cu.usbserial* (USB adapters).
+            // Exclude system and non-BT ports.
             let name = &port.port_name;
             name.starts_with("/dev/cu.")
                 && !name.contains("usbmodem")
                 && !name.contains("usbserial")
                 && !name.contains("Bluetooth-Incoming")
+                && name != "/dev/cu.BLTH"
         }
         #[cfg(target_os = "linux")]
         SerialPortType::Unknown => port.port_name.starts_with("/dev/rfcomm"),
         _ => false,
     }
+}
+
+/// Checks whether a `/dev/cu.*` entry name (without the `/dev/` prefix) looks
+/// like a Bluetooth SPP device rather than a built-in or USB serial port.
+#[cfg(target_os = "macos")]
+fn is_likely_bluetooth_dev_name(name: &str) -> bool {
+    // `name` is e.g. "cu.BY80125B39" (without /dev/ prefix).
+    let suffix = name.strip_prefix("cu.").unwrap_or("");
+    !suffix.is_empty()
+        && !name.contains("usbmodem")
+        && !name.contains("usbserial")
+        && !name.contains("Bluetooth-Incoming")
+        && suffix != "BLTH"
+        // Exclude wlan/debug ports sometimes seen on macOS.
+        && !name.contains("wlan")
+        && !name.contains("debug")
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +254,73 @@ impl NmeaGpsState {
         self.last_fix_at_ms = 0;
     }
 
+    /// Runs `blueutil --unpair / --pair / --connect` for the given port,
+    /// then opens System Settings so the user can click Connect.
+    /// Returns a status message for the UI.
+    #[cfg(target_os = "macos")]
+    pub fn prepare_bluetooth(port_path: &str) -> String {
+        let port_path = port_path.trim();
+        let suffix = port_path.strip_prefix("/dev/cu.").unwrap_or("");
+        if suffix.is_empty() {
+            return "No Bluetooth port selected.".to_string();
+        }
+
+        // Find MAC address from system_profiler.
+        let Some(mac) = find_bt_mac_for_name(suffix) else {
+            return format!(
+                "Could not find MAC address for device '{suffix}'. \
+                        Make sure it is paired in System Settings."
+            );
+        };
+
+        // blueutil uses hyphens in MAC addresses.
+        let mac_hyphen = mac.replace(':', "-").to_lowercase();
+
+        let Some(blueutil) = find_blueutil() else {
+            return "blueutil not found. Install with: brew install blueutil".to_string();
+        };
+
+        let run = |args: &[&str]| -> Result<(), String> {
+            let output = std::process::Command::new(&blueutil)
+                .args(args)
+                .output()
+                .map_err(|e| format!("blueutil failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("blueutil {} failed: {stderr}", args.join(" ")));
+            }
+            Ok(())
+        };
+
+        // Unpair → Pair → Connect
+        if let Err(e) = run(&["--unpair", &mac_hyphen]) {
+            return format!("Unpair failed: {e}");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+
+        if let Err(e) = run(&["--pair", &mac_hyphen]) {
+            return format!("Pair failed: {e}");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+
+        let _ = run(&["--connect", &mac_hyphen]);
+
+        // Open System Settings to Bluetooth so user can click Connect.
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.BluetoothSettings")
+            .spawn();
+
+        format!(
+            "Bluetooth device '{suffix}' reset. Click Connect on it in System Settings, \
+             then click Start GPS."
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn prepare_bluetooth(_port_path: &str) -> String {
+        "Bluetooth preparation is only needed on macOS.".to_string();
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.controller.is_some()
@@ -315,6 +424,85 @@ impl Drop for NmeaGpsController {
 // ---------------------------------------------------------------------------
 
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Locates the `blueutil` binary. Checks (in order):
+/// 1. Next to the app executable (bundled in `.app/Contents/MacOS/`)
+/// 2. Common Homebrew install paths
+#[cfg(target_os = "macos")]
+fn find_blueutil() -> Option<std::path::PathBuf> {
+    // 1. Bundled: same directory as our executable.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let bundled = dir.join("blueutil");
+        if bundled.exists() {
+            return Some(bundled);
+        }
+    }
+    // 2. Homebrew paths.
+    for path in ["/usr/local/bin/blueutil", "/opt/homebrew/bin/blueutil"] {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Finds the Bluetooth MAC address for a device by searching
+/// `system_profiler SPBluetoothDataType` output for a matching name.
+#[cfg(target_os = "macos")]
+fn find_bt_mac_for_name(device_name: &str) -> Option<String> {
+    let output = std::process::Command::new("system_profiler")
+        .args(["SPBluetoothDataType"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // system_profiler outputs blocks like:
+    //     BY80125B39:
+    //         Address: FC:E8:15:26:9F:7D
+    let mut found_device = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed
+            .strip_suffix(':')
+            .is_some_and(|name| name.eq_ignore_ascii_case(device_name))
+        {
+            found_device = true;
+            continue;
+        }
+        if found_device && trimmed.starts_with("Address:") {
+            return trimmed
+                .strip_prefix("Address:")
+                .map(|a| a.trim().to_string());
+        }
+        // If we hit another device block, stop.
+        if found_device
+            && !trimmed.is_empty()
+            && !trimmed.starts_with("Address")
+            && trimmed.ends_with(':')
+        {
+            break;
+        }
+    }
+    None
+}
+
+/// How many times to retry opening a Bluetooth serial port before giving up.
+/// macOS may keep the RFCOMM channel reserved for a moment after the previous
+/// session closes.
+const BT_OPEN_RETRIES: u32 = 4;
+
+/// Delay between Bluetooth port open retries.
+const BT_OPEN_RETRY_DELAY: Duration = Duration::from_millis(800);
+
+/// Settle time after closing a Bluetooth serial port. Gives the macOS
+/// Bluetooth stack time to fully release the RFCOMM channel.
+const BT_CLOSE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Seconds to wait before retrying the full open cycle when the device is
+/// unreachable (e.g. powered off or out of range).
+const BT_RECONNECT_DELAY_SECS: u32 = 5;
 
 /// Minimum change in degrees before we send a new Fix event (~0.1 m).
 const DEDUP_THRESHOLD: f64 = 0.000_001;
@@ -492,8 +680,9 @@ fn nmea_tcp_client_worker(
     let _ = tx.send(NmeaGpsEvent::Ended);
 }
 
-/// Worker for Bluetooth / serial port NMEA. Opens the port once and reads
-/// lines until the stop flag is set or an unrecoverable error occurs.
+/// Worker for Bluetooth / serial port NMEA. Maintains a persistent connection
+/// by automatically reconnecting when the link drops. Only exits when the
+/// stop flag is set.
 fn nmea_serial_worker(
     port_path: String,
     baud_rate: u32,
@@ -501,55 +690,93 @@ fn nmea_serial_worker(
     tx: mpsc::Sender<NmeaGpsEvent>,
     protocol: GpsProtocol,
 ) {
-    let port = match serialport::new(&port_path, baud_rate)
-        .timeout(Duration::from_secs(2))
-        .open()
-    {
-        Ok(p) => p,
-        Err(err) => {
-            let _ = tx.send(NmeaGpsEvent::Error(format!(
-                "Failed to open Bluetooth port {port_path}: {err}. \
-                 Make sure the device is paired and the port name is correct."
-            )));
-            let _ = tx.send(NmeaGpsEvent::Ended);
-            return;
-        }
-    };
-    let _ = tx.send(NmeaGpsEvent::Status(format!(
-        "Bluetooth GPS connected on {port_path} ({baud_rate} baud). Waiting for fix..."
-    )));
-
-    let reader = BufReader::new(port);
     let mut last_sent: Option<(f64, f64)> = None;
-    for line_result in reader.lines() {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        match line_result {
-            Ok(line) => {
-                if let Some((lat, lon)) = parse_gps_location(&line, protocol)
-                    && position_changed(last_sent.as_ref(), lat, lon)
+
+    // Outer reconnect loop — keeps trying to (re)open the port until stopped.
+    while !stop.load(Ordering::Relaxed) {
+        let port = {
+            let mut last_err = String::new();
+            let mut opened = None;
+            for attempt in 0..BT_OPEN_RETRIES {
+                if stop.load(Ordering::Relaxed) {
+                    let _ = tx.send(NmeaGpsEvent::Ended);
+                    return;
+                }
+                match serialport::new(&port_path, baud_rate)
+                    .timeout(Duration::from_secs(2))
+                    .open()
                 {
-                    last_sent = Some((lat, lon));
-                    if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
-                        return;
+                    Ok(p) => {
+                        opened = Some(p);
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = format!("{err}");
+                        if attempt + 1 < BT_OPEN_RETRIES {
+                            let _ = tx.send(NmeaGpsEvent::Status(format!(
+                                "Bluetooth port {port_path} busy, retrying ({}/{BT_OPEN_RETRIES})...",
+                                attempt + 1
+                            )));
+                            thread::sleep(BT_OPEN_RETRY_DELAY);
+                        }
                     }
                 }
             }
-            // A 2-second read timeout is normal on quiet Bluetooth links.
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                // Just loop back and check the stop flag.
-            }
-            Err(err) => {
-                let _ = tx.send(NmeaGpsEvent::Error(format!(
-                    "Bluetooth GPS read error on {port_path}: {err}"
+            if let Some(p) = opened {
+                p
+            } else {
+                let _ = tx.send(NmeaGpsEvent::Status(format!(
+                    "Cannot open {port_path}: {last_err}. \
+                     Retrying in {BT_RECONNECT_DELAY_SECS}s..."
                 )));
+                for _ in 0..(BT_RECONNECT_DELAY_SECS * 5) {
+                    if stop.load(Ordering::Relaxed) {
+                        let _ = tx.send(NmeaGpsEvent::Ended);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                continue;
+            }
+        };
+
+        let _ = tx.send(NmeaGpsEvent::Status(format!(
+            "Bluetooth GPS connected on {port_path} ({baud_rate} baud). Waiting for fix..."
+        )));
+
+        let mut reader = BufReader::new(port);
+        let mut line_buf = String::new();
+        loop {
+            if stop.load(Ordering::Relaxed) {
                 break;
             }
+            line_buf.clear();
+            match reader.read_line(&mut line_buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some((lat, lon)) = parse_gps_location(&line_buf, protocol)
+                        && position_changed(last_sent.as_ref(), lat, lon)
+                    {
+                        last_sent = Some((lat, lon));
+                        if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => {
+                    let _ = tx.send(NmeaGpsEvent::Status(format!(
+                        "Bluetooth GPS disconnected ({err}). Reconnecting to {port_path}..."
+                    )));
+                    break;
+                }
+            }
         }
+
+        drop(reader);
+        thread::sleep(BT_CLOSE_SETTLE);
     }
 
     let _ = tx.send(NmeaGpsEvent::Ended);

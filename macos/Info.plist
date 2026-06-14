@@ -20,5 +20,7 @@
 	<string>1</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Third Eye Client uses your location to center the OpenStreetMap view near your device.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Third Eye Client connects to a Bluetooth GPS device to receive location data.</string>
 </dict>
 </plist>

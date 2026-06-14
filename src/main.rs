@@ -2558,6 +2558,43 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_prepare_bt = Rc::clone(&state);
+    let store_for_prepare_bt = Rc::clone(&store);
+    ui.on_prepare_bluetooth(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_prepare_bt.try_borrow_mut() else {
+            return;
+        };
+        pull_configuration_from_ui(&ui, &mut state, &store_for_prepare_bt);
+        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
+        let port_path = if bt_ports.is_empty() {
+            String::new()
+        } else {
+            bt_ports[0].clone()
+        };
+        if port_path.is_empty() {
+            ui.set_nmea_gps_status(
+                "No Bluetooth serial ports detected. Pair the device first.".into(),
+            );
+            return;
+        }
+        ui.set_nmea_gps_status("Preparing Bluetooth device...".into());
+        // Run blueutil on a background thread to avoid blocking the UI.
+        let ui_weak_inner = ui.as_weak();
+        let port = port_path.clone();
+        thread::spawn(move || {
+            let msg = NmeaGpsState::prepare_bluetooth(&port);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak_inner.upgrade() {
+                    ui.set_nmea_gps_status(msg.into());
+                }
+            });
+        });
+    });
+
+    let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);
     let store_for_start_nmea = Rc::clone(&store);
     ui.on_start_nmea_gps(move || {
