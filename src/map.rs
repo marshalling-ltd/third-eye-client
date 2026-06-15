@@ -25,7 +25,7 @@ pub const DEFAULT_OSM_TILE_USER_AGENT: &str =
 // Shared frame type
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RgbaFrame {
     pub width: u32,
     pub height: u32,
@@ -810,5 +810,583 @@ mod tests {
         let (lat, lon) = state.center_lat_lon(14).expect("should have center");
         assert!((lat - 51.5).abs() < 0.01);
         assert!((lon - (-0.12)).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    /// Encodes a solid-colour RGBA image as PNG bytes for decode/network tests.
+    fn solid_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        bytes
+    }
+
+    /// Builds a zero-filled `RgbaFrame` of the requested size.
+    fn solid_frame(width: u32, height: u32) -> RgbaFrame {
+        RgbaFrame {
+            width,
+            height,
+            rgba: vec![0u8; width as usize * height as usize * 4],
+        }
+    }
+
+    /// A 1x1 Slint image, handy for populating tile maps in tests.
+    fn blank_image() -> Image {
+        rgba_frame_to_slint_image(&solid_frame(1, 1))
+    }
+
+    /// Serialises tests that mutate the `OSM_TILES_URL` env var. Holding the
+    /// guard for the whole test prevents background loader threads in other
+    /// tests from observing a stale override (and never the real OSM host).
+    static OSM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_osm_env() -> std::sync::MutexGuard<'static, ()> {
+        OSM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // -----------------------------------------------------------------------
+    // PNG decode + Slint image conversion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_png_to_frame_resizes_to_tile_size() {
+        let png = solid_png(10, 10, [10, 20, 30, 255]);
+        let frame = decode_png_to_frame(&png).expect("decode ok");
+        assert_eq!(frame.width, MAP_TILE_SIZE_PX as u32);
+        assert_eq!(frame.height, MAP_TILE_SIZE_PX as u32);
+        assert_eq!(
+            frame.rgba.len(),
+            frame.width as usize * frame.height as usize * 4
+        );
+    }
+
+    #[test]
+    fn decode_png_to_frame_rejects_garbage() {
+        let err = decode_png_to_frame(&[0, 1, 2, 3, 4]).expect_err("should fail");
+        assert!(format!("{err:#}").contains("decode"));
+    }
+
+    #[test]
+    fn rgba_frame_to_slint_image_preserves_dimensions() {
+        let frame = RgbaFrame {
+            width: 4,
+            height: 6,
+            rgba: vec![0u8; 4 * 6 * 4],
+        };
+        let image = rgba_frame_to_slint_image(&frame);
+        assert_eq!(image.size().width, 4);
+        assert_eq!(image.size().height, 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Visible size / offset / viewport geometry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_visible_size_detects_change_and_noop() {
+        let mut state = MapTilesState::new();
+        assert!(state.update_visible_size(800.0, 600.0, 14));
+        assert!(!state.update_visible_size(800.0, 600.0, 14));
+    }
+
+    #[test]
+    fn update_visible_size_clamps_extremes() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(1.0, 100_000.0, 14);
+        assert!((state.visible_width - 32.0).abs() < f64::EPSILON);
+        assert!((state.visible_height - 4096.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zoom_focus_center_is_half_visible() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 14);
+        let (cx, cy) = state.zoom_focus_center();
+        assert!((cx - 400.0).abs() < f64::EPSILON);
+        assert!((cy - 300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn viewport_round_trips_offset() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 5);
+        // Negative viewport => positive offset, which survives clamping.
+        state.set_offset_from_viewport(-500.0, -300.0, 5);
+        let (vx, vy, w, h) = state.viewport_for_slint(5);
+        assert!((vx - (-500.0)).abs() < 1e-3);
+        assert!((vy - (-300.0)).abs() < 1e-3);
+        let world = MapTilesState::world_size_px(5) as f32;
+        assert!((w - world).abs() < 1.0);
+        assert!((h - world).abs() < 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Zooming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_zoom_level_same_zoom_is_noop() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 14);
+        state.center_on_location(40.0, -70.0, 14);
+        let before_x = state.offset_x;
+        let before_y = state.offset_y;
+        state.set_zoom_level(14, 14, 400.0, 300.0);
+        assert!((state.offset_x - before_x).abs() < f64::EPSILON);
+        assert!((state.offset_y - before_y).abs() < f64::EPSILON);
+        assert!(state.fallback_zoom.is_none());
+    }
+
+    #[test]
+    fn set_zoom_level_sets_fallback_and_clears_loading() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 14);
+        state.center_on_location(40.0, -70.0, 14);
+        state
+            .loading_tiles
+            .insert(TileCoordinate { z: 14, x: 1, y: 1 });
+        state.set_zoom_level(14, 15, 400.0, 300.0);
+        assert_eq!(state.fallback_zoom, Some(14));
+        assert!(state.loading_tiles.is_empty());
+    }
+
+    #[test]
+    fn set_zoom_level_keeps_center_anchored() {
+        let mut state = MapTilesState::new();
+        state.update_visible_size(800.0, 600.0, 14);
+        state.center_on_location(48.0, 2.0, 14);
+        let (cx, cy) = state.zoom_focus_center();
+        state.set_zoom_level(14, 16, cx, cy);
+        let (lat, lon) = state.center_lat_lon(16).expect("center");
+        assert!((lat - 48.0).abs() < 0.05);
+        assert!((lon - 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn center_lat_lon_round_trip_multiple_points() {
+        let points = [(0.0, 0.0), (51.5, -0.12), (-33.8, 151.2), (35.68, 139.69)];
+        for (lat, lon) in points {
+            let mut state = MapTilesState::new();
+            state.update_visible_size(800.0, 600.0, 12);
+            state.center_on_location(lat, lon, 12);
+            let (got_lat, got_lon) = state.center_lat_lon(12).expect("center");
+            assert!((got_lat - lat).abs() < 0.05, "lat {lat} got {got_lat}");
+            assert!((got_lon - lon).abs() < 0.05, "lon {lon} got {got_lon}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tile bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn coord_in_bounds_accepts_inside_and_rejects_outside() {
+        let inside = TileCoordinate { z: 10, x: 5, y: 5 };
+        assert!(MapTilesState::coord_in_bounds(&inside, 0, 0, 10, 10, 1024));
+        let negative = TileCoordinate { z: 10, x: -1, y: 5 };
+        assert!(!MapTilesState::coord_in_bounds(
+            &negative, -5, 0, 10, 10, 1024
+        ));
+        let beyond = TileCoordinate {
+            z: 10,
+            x: 1024,
+            y: 5,
+        };
+        assert!(!MapTilesState::coord_in_bounds(
+            &beyond, 0, 0, 2000, 10, 1024
+        ));
+    }
+
+    #[test]
+    fn coord_in_bounds_respects_margin() {
+        // max_x = 10, margin = 8: x = 14 is within (< 18) but x = 18 is not.
+        let within = TileCoordinate { z: 10, x: 14, y: 5 };
+        assert!(MapTilesState::coord_in_bounds(&within, 0, 0, 10, 10, 1024));
+        let edge = TileCoordinate { z: 10, x: 18, y: 5 };
+        assert!(!MapTilesState::coord_in_bounds(&edge, 0, 0, 10, 10, 1024));
+    }
+
+    // -----------------------------------------------------------------------
+    // poll_loaded_tiles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn poll_loaded_tiles_applies_current_zoom_frame() {
+        let mut state = MapTilesState::new();
+        let coord = TileCoordinate { z: 14, x: 3, y: 4 };
+        state.loading_tiles.insert(coord);
+        state
+            .tile_result_tx
+            .send(TileLoadResult {
+                coord,
+                frame: Some(solid_frame(256, 256)),
+                error: None,
+            })
+            .unwrap();
+        let (changed, err) = state.poll_loaded_tiles(14);
+        assert!(changed);
+        assert!(err.is_none());
+        assert!(state.loaded_tiles.contains_key(&coord));
+        assert!(state.tile_cache.contains_key(&coord));
+        assert!(!state.loading_tiles.contains(&coord));
+    }
+
+    #[test]
+    fn poll_loaded_tiles_reports_error_for_current_zoom() {
+        let mut state = MapTilesState::new();
+        let coord = TileCoordinate { z: 14, x: 1, y: 1 };
+        state.loading_tiles.insert(coord);
+        state
+            .tile_result_tx
+            .send(TileLoadResult {
+                coord,
+                frame: None,
+                error: Some("boom".to_string()),
+            })
+            .unwrap();
+        let (changed, err) = state.poll_loaded_tiles(14);
+        assert!(!changed);
+        assert_eq!(err.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn poll_loaded_tiles_caches_other_zoom_without_changing() {
+        let mut state = MapTilesState::new();
+        let coord = TileCoordinate { z: 10, x: 1, y: 1 };
+        state
+            .tile_result_tx
+            .send(TileLoadResult {
+                coord,
+                frame: Some(solid_frame(256, 256)),
+                error: None,
+            })
+            .unwrap();
+        let (changed, _err) = state.poll_loaded_tiles(14);
+        assert!(!changed);
+        assert!(state.tile_cache.contains_key(&coord));
+        assert!(!state.loaded_tiles.contains_key(&coord));
+    }
+
+    #[test]
+    fn poll_loaded_tiles_clears_fallback_equal_to_zoom() {
+        let mut state = MapTilesState::new();
+        state.fallback_zoom = Some(14);
+        let _ = state.poll_loaded_tiles(14);
+        assert!(state.fallback_zoom.is_none());
+    }
+
+    #[test]
+    fn poll_loaded_tiles_clears_fallback_after_enough_tiles() {
+        let mut state = MapTilesState::new();
+        state.fallback_zoom = Some(13);
+        for i in 0_isize..8 {
+            state
+                .loaded_tiles
+                .insert(TileCoordinate { z: 14, x: i, y: 0 }, blank_image());
+        }
+        state
+            .loaded_tiles
+            .insert(TileCoordinate { z: 13, x: 0, y: 0 }, blank_image());
+        let _ = state.poll_loaded_tiles(14);
+        assert!(state.fallback_zoom.is_none());
+        assert!(state.loaded_tiles.keys().all(|c| c.z == 14));
+        assert_eq!(state.loaded_tiles.len(), 8);
+    }
+
+    #[test]
+    fn poll_loaded_tiles_keeps_fallback_when_insufficient_tiles() {
+        let mut state = MapTilesState::new();
+        state.fallback_zoom = Some(13);
+        for i in 0_isize..3 {
+            state
+                .loaded_tiles
+                .insert(TileCoordinate { z: 14, x: i, y: 0 }, blank_image());
+        }
+        let _ = state.poll_loaded_tiles(14);
+        assert_eq!(state.fallback_zoom, Some(13));
+    }
+
+    // -----------------------------------------------------------------------
+    // visible_tiles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn visible_tiles_includes_current_and_fallback() {
+        let mut state = MapTilesState::new();
+        state.fallback_zoom = Some(13);
+        state
+            .loaded_tiles
+            .insert(TileCoordinate { z: 14, x: 2, y: 3 }, blank_image());
+        state
+            .loaded_tiles
+            .insert(TileCoordinate { z: 13, x: 1, y: 1 }, blank_image());
+        state
+            .loaded_tiles
+            .insert(TileCoordinate { z: 9, x: 0, y: 0 }, blank_image());
+        let tiles = state.visible_tiles(14);
+        assert_eq!(tiles.len(), 2);
+    }
+
+    #[test]
+    fn visible_tiles_scales_fallback_geometry() {
+        let mut state = MapTilesState::new();
+        state.fallback_zoom = Some(13);
+        state
+            .loaded_tiles
+            .insert(TileCoordinate { z: 13, x: 2, y: 3 }, blank_image());
+        let tiles = state.visible_tiles(14);
+        assert_eq!(tiles.len(), 1);
+        let tile = &tiles[0];
+        // render_zoom (14) is one above tile zoom (13): scale = 2.
+        let unit = MAP_TILE_SIZE_PX as f32 * 2.0;
+        assert!((tile.size - unit).abs() < f32::EPSILON);
+        assert!((tile.x - 2.0 * unit).abs() < f32::EPSILON);
+        assert!((tile.y - 3.0 * unit).abs() < f32::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // request_visible_tiles (offline paths)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_visible_tiles_promotes_cached_tiles_without_spawning() {
+        let _guard = lock_osm_env();
+        // Any accidental spawn fails fast instead of hitting the real OSM host.
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", "http://127.0.0.1:1") };
+        let mut state = MapTilesState::new();
+        state.update_visible_size(256.0, 256.0, 3);
+        state.center_on_location(0.0, 0.0, 3);
+        let (min_x, min_y, max_x, max_y, world_tiles) = state.visible_tile_bounds(3, 3);
+        for x in min_x..max_x {
+            for y in min_y..max_y {
+                if (0..world_tiles).contains(&x) && (0..world_tiles).contains(&y) {
+                    state
+                        .tile_cache
+                        .insert(TileCoordinate { z: 3, x, y }, blank_image());
+                }
+            }
+        }
+        state.request_visible_tiles(3, "agent");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        assert!(state.loading_tiles.is_empty());
+        assert!(!state.loaded_tiles.is_empty());
+        assert!(state.loaded_tiles.keys().all(|c| c.z == 3));
+    }
+
+    #[test]
+    fn request_visible_tiles_evicts_distant_zoom_when_cache_large() {
+        let _guard = lock_osm_env();
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", "http://127.0.0.1:1") };
+        let mut state = MapTilesState::new();
+        state.update_visible_size(256.0, 256.0, 14);
+        state.center_on_location(0.0, 0.0, 14);
+        // >500 cached tiles at a far-away zoom (|z - 14| > 2) trigger eviction.
+        for i in 0..600_isize {
+            state
+                .tile_cache
+                .insert(TileCoordinate { z: 3, x: i, y: 0 }, blank_image());
+        }
+        // Pre-fill the actual visible coords so the request needs no network.
+        let (min_x, min_y, max_x, max_y, world_tiles) = state.visible_tile_bounds(14, 14);
+        for x in min_x..max_x {
+            for y in min_y..max_y {
+                if (0..world_tiles).contains(&x) && (0..world_tiles).contains(&y) {
+                    state
+                        .tile_cache
+                        .insert(TileCoordinate { z: 14, x, y }, blank_image());
+                }
+            }
+        }
+        state.request_visible_tiles(14, "agent");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        assert!(state.tile_cache.keys().all(|c| c.z >= 12 && c.z <= 16));
+        assert!(state.loading_tiles.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // load_osm_tile_cached (network via mockito) + disk cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_osm_tile_cached_fetches_from_network() {
+        let _guard = lock_osm_env();
+        let mut server = mockito::Server::new();
+        let png = solid_png(8, 8, [1, 2, 3, 255]);
+        let mock = server
+            .mock("GET", "/3/1/2.png")
+            .with_status(200)
+            .with_header("content-type", "image/png")
+            .with_body(png)
+            .create();
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", server.url()) };
+        let coord = TileCoordinate { z: 3, x: 1, y: 2 };
+        let frame =
+            load_osm_tile_cached(Client::new(), coord, "agent", None, 0).expect("network ok");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        mock.assert();
+        assert_eq!(frame.width, MAP_TILE_SIZE_PX as u32);
+        assert_eq!(frame.height, MAP_TILE_SIZE_PX as u32);
+    }
+
+    #[test]
+    fn load_osm_tile_cached_maps_http_error() {
+        let _guard = lock_osm_env();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/3/1/2.png")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", server.url()) };
+        let coord = TileCoordinate { z: 3, x: 1, y: 2 };
+        let err =
+            load_osm_tile_cached(Client::new(), coord, "agent", None, 0).expect_err("should fail");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        mock.assert();
+        assert!(format!("{err:#}").contains("non-success"));
+    }
+
+    #[test]
+    fn load_osm_tile_cached_uses_disk_cache_hit() {
+        let _guard = lock_osm_env();
+        let app = third_eye_client::storage::AppStore::open_in_memory().unwrap();
+        let store = app.tile_cache().clone();
+        let png = solid_png(8, 8, [9, 9, 9, 255]);
+        store.put_tile(3, 1, 2, &png).unwrap();
+        // Unreachable URL proves the disk hit short-circuits the network.
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", "http://127.0.0.1:1") };
+        let coord = TileCoordinate { z: 3, x: 1, y: 2 };
+        let frame = load_osm_tile_cached(Client::new(), coord, "agent", Some(&store), 1_000_000)
+            .expect("disk hit");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        assert_eq!(frame.width, MAP_TILE_SIZE_PX as u32);
+    }
+
+    #[test]
+    fn load_osm_tile_cached_persists_to_disk() {
+        let _guard = lock_osm_env();
+        let app = third_eye_client::storage::AppStore::open_in_memory().unwrap();
+        let store = app.tile_cache().clone();
+        let mut server = mockito::Server::new();
+        let png = solid_png(8, 8, [4, 5, 6, 255]);
+        let mock = server
+            .mock("GET", "/5/3/7.png")
+            .with_status(200)
+            .with_body(png)
+            .create();
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", server.url()) };
+        let coord = TileCoordinate { z: 5, x: 3, y: 7 };
+        assert!(store.get_tile(5, 3, 7).unwrap().is_none());
+        let _frame = load_osm_tile_cached(Client::new(), coord, "agent", Some(&store), 10_000_000)
+            .expect("network ok");
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        mock.assert();
+        assert!(store.get_tile(5, 3, 7).unwrap().is_some());
+    }
+
+    #[test]
+    fn request_visible_tiles_spawns_loaders_and_poll_applies() {
+        let _guard = lock_osm_env();
+        let mut server = mockito::Server::new();
+        let png = solid_png(8, 8, [7, 7, 7, 255]);
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(png)
+            .create();
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::set_var("OSM_TILES_URL", server.url()) };
+        let mut state = MapTilesState::new();
+        state.update_visible_size(256.0, 256.0, 3);
+        state.center_on_location(0.0, 0.0, 3);
+        state.request_visible_tiles(3, "agent");
+        let mut changed = false;
+        for _ in 0..200 {
+            let (c, _err) = state.poll_loaded_tiles(3);
+            changed |= c;
+            if state.loading_tiles.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let drained_empty = state.loading_tiles.is_empty();
+        // Only clear the override once every loader thread has finished, so no
+        // straggler can fall back to the real OSM host.
+        // SAFETY: env access serialised by OSM_ENV_LOCK.
+        unsafe { std::env::remove_var("OSM_TILES_URL") };
+        assert!(drained_empty, "loaders did not finish in time");
+        assert!(changed);
+        assert!(!state.loaded_tiles.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CoreLocation (macOS)
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn corelocation_status_label_covers_all_branches() {
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus::NotDetermined),
+            "NotDetermined"
+        );
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus::Denied),
+            "Denied"
+        );
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus::Restricted),
+            "Restricted"
+        );
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus::AuthorizedWhenInUse),
+            "AuthorizedWhenInUse"
+        );
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus::AuthorizedAlways),
+            "AuthorizedAlways"
+        );
+        assert_eq!(
+            corelocation_status_label(CLAuthorizationStatus(99)),
+            "Unknown"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn corelocation_debug_status_handles_uninitialized_manager() {
+        let map = MapState::default();
+        let text = corelocation_debug_status(&map);
+        assert!(text.contains("manager_initialized=false"));
+        assert!(text.contains("ManagerNotInitialized"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_corelocation_warmup_fix_returns_none_without_manager() {
+        let map = MapState::default();
+        assert!(check_corelocation_warmup_fix(&map).is_none());
     }
 }
