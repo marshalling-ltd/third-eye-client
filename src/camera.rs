@@ -3,6 +3,7 @@ use reqwest::Url;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+use std::net::IpAddr;
 
 /// Photo format accepted by the camera's `/v1/capture` endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -294,9 +295,9 @@ impl CameraApiClient {
     /// Constructor that binds outgoing connections to a specific network
     /// interface (e.g. `"en10"` for a USB ethernet adapter).
     ///
-    /// On macOS this uses `IP_BOUND_IF`; on Linux `SO_BINDTODEVICE`.
-    /// On Windows, interface binding is not supported by reqwest and the
-    /// parameter is ignored (OS routing is used).
+    /// On macOS this uses `IP_BOUND_IF`; on Linux `SO_BINDTODEVICE`. On
+    /// Windows reqwest cannot bind by interface name, so the chosen NIC's
+    /// local IPv4 is resolved and used as the client's bind address instead.
     /// Pass `None` for default OS routing (equivalent to [`Self::new`]).
     #[must_use]
     #[allow(unused_variables)]
@@ -306,6 +307,15 @@ impl CameraApiClient {
         #[cfg(unix)]
         if let Some(iface) = interface {
             builder = builder.interface(iface);
+        }
+        // reqwest cannot bind to an interface by name on Windows, but binding
+        // the client's local address to that NIC's IPv4 selects the same
+        // source interface for outgoing ROV connections.
+        #[cfg(windows)]
+        if let Some(iface) = interface
+            && let Some(ip) = local_ipv4_for_interface(iface)
+        {
+            builder = builder.local_address(ip);
         }
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
@@ -577,11 +587,123 @@ fn format_legacy_error(op: &str, status: reqwest::StatusCode, body: &str) -> Str
     format!("{op} failed (HTTP {status}): {body}")
 }
 
+/// Resolves the first non-loopback IPv4 address of the named interface.
+///
+/// Used on Windows, where reqwest cannot bind to an interface by name, to
+/// translate the chosen interface into a `local_address` bind target. Pure
+/// over the supplied interface list so it can be unit-tested on any platform;
+/// loopback interfaces, name mismatches, and IPv6-only interfaces are skipped.
+#[must_use]
+pub fn local_ipv4_for_interface_from(ifaces: &[if_addrs::Interface], name: &str) -> Option<IpAddr> {
+    ifaces.iter().find_map(|iface| {
+        if iface.name != name || iface.is_loopback() {
+            return None;
+        }
+        match &iface.addr {
+            if_addrs::IfAddr::V4(v4) => Some(IpAddr::V4(v4.ip)),
+            if_addrs::IfAddr::V6(_) => None,
+        }
+    })
+}
+
+/// Live Windows wrapper around [`local_ipv4_for_interface_from`] that
+/// enumerates the host's interfaces.
+#[cfg(windows)]
+fn local_ipv4_for_interface(name: &str) -> Option<IpAddr> {
+    let ifaces = if_addrs::get_if_addrs().ok()?;
+    local_ipv4_for_interface_from(&ifaces, name)
+}
+
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    fn make_iface(name: &str, addr: if_addrs::IfAddr) -> if_addrs::Interface {
+        if_addrs::Interface {
+            name: name.to_string(),
+            addr,
+            index: None,
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    fn v4_iface(name: &str, ip: [u8; 4]) -> if_addrs::Interface {
+        make_iface(
+            name,
+            if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+        )
+    }
+
+    fn v6_iface(name: &str) -> if_addrs::Interface {
+        make_iface(
+            name,
+            if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                ip: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                netmask: Ipv6Addr::new(0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+        )
+    }
+
+    fn loopback_iface() -> if_addrs::Interface {
+        make_iface(
+            "lo0",
+            if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip: Ipv4Addr::LOCALHOST,
+                netmask: Ipv4Addr::new(255, 0, 0, 0),
+                prefixlen: 8,
+                broadcast: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn local_ipv4_picks_named_interface() {
+        let ifaces = vec![
+            v4_iface("en5", [192, 168, 1, 9]),
+            v4_iface("en0", [10, 0, 0, 2]),
+        ];
+        assert_eq!(
+            local_ipv4_for_interface_from(&ifaces, "en0"),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        );
+    }
+
+    #[test]
+    fn local_ipv4_skips_loopback_and_mismatch() {
+        let ifaces = vec![loopback_iface(), v4_iface("en5", [192, 168, 1, 9])];
+        assert_eq!(local_ipv4_for_interface_from(&ifaces, "en9"), None);
+        assert_eq!(local_ipv4_for_interface_from(&ifaces, "lo0"), None);
+    }
+
+    #[test]
+    fn local_ipv4_scans_past_ipv6_entry() {
+        // The IPv6 entry for `en5` precedes its IPv4 entry; the scan must skip
+        // past V6 and still find the V4 address.
+        let ifaces = vec![v6_iface("en5"), v4_iface("en5", [192, 168, 1, 50])];
+        assert_eq!(
+            local_ipv4_for_interface_from(&ifaces, "en5"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
+        );
+    }
+
+    #[test]
+    fn local_ipv4_none_when_only_ipv6() {
+        let ifaces = vec![v6_iface("en5")];
+        assert_eq!(local_ipv4_for_interface_from(&ifaces, "en5"), None);
+    }
 
     #[test]
     fn photo_format_api_strings() {

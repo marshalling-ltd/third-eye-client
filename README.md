@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/gh/marshalling-ltd/third-eye-client/graph/badge.svg?token=W0Ys8TfmQA)](https://codecov.io/gh/marshalling-ltd/third-eye-client)
+
 # third-eye-client
 
 Cross-platform desktop client for controlling and interacting with Chasing underwater ROVs. Built with Rust and [Slint](https://slint.dev/) for a native GUI on macOS, Windows, and Linux.

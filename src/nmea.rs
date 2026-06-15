@@ -271,6 +271,13 @@ impl NmeaGpsState {
             return "No Bluetooth port selected.".to_string();
         }
 
+        if !macos_command_available("system_profiler") {
+            return "`system_profiler` not found on PATH, so the GPS Bluetooth \
+                    address can't be looked up. It ships with macOS — ensure \
+                    /usr/sbin is on your PATH."
+                .to_string();
+        }
+
         // Find MAC address from system_profiler.
         let Some(mac) = find_bt_mac_for_name(suffix) else {
             return format!(
@@ -312,9 +319,11 @@ impl NmeaGpsState {
         let _ = run(&["--connect", &mac_hyphen]);
 
         // Open System Settings to Bluetooth so user can click Connect.
-        let _ = std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.BluetoothSettings")
-            .spawn();
+        if macos_command_available("open") {
+            let _ = std::process::Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.BluetoothSettings")
+                .spawn();
+        }
 
         format!(
             "Bluetooth device '{suffix}' reset. Click Connect on it in System Settings, \
@@ -323,8 +332,8 @@ impl NmeaGpsState {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn prepare_bluetooth(_port_path: &str) -> String {
-        "Bluetooth preparation is only needed on macOS.".to_string()
+    pub fn prepare_bluetooth(port_path: &str) -> String {
+        bluetooth_pairing_guidance(std::env::consts::OS, port_path)
     }
 
     #[must_use]
@@ -426,6 +435,43 @@ impl Drop for NmeaGpsController {
 }
 
 // ---------------------------------------------------------------------------
+// Bluetooth pairing guidance (non-macOS)
+// ---------------------------------------------------------------------------
+
+/// Builds platform-specific Bluetooth pairing guidance for platforms without
+/// the automated macOS pairing flow. `target_os` is a value like
+/// [`std::env::consts::OS`] (`"linux"`, `"windows"`, ...). Pure, so it is
+/// unit-testable on any host.
+#[must_use]
+pub fn bluetooth_pairing_guidance(target_os: &str, port_path: &str) -> String {
+    let port = port_path.trim();
+    match target_os {
+        "linux" => {
+            let target = if port.is_empty() {
+                "/dev/rfcomm0"
+            } else {
+                port
+            };
+            format!(
+                "Linux Bluetooth setup: pair the GPS with `bluetoothctl` \
+                 (power on, scan on, pair <MAC>, trust <MAC>), then bind an \
+                 RFCOMM port with `sudo rfcomm bind {target} <MAC> 1`. Once \
+                 {target} exists, select it above and click Start GPS."
+            )
+        }
+        "windows" => "Windows Bluetooth setup: pair the GPS under Settings > \
+             Bluetooth & devices, then open 'More Bluetooth settings' > COM \
+             Ports and note the 'Outgoing' COM port. Select that COM port \
+             above and click Start GPS."
+            .to_string(),
+        _ => "Automated Bluetooth pairing is only available on macOS. Pair the \
+             GPS in your OS Bluetooth settings, then select its serial port \
+             above and click Start GPS."
+            .to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------
 
@@ -453,6 +499,33 @@ fn find_blueutil() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Returns `true` if `cmd` is an absolute path that exists, or a bare command
+/// name found on `$PATH` or in the common macOS system / Homebrew binary
+/// directories. Used to surface a precise "tool not found" message instead of
+/// a misleading failure when a required CLI is missing.
+#[cfg(target_os = "macos")]
+fn macos_command_available(cmd: &str) -> bool {
+    let path = std::path::Path::new(cmd);
+    if path.is_absolute() {
+        return path.exists();
+    }
+    let mut dirs: Vec<String> = std::env::var("PATH")
+        .map(|value| value.split(':').map(str::to_owned).collect())
+        .unwrap_or_default();
+    for extra in [
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+    ] {
+        dirs.push(extra.to_owned());
+    }
+    dirs.iter()
+        .any(|dir| std::path::Path::new(dir).join(cmd).exists())
 }
 
 /// Finds the Bluetooth MAC address for a device by searching
@@ -751,33 +824,13 @@ fn nmea_serial_worker(
         )));
 
         let mut reader = BufReader::new(port);
-        let mut line_buf = String::new();
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            line_buf.clear();
-            match reader.read_line(&mut line_buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if let Some((lat, lon)) = parse_gps_location(&line_buf, protocol)
-                        && position_changed(last_sent.as_ref(), lat, lon)
-                    {
-                        last_sent = Some((lat, lon));
-                        if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::TimedOut
-                        || err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => {
-                    let _ = tx.send(NmeaGpsEvent::Status(format!(
-                        "Bluetooth GPS disconnected ({err}). Reconnecting to {port_path}..."
-                    )));
-                    break;
-                }
+        match pump_nmea_lines(&mut reader, &stop, &tx, protocol, &mut last_sent) {
+            ReadLoopExit::Stopped => break,
+            ReadLoopExit::Disconnected => {}
+            ReadLoopExit::Error(err) => {
+                let _ = tx.send(NmeaGpsEvent::Status(format!(
+                    "Bluetooth GPS disconnected ({err}). Reconnecting to {port_path}..."
+                )));
             }
         }
 
@@ -786,6 +839,58 @@ fn nmea_serial_worker(
     }
 
     let _ = tx.send(NmeaGpsEvent::Ended);
+}
+
+/// Why [`pump_nmea_lines`] stopped reading.
+enum ReadLoopExit {
+    /// The stop flag was set, or the event channel was closed; the worker
+    /// should shut down rather than reconnect.
+    Stopped,
+    /// The reader reached EOF (`Ok(0)`); the caller should reconnect.
+    Disconnected,
+    /// A non-timeout read error occurred; the caller should reconnect.
+    Error(std::io::Error),
+}
+
+/// Reads NMEA/TAIP lines from `reader`, emitting deduplicated
+/// [`NmeaGpsEvent::Fix`] events on `tx` until the stop flag is observed, EOF is
+/// reached, or a read error occurs.
+///
+/// Read timeouts (`TimedOut` / `WouldBlock`) are ignored so a blocking serial
+/// port with a short timeout still observes the stop flag promptly. `last_sent`
+/// carries dedup state across reconnects. Extracted from [`nmea_serial_worker`]
+/// behind a [`BufRead`] seam so it can be unit-tested with an in-memory reader.
+fn pump_nmea_lines<R: BufRead>(
+    reader: &mut R,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<NmeaGpsEvent>,
+    protocol: GpsProtocol,
+    last_sent: &mut Option<(f64, f64)>,
+) -> ReadLoopExit {
+    let mut line_buf = String::new();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return ReadLoopExit::Stopped;
+        }
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => return ReadLoopExit::Disconnected,
+            Ok(_) => {
+                if let Some((lat, lon)) = parse_gps_location(&line_buf, protocol)
+                    && position_changed(last_sent.as_ref(), lat, lon)
+                {
+                    *last_sent = Some((lat, lon));
+                    if tx.send(NmeaGpsEvent::Fix { lat, lon }).is_err() {
+                        return ReadLoopExit::Stopped;
+                    }
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return ReadLoopExit::Error(err),
+        }
+    }
 }
 
 /// GPS protocol selector for worker threads.
@@ -874,6 +979,11 @@ fn parse_nmea_coordinate(value: &str, hemisphere: &str) -> Option<f64> {
     if value.is_empty() || hemisphere.is_empty() {
         return None;
     }
+    // NMEA fields are ASCII; reject non-ASCII so the byte-index slicing below
+    // can never split a multi-byte UTF-8 char (which would panic).
+    if !value.is_ascii() {
+        return None;
+    }
     let dot_pos = value.find('.')?;
     if dot_pos < 2 {
         return None;
@@ -920,6 +1030,12 @@ pub fn parse_taip_location(line: &str) -> Option<(f64, f64)> {
     // Strip optional `;ID=...` and `;*xx` suffixes — only keep the fixed-length data.
     let data = data.split(';').next()?;
 
+    // TAIP data is ASCII; reject non-ASCII so the fixed byte-offset slices below
+    // cannot split a multi-byte UTF-8 char (which would panic).
+    if !data.is_ascii() {
+        return None;
+    }
+
     // Minimum data length: time(5) + lat(8) + lon(9) + spd(3) + hdg(3) + fix(1) + age(1) = 30
     if data.len() < 30 {
         return None;
@@ -952,6 +1068,10 @@ pub fn parse_taip_location(line: &str) -> Option<(f64, f64)> {
 /// Parses a TAIP coordinate: sign + `degree_digits` digits of degrees + 5 digits
 /// of decimal fraction → `±DD.DDDDD` or `±DDD.DDDDD`.
 fn parse_taip_coordinate(s: &str, degree_digits: usize) -> Option<f64> {
+    // ASCII guard: the byte-index slicing below would panic on a multi-byte char.
+    if !s.is_ascii() {
+        return None;
+    }
     if s.len() < 1 + degree_digits + 5 {
         return None;
     }
@@ -1092,6 +1212,14 @@ mod tests {
         assert!((lon).abs() < 0.001);
     }
 
+    #[test]
+    fn taip_location_rejects_non_ascii_without_panic() {
+        // 'é' (2 bytes) straddles the fixed slice boundary at byte 13, which
+        // would panic the byte-index slicing before the ASCII guard was added.
+        let line = ">RPV15714+373943\u{e9}2038400000581234<";
+        assert!(parse_taip_location(line).is_none());
+    }
+
     // ---- Unified parser tests ---------------------------------------------
 
     #[test]
@@ -1184,6 +1312,19 @@ mod tests {
     }
 
     #[test]
+    fn nmea_coordinate_rejects_non_ascii_without_panic() {
+        // 'é' (2 bytes) makes the `find('.')`-derived offset land off a char
+        // boundary; the parser must reject it rather than panic.
+        assert!(parse_nmea_coordinate("48\u{e9}7.038", "N").is_none());
+    }
+
+    #[test]
+    fn nmea_location_rejects_non_ascii_coordinate_without_panic() {
+        let line = "$GPGGA,123519,48\u{e9}7.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47";
+        assert!(parse_nmea_location(line).is_none());
+    }
+
+    #[test]
     fn nmea_location_requires_dollar_prefix() {
         assert!(parse_nmea_location("GPGGA,123519,4807.038,N,01131.000,E,1").is_none());
     }
@@ -1199,6 +1340,12 @@ mod tests {
         assert!(parse_taip_coordinate("3739438", 2).is_none());
         // Too short for sign + degrees + 5-digit fraction.
         assert!(parse_taip_coordinate("+37", 2).is_none());
+    }
+
+    #[test]
+    fn taip_coordinate_rejects_non_ascii_without_panic() {
+        // 'é' (2 bytes) makes the byte-index slices land off a char boundary.
+        assert!(parse_taip_coordinate("+3\u{e9}9438", 2).is_none());
     }
 
     // ---- position_changed -------------------------------------------------
@@ -1505,5 +1652,107 @@ mod tests {
             state.latest_location().is_some(),
             "client worker should read at least one fix"
         );
+    }
+
+    // ---- pump_nmea_lines (serial read-loop seam) --------------------------
+
+    #[test]
+    fn pump_emits_fix_event_for_nmea_line() {
+        use std::io::Cursor;
+        let data = b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47\n".to_vec();
+        let mut reader = Cursor::new(data);
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut last_sent = None;
+        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        assert!(matches!(exit, ReadLoopExit::Disconnected));
+        let NmeaGpsEvent::Fix { lat, lon } = rx.try_recv().expect("a fix event") else {
+            panic!("expected a Fix event");
+        };
+        assert!((lat - 48.1173).abs() < 0.01, "lat={lat}");
+        assert!((lon - 11.516_667).abs() < 0.01, "lon={lon}");
+        assert!(last_sent.is_some());
+    }
+
+    #[test]
+    fn pump_dedups_repeated_positions() {
+        use std::io::Cursor;
+        let line = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47\n";
+        let data = format!("{line}{line}{line}").into_bytes();
+        let mut reader = Cursor::new(data);
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut last_sent = None;
+        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        assert!(matches!(exit, ReadLoopExit::Disconnected));
+        // Three identical sentences collapse to a single Fix event.
+        assert!(matches!(rx.try_recv(), Ok(NmeaGpsEvent::Fix { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pump_reports_disconnect_on_eof() {
+        use std::io::Cursor;
+        let mut reader = Cursor::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let (tx, _rx) = mpsc::channel();
+        let mut last_sent = None;
+        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        assert!(matches!(exit, ReadLoopExit::Disconnected));
+    }
+
+    #[test]
+    fn pump_stops_without_reading_when_flag_preset() {
+        use std::io::Cursor;
+        let data = b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47\n".to_vec();
+        let mut reader = Cursor::new(data);
+        let stop = AtomicBool::new(true); // already stopped
+        let (tx, rx) = mpsc::channel();
+        let mut last_sent = None;
+        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        assert!(matches!(exit, ReadLoopExit::Stopped));
+        assert!(rx.try_recv().is_err());
+        assert!(last_sent.is_none());
+        assert_eq!(reader.position(), 0, "must not read when already stopped");
+    }
+
+    // ---- bluetooth_pairing_guidance ---------------------------------------
+
+    #[test]
+    fn bt_guidance_linux_mentions_bluetoothctl_and_rfcomm() {
+        let msg = bluetooth_pairing_guidance("linux", "/dev/rfcomm0");
+        assert!(msg.contains("bluetoothctl"), "{msg}");
+        assert!(msg.contains("rfcomm bind /dev/rfcomm0"), "{msg}");
+    }
+
+    #[test]
+    fn bt_guidance_linux_defaults_port_when_empty() {
+        let msg = bluetooth_pairing_guidance("linux", "   ");
+        assert!(msg.contains("/dev/rfcomm0"), "{msg}");
+    }
+
+    #[test]
+    fn bt_guidance_windows_mentions_com_port() {
+        let msg = bluetooth_pairing_guidance("windows", "COM5");
+        assert!(msg.contains("COM"), "{msg}");
+        assert!(msg.to_lowercase().contains("bluetooth"), "{msg}");
+    }
+
+    #[test]
+    fn bt_guidance_other_os_is_nonempty() {
+        let msg = bluetooth_pairing_guidance("freebsd", "");
+        assert!(!msg.is_empty());
+        assert!(msg.to_lowercase().contains("bluetooth"), "{msg}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_command_available_detects_known_and_missing_tools() {
+        // Found via the absolute-dir fallback even with a minimal PATH.
+        assert!(macos_command_available("ls"));
+        assert!(macos_command_available("system_profiler"));
+        assert!(macos_command_available("/bin/ls"));
+        assert!(!macos_command_available("definitely-not-a-real-binary-xyz"));
+        assert!(!macos_command_available("/nonexistent/path/to/tool"));
     }
 }
