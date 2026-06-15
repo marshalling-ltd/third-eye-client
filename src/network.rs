@@ -261,4 +261,59 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 16000
 ";
         assert_eq!(select_active_macos_ethernet_interface(ifconfig), None);
     }
+
+    #[test]
+    fn select_active_returns_none_for_empty_input() {
+        assert_eq!(select_active_macos_ethernet_interface(""), None);
+    }
+
+    #[test]
+    fn select_active_ignores_adapter_without_ether() {
+        let ifconfig = r"
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	media: autoselect (1000baseT <full-duplex>)
+	status: active
+";
+        assert_eq!(select_active_macos_ethernet_interface(ifconfig), None);
+    }
+
+    #[test]
+    fn select_active_ignores_non_wired_media_adapter() {
+        // Has ether + active, but the media line is not a wired *base* type.
+        let ifconfig = r"
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether ac:de:48:00:11:22
+	media: autoselect
+	status: active
+";
+        assert_eq!(select_active_macos_ethernet_interface(ifconfig), None);
+    }
+
+    #[test]
+    fn select_active_returns_first_matching_adapter() {
+        let ifconfig = r"
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 16000
+	ether ac:de:48:00:11:22
+	media: autoselect (100baseTX <full-duplex>)
+	status: active
+en6: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 16000
+	ether ac:de:48:00:33:44
+	media: autoselect (1000baseT <full-duplex>)
+	status: active
+";
+        assert_eq!(
+            select_active_macos_ethernet_interface(ifconfig),
+            Some("en5".to_string())
+        );
+    }
+
+    #[test]
+    fn recalibrate_result_holds_fields() {
+        let result = RecalibrateResult {
+            interface: "en10".to_string(),
+            rov_info: "Detected ROV interface en10.".to_string(),
+        };
+        assert_eq!(result.interface, "en10");
+        assert!(result.rov_info.contains("en10"));
+    }
 }

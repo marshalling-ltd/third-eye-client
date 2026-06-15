@@ -579,6 +579,8 @@ fn format_legacy_error(op: &str, status: reqwest::StatusCode, body: &str) -> Str
 
 #[cfg(test)]
 mod tests {
+    use reqwest::StatusCode;
+
     use super::*;
 
     #[test]
@@ -768,5 +770,572 @@ mod tests {
         assert!(msg.contains("404"));
         assert!(msg.contains("1101"));
         assert!(msg.contains("file not found"));
+    }
+
+    #[test]
+    fn photo_format_as_api_str() {
+        assert_eq!(PhotoFormat::Jpeg.as_api_str(), "JPEG");
+        assert_eq!(PhotoFormat::Dng.as_api_str(), "DNG");
+        assert_eq!(PhotoFormat::JpegDng.as_api_str(), "JPEG+DNG");
+    }
+
+    #[test]
+    fn media_file_stat_handles_unknown_code() {
+        assert_eq!(MediaFileStat::from_code(999), MediaFileStat::Other(999));
+    }
+
+    #[test]
+    fn capture_response_handles_missing_fields() {
+        let payload = r#"{"status":0}"#;
+        let parsed: CaptureResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.status, Some(0));
+        assert!(parsed.msg.is_none());
+        assert!(parsed.errors.is_none());
+    }
+
+    #[test]
+    fn capture_response_handles_empty_errors() {
+        let payload = r#"{"status":1,"errors":[]}"#;
+        let parsed: CaptureResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.status, Some(1));
+        assert!(parsed.errors.unwrap().is_empty());
+    }
+
+    #[test]
+    fn lamp_envelope_handles_missing_data() {
+        let payload = r#"{"status":0,"msg":"success"}"#;
+        let parsed: LampEnvelope<LampBrightnessData> = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.status, 0);
+        assert_eq!(parsed.msg, "success");
+        assert!(parsed.data.is_none());
+    }
+
+    #[test]
+    fn lamp_envelope_handles_invalid_data() {
+        let payload = r#"{"status":0,"msg":"success","data":{"invalid_field":10}}"#;
+        let parsed: Result<LampEnvelope<LampBrightnessData>, _> = serde_json::from_str(payload);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn camera_api_client_handles_invalid_url() {
+        let client = CameraApiClient::new("invalid_url".to_string());
+        let result = client.build_url(&["v1", "capture"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn camera_api_client_handles_empty_base_url() {
+        let client = CameraApiClient::new(String::new());
+        let result = client.build_url(&["v1", "capture"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn camera_api_client_handles_empty_segments() {
+        let client = CameraApiClient::new("http://example.com".to_string());
+        let result = client.build_url(&[]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "http://example.com/");
+    }
+
+    #[test]
+    fn media_info_handles_missing_fields() {
+        let payload = r#"{
+            "name": "test.mp4",
+            "size": 12345,
+            "canplayback": true,
+            "origin": {
+                "width": 1920,
+                "height": 1080,
+                "duration": 60,
+                "fps": 30,
+                "br": 10000,
+                "multi": 0,
+                "withOsd": false,
+                "id": "test.mp4",
+                "stat": 0
+            }
+        }"#;
+        let parsed: MediaInfo = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.name, "test.mp4");
+        assert_eq!(parsed.size, 12345);
+        assert!(parsed.canplayback);
+        assert!(parsed.play.is_none());
+        assert!(parsed.osd.is_none());
+    }
+
+    #[test]
+    fn media_origin_handles_invalid_stat() {
+        let origin = MediaOrigin {
+            width: 1920,
+            height: 1080,
+            duration: 60,
+            fps: 30,
+            br: 10000,
+            multi: 0,
+            with_osd: false,
+            id: "test.mp4".to_string(),
+            stat: 999,
+        };
+        assert_eq!(origin.file_stat(), MediaFileStat::Other(999));
+    }
+
+    #[test]
+    fn media_which_handles_query_value() {
+        assert_eq!(MediaWhich::Original.as_query_value(), None);
+        assert_eq!(MediaWhich::Play.as_query_value(), Some("play"));
+    }
+
+    #[test]
+    fn media_info_for_handles_query_value() {
+        assert_eq!(MediaInfoFor::Default.as_query_value(), None);
+        assert_eq!(MediaInfoFor::Repair.as_query_value(), Some("repair"));
+    }
+
+    #[test]
+    fn downloaded_media_handles_empty_content_type() {
+        let media = DownloadedMedia {
+            content_type: None,
+            bytes: vec![1, 2, 3],
+        };
+        assert!(media.content_type.is_none());
+        assert_eq!(media.bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn format_legacy_error_handles_empty_body() {
+        let msg = format_legacy_error("test operation", StatusCode::NOT_FOUND, "");
+        assert!(msg.contains("test operation failed with HTTP 404"));
+    }
+
+    #[test]
+    fn format_legacy_error_handles_invalid_json() {
+        let body = "invalid json";
+        let msg = format_legacy_error("test operation", StatusCode::BAD_REQUEST, body);
+        assert!(msg.contains("test operation failed (HTTP 400 Bad Request): invalid json"));
+    }
+
+    #[test]
+    fn format_legacy_error_falls_back_for_empty_envelope() {
+        // Valid JSON object with neither `code` nor `error` set.
+        let msg = format_legacy_error("op", StatusCode::BAD_GATEWAY, "{}");
+        assert!(msg.contains("op failed (HTTP 502"));
+        assert!(msg.contains("{}"));
+    }
+
+    #[test]
+    fn check_lamp_status_accepts_zero_and_reports_empty_msg() {
+        let ok = LampEnvelope::<serde_json::Value> {
+            status: 0,
+            msg: String::new(),
+            data: None,
+        };
+        assert!(check_lamp_status("op", &ok).is_ok());
+        let bad = LampEnvelope::<serde_json::Value> {
+            status: 9,
+            msg: String::new(),
+            data: None,
+        };
+        let err = check_lamp_status("op", &bad).unwrap_err();
+        assert!(format!("{err}").contains("<no msg>"));
+    }
+
+    // ---- constructors -----------------------------------------------------
+
+    #[test]
+    fn new_trims_trailing_slash() {
+        let client = CameraApiClient::new("http://192.168.1.88/".to_string());
+        let url = client.build_url(&["v1", "capture"]).unwrap();
+        assert_eq!(url.as_str(), "http://192.168.1.88/v1/capture");
+    }
+
+    #[test]
+    fn with_http_builds_expected_url() {
+        let client = CameraApiClient::with_http("http://cam.test".to_string(), Client::new());
+        let url = client.build_url(&["v1", "lamp"]).unwrap();
+        assert_eq!(url.as_str(), "http://cam.test/v1/lamp");
+    }
+
+    #[test]
+    fn new_bound_constructs_client() {
+        let bound = CameraApiClient::new_bound("http://cam.test".to_string(), Some("lo0"));
+        assert!(bound.build_url(&["v1", "capture"]).is_ok());
+        let unbound = CameraApiClient::new_bound("http://cam.test".to_string(), None);
+        assert!(unbound.build_url(&["v1", "capture"]).is_ok());
+    }
+
+    // ---- capture ----------------------------------------------------------
+
+    #[test]
+    fn capture_success_returns_response() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/capture")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":0,"msg":"success","data":null}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let resp = client.capture(PhotoFormat::Jpeg, 1).expect("capture ok");
+        mock.assert();
+        assert_eq!(resp.status, Some(0));
+    }
+
+    #[test]
+    fn capture_surfaces_sub_camera_errors() {
+        let mut server = mockito::Server::new();
+        let body = r#"{
+            "code": 4325377,
+            "status": 4325377,
+            "msg": "capture parallel error",
+            "errors": [
+                {"code": 4390913, "msg": "timeout", "meta": {"ip": "192.168.1.104"}}
+            ]
+        }"#;
+        let mock = server
+            .mock("POST", "/v1/capture")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client
+            .capture(PhotoFormat::JpegDng, 2)
+            .expect_err("should fail");
+        mock.assert();
+        let msg = format!("{err}");
+        assert!(msg.contains("capture failed"));
+        assert!(msg.contains("4390913"));
+        assert!(msg.contains("192.168.1.104"));
+    }
+
+    #[test]
+    fn capture_treats_unparsable_success_as_ok() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/capture")
+            .with_status(200)
+            .with_body("not json")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let resp = client.capture(PhotoFormat::Dng, 1).expect("defaults to ok");
+        mock.assert();
+        assert!(resp.status.is_none());
+    }
+
+    // ---- list_medias ------------------------------------------------------
+
+    #[test]
+    fn list_medias_returns_parsed_entries() {
+        let mut server = mockito::Server::new();
+        let body = r#"[
+            {"name":"a.jpeg","size":100,"canplayback":false,
+             "origin":{"width":0,"height":0,"duration":0,"fps":0,"br":0,"multi":0,"withOsd":false,"id":"a.jpeg","stat":0},
+             "play":null,"osd":null}
+        ]"#;
+        let mock = server
+            .mock("GET", "/v1/medias")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let medias = client.list_medias(None).expect("list ok");
+        mock.assert();
+        assert_eq!(medias.len(), 1);
+        assert_eq!(medias[0].name, "a.jpeg");
+    }
+
+    #[test]
+    fn list_medias_with_scene_sends_query() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias")
+            .match_query(mockito::Matcher::UrlEncoded("scene".into(), "1".into()))
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let medias = client
+            .list_medias(Some(MediaScene::VesselInspection))
+            .expect("list ok");
+        mock.assert();
+        assert!(medias.is_empty());
+    }
+
+    #[test]
+    fn list_medias_maps_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias")
+            .with_status(500)
+            .with_body(r#"{"code":1,"error":"boom"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client.list_medias(None).expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("list medias"));
+    }
+
+    // ---- download_media ---------------------------------------------------
+
+    #[test]
+    fn download_media_rejects_empty_name() {
+        let client = CameraApiClient::new("http://cam.test".to_string());
+        assert!(client.download_media("", MediaWhich::Original).is_err());
+    }
+
+    #[test]
+    fn download_media_returns_bytes_and_content_type() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias/a.jpeg/download")
+            .with_status(200)
+            .with_header("content-type", "image/jpeg")
+            .with_body(b"jpeg-bytes")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let media = client
+            .download_media("a.jpeg", MediaWhich::Original)
+            .expect("download ok");
+        mock.assert();
+        assert_eq!(media.bytes, b"jpeg-bytes".to_vec());
+        assert_eq!(media.content_type.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn download_media_play_variant_sends_query() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias/clip.mp4/download")
+            .match_query(mockito::Matcher::UrlEncoded("which".into(), "play".into()))
+            .with_status(200)
+            .with_body(b"mp4")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let media = client
+            .download_media("clip.mp4", MediaWhich::Play)
+            .expect("download ok");
+        mock.assert();
+        assert_eq!(media.bytes, b"mp4".to_vec());
+    }
+
+    #[test]
+    fn download_media_maps_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias/missing.jpeg/download")
+            .with_status(404)
+            .with_body("")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client
+            .download_media("missing.jpeg", MediaWhich::Original)
+            .expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("download media"));
+    }
+
+    // ---- delete_media -----------------------------------------------------
+
+    #[test]
+    fn delete_media_rejects_empty_name() {
+        let client = CameraApiClient::new("http://cam.test".to_string());
+        assert!(client.delete_media("").is_err());
+    }
+
+    #[test]
+    fn delete_media_success() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("DELETE", "/v1/medias/a.jpeg")
+            .with_status(200)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        client.delete_media("a.jpeg").expect("delete ok");
+        mock.assert();
+    }
+
+    #[test]
+    fn delete_media_maps_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("DELETE", "/v1/medias/a.jpeg")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client.delete_media("a.jpeg").expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("delete media"));
+    }
+
+    // ---- media_info -------------------------------------------------------
+
+    #[test]
+    fn media_info_rejects_empty_name() {
+        let client = CameraApiClient::new("http://cam.test".to_string());
+        assert!(
+            client
+                .media_info("", MediaInfoFor::Default, MediaWhich::Original)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn media_info_success() {
+        let mut server = mockito::Server::new();
+        let body = r#"{
+            "name":"clip.mp4","size":10,"width":1920,"height":1080,
+            "duration":17,"fps":30,"br":20480,"multi":0,"withOsd":false,"id":"clip.mp4"
+        }"#;
+        let mock = server
+            .mock("GET", "/v1/medias/clip.mp4/info")
+            // media_info always opens a query string, so the request path ends
+            // in a bare `?`; accept any (including empty) query here.
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let info = client
+            .media_info("clip.mp4", MediaInfoFor::Default, MediaWhich::Original)
+            .expect("info ok");
+        mock.assert();
+        assert_eq!(info.name, "clip.mp4");
+        assert_eq!(info.width, 1920);
+    }
+
+    #[test]
+    fn media_info_repair_sends_queries() {
+        let mut server = mockito::Server::new();
+        let body = r#"{
+            "name":"clip.mp4","size":10,"width":1,"height":1,
+            "duration":1,"fps":1,"br":1,"multi":0,"id":"clip.mp4"
+        }"#;
+        let mock = server
+            .mock("GET", "/v1/medias/clip.mp4/info")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("for".into(), "repair".into()),
+                mockito::Matcher::UrlEncoded("which".into(), "play".into()),
+            ]))
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let info = client
+            .media_info("clip.mp4", MediaInfoFor::Repair, MediaWhich::Play)
+            .expect("info ok");
+        mock.assert();
+        assert_eq!(info.name, "clip.mp4");
+    }
+
+    #[test]
+    fn media_info_maps_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/medias/x/info")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"code":1101,"error":"file not found"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client
+            .media_info("x", MediaInfoFor::Default, MediaWhich::Original)
+            .expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("media info"));
+    }
+
+    // ---- lamp -------------------------------------------------------------
+
+    #[test]
+    fn get_led_brightness_success() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/lamp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":0,"msg":"success","data":{"brightness":42}}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let brightness = client.get_led_brightness().expect("ok");
+        mock.assert();
+        assert_eq!(brightness, 42);
+    }
+
+    #[test]
+    fn get_led_brightness_status_nonzero_errors() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/lamp")
+            .with_status(200)
+            .with_body(r#"{"status":7,"msg":"lamp busy"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client.get_led_brightness().expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("lamp busy"));
+    }
+
+    #[test]
+    fn get_led_brightness_missing_data_errors() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/lamp")
+            .with_status(200)
+            .with_body(r#"{"status":0,"msg":"success"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client.get_led_brightness().expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("missing data"));
+    }
+
+    #[test]
+    fn get_led_brightness_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("GET", "/v1/lamp").with_status(500).create();
+        let client = CameraApiClient::new(server.url());
+        assert!(client.get_led_brightness().is_err());
+        mock.assert();
+    }
+
+    #[test]
+    fn set_led_brightness_success() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/lamp")
+            .with_status(200)
+            .with_body(r#"{"status":0,"msg":"success"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        client.set_led_brightness(70).expect("ok");
+        mock.assert();
+    }
+
+    #[test]
+    fn set_led_brightness_status_nonzero_errors() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/lamp")
+            .with_status(200)
+            .with_body(r#"{"status":3,"msg":"rejected"}"#)
+            .create();
+        let client = CameraApiClient::new(server.url());
+        let err = client.set_led_brightness(10).expect_err("should fail");
+        mock.assert();
+        assert!(format!("{err}").contains("rejected"));
+    }
+
+    #[test]
+    fn set_led_brightness_http_error() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/v1/lamp").with_status(500).create();
+        let client = CameraApiClient::new(server.url());
+        assert!(client.set_led_brightness(10).is_err());
+        mock.assert();
     }
 }

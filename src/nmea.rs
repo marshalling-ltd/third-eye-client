@@ -1147,4 +1147,363 @@ mod tests {
             GpsProtocol::Taip
         );
     }
+
+    #[test]
+    fn protocol_default_is_nmea() {
+        assert_eq!(GpsProtocol::default(), GpsProtocol::Nmea);
+    }
+
+    // ---- private coordinate parsers ---------------------------------------
+
+    #[test]
+    fn nmea_coordinate_rejects_bad_input() {
+        assert!(parse_nmea_coordinate("", "N").is_none());
+        assert!(parse_nmea_coordinate("4807.038", "").is_none());
+        // Dot too early: no room for the two-digit minutes field.
+        assert!(parse_nmea_coordinate("1.5", "N").is_none());
+        // Invalid hemisphere indicator.
+        assert!(parse_nmea_coordinate("4807.038", "X").is_none());
+    }
+
+    #[test]
+    fn nmea_coordinate_parses_every_hemisphere() {
+        let n = parse_nmea_coordinate("4807.038", "N").unwrap();
+        assert!((n - 48.1173).abs() < 0.001);
+        let s = parse_nmea_coordinate("4807.038", "S").unwrap();
+        assert!((s + 48.1173).abs() < 0.001);
+        let e = parse_nmea_coordinate("01131.000", "E").unwrap();
+        assert!((e - 11.516_667).abs() < 0.001);
+        let w = parse_nmea_coordinate("01131.000", "W").unwrap();
+        assert!((w + 11.516_667).abs() < 0.001);
+    }
+
+    #[test]
+    fn nmea_coordinate_rejects_out_of_range() {
+        // Degrees + minutes well outside [-180, 180].
+        assert!(parse_nmea_coordinate("999999.000", "N").is_none());
+    }
+
+    #[test]
+    fn nmea_location_requires_dollar_prefix() {
+        assert!(parse_nmea_location("GPGGA,123519,4807.038,N,01131.000,E,1").is_none());
+    }
+
+    #[test]
+    fn nmea_location_rejects_short_sentence() {
+        assert!(parse_nmea_location("$GPGGA,123519,4807.038").is_none());
+    }
+
+    #[test]
+    fn taip_coordinate_rejects_bad_sign_and_length() {
+        // Missing leading sign.
+        assert!(parse_taip_coordinate("3739438", 2).is_none());
+        // Too short for sign + degrees + 5-digit fraction.
+        assert!(parse_taip_coordinate("+37", 2).is_none());
+    }
+
+    // ---- position_changed -------------------------------------------------
+
+    #[test]
+    fn position_changed_detects_movement() {
+        assert!(position_changed(None, 1.0, 2.0));
+        let last = (1.0, 2.0);
+        assert!(!position_changed(Some(&last), 1.0, 2.0));
+        // Below the dedup threshold in both axes.
+        assert!(!position_changed(Some(&last), 1.000_000_1, 2.000_000_1));
+        // Above the threshold in latitude, then in longitude.
+        assert!(position_changed(Some(&last), 1.01, 2.0));
+        assert!(position_changed(Some(&last), 1.0, 2.01));
+    }
+
+    #[test]
+    fn now_ms_is_positive() {
+        assert!(now_ms() > 0);
+    }
+
+    // ---- NmeaGpsState defaults & accessors --------------------------------
+
+    #[test]
+    fn state_default_is_idle() {
+        let state = NmeaGpsState::default();
+        assert!(!state.is_running());
+        assert!(state.latest_location().is_none());
+        assert_eq!(state.status_text(), "");
+        assert_eq!(state.fixes_received(), 0);
+        assert!(!state.has_recent_fix(10_000));
+    }
+
+    #[test]
+    fn set_status_overwrites_text() {
+        let mut state = NmeaGpsState::default();
+        state.set_status("hello".to_string());
+        assert_eq!(state.status_text(), "hello");
+    }
+
+    #[test]
+    fn start_client_rejects_empty_host() {
+        let mut state = NmeaGpsState::default();
+        assert!(state.start_client("   ", 1234, GpsProtocol::Nmea).is_err());
+    }
+
+    #[test]
+    fn start_bluetooth_rejects_empty_path() {
+        let mut state = NmeaGpsState::default();
+        assert!(state.start_bluetooth("  ", GpsProtocol::Nmea).is_err());
+    }
+
+    #[test]
+    fn prepare_bluetooth_handles_empty_port() {
+        // On macOS this short-circuits before touching blueutil; elsewhere it
+        // returns the platform message. Either way it must be non-empty.
+        let msg = NmeaGpsState::prepare_bluetooth("");
+        assert!(!msg.is_empty());
+    }
+
+    // ---- poll_events via injected events ----------------------------------
+
+    #[test]
+    fn poll_events_records_fix() {
+        let mut state = NmeaGpsState::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(NmeaGpsEvent::Fix {
+            lat: 12.5,
+            lon: -3.25,
+        })
+        .unwrap();
+        state.event_rx = Some(rx);
+        assert!(state.poll_events());
+        let (lat, lon) = state.latest_location().expect("fix recorded");
+        assert!((lat - 12.5).abs() < f64::EPSILON);
+        assert!((lon + 3.25).abs() < f64::EPSILON);
+        assert_eq!(state.fixes_received(), 1);
+        assert!(state.status_text().contains("fix"));
+    }
+
+    #[test]
+    fn poll_events_counts_multiple_fixes() {
+        let mut state = NmeaGpsState::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(NmeaGpsEvent::Fix { lat: 1.0, lon: 1.0 }).unwrap();
+        tx.send(NmeaGpsEvent::Fix { lat: 2.0, lon: 2.0 }).unwrap();
+        state.event_rx = Some(rx);
+        assert!(state.poll_events());
+        assert_eq!(state.fixes_received(), 2);
+        let (lat, _) = state.latest_location().unwrap();
+        assert!((lat - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn poll_events_applies_status_then_keeps_it_on_end() {
+        let mut state = NmeaGpsState::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(NmeaGpsEvent::Status("connected".to_string()))
+            .unwrap();
+        tx.send(NmeaGpsEvent::Ended).unwrap();
+        state.event_rx = Some(rx);
+        assert!(!state.poll_events());
+        assert_eq!(state.status_text(), "connected");
+        assert!(!state.is_running());
+        assert!(state.event_rx.is_none());
+    }
+
+    #[test]
+    fn poll_events_reports_error_text() {
+        let mut state = NmeaGpsState::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(NmeaGpsEvent::Error("boom".to_string())).unwrap();
+        state.event_rx = Some(rx);
+        assert!(!state.poll_events());
+        assert_eq!(state.status_text(), "boom");
+    }
+
+    #[test]
+    fn poll_events_handles_disconnect_with_empty_status() {
+        let mut state = NmeaGpsState::default();
+        let (tx, rx) = mpsc::channel::<NmeaGpsEvent>();
+        drop(tx);
+        state.event_rx = Some(rx);
+        assert!(!state.poll_events());
+        assert_eq!(state.status_text(), "NMEA GPS connection ended.");
+        assert!(state.event_rx.is_none());
+    }
+
+    #[test]
+    fn poll_events_without_channel_is_noop() {
+        let mut state = NmeaGpsState::default();
+        assert!(!state.poll_events());
+    }
+
+    // ---- controller lifecycle & has_recent_fix ----------------------------
+
+    #[test]
+    fn has_recent_fix_requires_running_and_fresh_timestamp() {
+        let mut state = NmeaGpsState {
+            controller: Some(NmeaGpsController {
+                stop_flag: Arc::new(AtomicBool::new(false)),
+                worker: None,
+            }),
+            ..Default::default()
+        };
+        assert!(state.is_running());
+        // Running but no fix yet.
+        assert!(!state.has_recent_fix(10_000));
+        state.last_fix_at_ms = now_ms();
+        assert!(state.has_recent_fix(10_000));
+        // Stale timestamp falls outside the window.
+        state.last_fix_at_ms = now_ms() - 20_000;
+        assert!(!state.has_recent_fix(10_000));
+    }
+
+    #[test]
+    fn stop_clears_controller_and_resets_counters() {
+        let mut state = NmeaGpsState {
+            controller: Some(NmeaGpsController {
+                stop_flag: Arc::new(AtomicBool::new(false)),
+                worker: None,
+            }),
+            fixes_received: 7,
+            last_fix_at_ms: now_ms(),
+            ..Default::default()
+        };
+        state.stop();
+        assert!(!state.is_running());
+        assert_eq!(state.fixes_received(), 0);
+        assert_eq!(state.status_text(), "NMEA GPS listener stopped.");
+    }
+
+    // ---- serial port helpers ----------------------------------------------
+
+    #[test]
+    fn list_helpers_do_not_panic() {
+        let _ = list_serial_ports();
+        let _ = list_bluetooth_ports();
+    }
+
+    #[test]
+    fn is_likely_bluetooth_port_classifies_types() {
+        use serialport::{SerialPortInfo, SerialPortType};
+        let bt = SerialPortInfo {
+            port_name: "/dev/cu.GPS".to_string(),
+            port_type: SerialPortType::BluetoothPort,
+        };
+        assert!(is_likely_bluetooth_port(&bt));
+        let pci = SerialPortInfo {
+            port_name: "/dev/cu.serial".to_string(),
+            port_type: SerialPortType::PciPort,
+        };
+        assert!(!is_likely_bluetooth_port(&pci));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unknown_cu_port_is_bluetooth() {
+        use serialport::{SerialPortInfo, SerialPortType};
+        let unknown = SerialPortInfo {
+            port_name: "/dev/cu.BY80125B39".to_string(),
+            port_type: SerialPortType::Unknown,
+        };
+        assert!(is_likely_bluetooth_port(&unknown));
+        let usb = SerialPortInfo {
+            port_name: "/dev/cu.usbmodem1234".to_string(),
+            port_type: SerialPortType::Unknown,
+        };
+        assert!(!is_likely_bluetooth_port(&usb));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bluetooth_dev_name_filter() {
+        assert!(is_likely_bluetooth_dev_name("cu.BY80125B39"));
+        assert!(!is_likely_bluetooth_dev_name("cu.usbmodem1234"));
+        assert!(!is_likely_bluetooth_dev_name("cu.usbserial-10"));
+        assert!(!is_likely_bluetooth_dev_name("cu.Bluetooth-Incoming-Port"));
+        assert!(!is_likely_bluetooth_dev_name("cu.BLTH"));
+        assert!(!is_likely_bluetooth_dev_name("cu."));
+    }
+
+    // ---- worker integration (real localhost sockets) ---------------------
+
+    #[test]
+    fn tcp_server_worker_reports_fix() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let mut state = NmeaGpsState::default();
+        state.start("127.0.0.1", port, GpsProtocol::Nmea).unwrap();
+        assert!(state.is_running());
+
+        // The worker binds asynchronously; retry connecting briefly.
+        let mut stream = None;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                stream = Some(s);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut stream = stream.expect("listener should accept a connection");
+        stream
+            .write_all(b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47\n")
+            .unwrap();
+        stream.flush().unwrap();
+
+        let start = Instant::now();
+        while state.latest_location().is_none() && start.elapsed() < Duration::from_secs(3) {
+            state.poll_events();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (lat, lon) = state
+            .latest_location()
+            .expect("server worker should report a fix");
+        assert!((lat - 48.1173).abs() < 0.01, "lat={lat}");
+        assert!((lon - 11.516_667).abs() < 0.01, "lon={lon}");
+        state.stop();
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn tcp_client_worker_reads_fix() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Stand in for the phone's NMEA server: accept once, stream a sentence.
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(
+                    b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A\n",
+                );
+                let _ = stream.flush();
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+
+        let mut state = NmeaGpsState::default();
+        state
+            .start_client("127.0.0.1", port, GpsProtocol::Nmea)
+            .unwrap();
+
+        let start = Instant::now();
+        while state.latest_location().is_none() && start.elapsed() < Duration::from_secs(3) {
+            state.poll_events();
+            thread::sleep(Duration::from_millis(20));
+        }
+        state.stop();
+        let _ = handle.join();
+        assert!(
+            state.latest_location().is_some(),
+            "client worker should read at least one fix"
+        );
+    }
 }
