@@ -182,6 +182,11 @@ export component AppWindow inherits Window {
     callback map_flicked(length, length, length, length);
     callback map_zoom_in(length, length, length, length);
     callback map_zoom_out(length, length, length, length);
+    // Mouse-wheel / trackpad / touchscreen scroll zoom. Args:
+    // (delta_y, viewport_x, viewport_y, canvas_width, canvas_height).
+    // Positive delta_y zooms in, negative zooms out; the Rust side rate-limits
+    // so one scroll/gesture advances at most one zoom level.
+    callback map_scroll_zoom(length, length, length, length, length);
     callback center_map_on_pin(length, length, length, length);
 
     callback start_stream();
@@ -1171,6 +1176,28 @@ export component AppWindow inherits Window {
                         viewport-y <=> root.map_viewport_y;
                         viewport-width: root.map_viewport_width;
                         viewport-height: root.map_viewport_height;
+
+                        // Invisible layer tracking the visible map area. It
+                        // turns mouse-wheel / trackpad / touchscreen scroll
+                        // gestures into single-step zoom. Returning `accept`
+                        // stops the Flickable from panning on scroll; press +
+                        // drag still pans as before.
+                        TouchArea {
+                            x: -parent.viewport-x;
+                            y: -parent.viewport-y;
+                            width: parent.width;
+                            height: parent.height;
+                            scroll-event(event) => {
+                                root.map_scroll_zoom(
+                                    event.delta-y,
+                                    parent.viewport-x,
+                                    parent.viewport-y,
+                                    map_canvas.width,
+                                    map_canvas.height
+                                );
+                                accept
+                            }
+                        }
 
                         for tile in root.map_tiles : Image {
                             x: tile.x;

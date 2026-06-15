@@ -412,6 +412,11 @@ struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
     suppress_next_map_flick: bool,
+    /// Deadline (unix-ms) until which scroll/gesture (mouse-wheel, trackpad,
+    /// touchscreen) zoom is "settling": further scroll/gesture zoom events are
+    /// ignored until this passes or the new zoom's tiles have been applied.
+    /// `0` means not engaged. See `scroll_zoom_allowed`.
+    zoom_settle_until_ms: i64,
     config: AppConfig,
     map: MapState,
     map_tiles: MapTilesState,
@@ -524,6 +529,7 @@ impl ThirdEyeState {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
             suppress_next_map_flick: false,
+            zoom_settle_until_ms: 0,
             config,
             map: MapState {
                 zoom: DEFAULT_ZOOM,
@@ -1619,6 +1625,25 @@ fn current_unix_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Maximum time (ms) a scroll/gesture zoom step stays "settling" before another
+/// step is allowed, even if the new zoom's tiles never finish loading (e.g.
+/// offline or tile-server errors). This bounds the gate so scroll zoom can't
+/// get stuck, while still rate-limiting fast scroll/gesture bursts.
+const ZOOM_SETTLE_TIMEOUT_MS: i64 = 700;
+
+/// Returns `true` when a scroll/gesture (mouse-wheel, trackpad, touchscreen)
+/// zoom step is currently allowed.
+///
+/// After a step, zoom is marked "settling" by storing a deadline in
+/// `settle_until_ms`. Further scroll/gesture events are ignored until the new
+/// zoom level's tiles have been applied (`fallback_zoom` cleared back to
+/// `None`) or the safety deadline passes. The result: one scroll notch / one
+/// trackpad or touchscreen gesture advances at most one zoom level (matching
+/// the +/- buttons); the user repeats the gesture to keep zooming.
+fn scroll_zoom_allowed(now_ms: i64, settle_until_ms: i64, fallback_zoom: Option<u32>) -> bool {
+    settle_until_ms == 0 || fallback_zoom.is_none() || now_ms >= settle_until_ms
+}
+
 /// Reconciles the ROV media list and writes a `capture_metadata` row for the
 /// file that was most recently seen. Returns `(summary_text, media_id, name)`
 /// so the caller can also download the file immediately.
@@ -1787,6 +1812,62 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.set_map_zoom(next_zoom, focus_x, focus_y);
             state.suppress_next_map_flick = true;
             state.map.status = format!("Zoomed out to {}.", state.map.zoom);
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_scroll_zoom = Rc::clone(&state);
+    ui.on_map_scroll_zoom(
+        move |delta_y, viewport_x, viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let Ok(mut state) = state_for_map_scroll_zoom.try_borrow_mut() else {
+                return;
+            };
+            // Scroll up / away from the user (positive delta) zooms in; scroll
+            // down / toward the user (negative delta) zooms out. A zero vertical
+            // delta (e.g. a purely horizontal trackpad swipe) is ignored.
+            let zoom_in = if delta_y > 0.0 {
+                true
+            } else if delta_y < 0.0 {
+                false
+            } else {
+                return;
+            };
+            // Rate-limit scroll/touch/trackpad zoom so one gesture advances at
+            // most one level: ignore events while the previous step's tiles are
+            // still being applied. Without this a single trackpad/touchscreen
+            // gesture could skip many zoom levels at once.
+            if !scroll_zoom_allowed(
+                current_unix_ms(),
+                state.zoom_settle_until_ms,
+                state.map_tiles.fallback_zoom,
+            ) {
+                return;
+            }
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+            state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
+            state.viewport_anim = None;
+            let current_zoom = state.map.zoom;
+            let next_zoom = if zoom_in {
+                current_zoom.saturating_add(1).min(MAX_ZOOM)
+            } else {
+                current_zoom.saturating_sub(1).max(MIN_ZOOM)
+            };
+            if next_zoom == current_zoom {
+                // Already at the zoom limit; nothing to do.
+                return;
+            }
+            let (focus_x, focus_y) = state.map_tiles.zoom_focus_center();
+            state.set_map_zoom(next_zoom, focus_x, focus_y);
+            state.suppress_next_map_flick = true;
+            let direction = if zoom_in { "in" } else { "out" };
+            state.map.status = format!("Zoomed {direction} to {}.", state.map.zoom);
+            // Engage the settle gate: the next scroll/gesture is ignored until
+            // the new zoom's tiles are applied or this deadline passes.
+            state.zoom_settle_until_ms = current_unix_ms() + ZOOM_SETTLE_TIMEOUT_MS;
             apply_map_runtime_to_ui(&ui, &state);
         },
     );
@@ -4191,4 +4272,47 @@ fn main() -> Result<()> {
     store.shutdown();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ZOOM_SETTLE_TIMEOUT_MS, scroll_zoom_allowed};
+
+    #[test]
+    fn scroll_zoom_allowed_when_gate_not_engaged() {
+        // settle_until_ms == 0 => no scroll zoom has been gated yet.
+        assert!(scroll_zoom_allowed(1_000, 0, Some(14)));
+        assert!(scroll_zoom_allowed(1_000, 0, None));
+    }
+
+    #[test]
+    fn scroll_zoom_blocked_while_unsettled_before_deadline() {
+        // Tiles for the new zoom are still loading (fallback_zoom is Some) and
+        // we are before the safety deadline => the next step is blocked.
+        let now = 1_000;
+        let settle_until = now + ZOOM_SETTLE_TIMEOUT_MS;
+        assert!(!scroll_zoom_allowed(now, settle_until, Some(13)));
+    }
+
+    #[test]
+    fn scroll_zoom_allowed_once_tiles_settled() {
+        // fallback_zoom cleared => new zoom tiles applied => allowed even before
+        // the deadline.
+        let now = 1_000;
+        let settle_until = now + ZOOM_SETTLE_TIMEOUT_MS;
+        assert!(scroll_zoom_allowed(now, settle_until, None));
+    }
+
+    #[test]
+    fn scroll_zoom_allowed_after_deadline_even_if_unsettled() {
+        // Tiles never settled (e.g. offline), but the safety deadline passed =>
+        // allowed, so scroll zoom can't get permanently stuck.
+        let settle_until = 1_000;
+        assert!(scroll_zoom_allowed(settle_until, settle_until, Some(13)));
+        assert!(scroll_zoom_allowed(
+            settle_until + 1,
+            settle_until,
+            Some(13)
+        ));
+    }
 }
