@@ -1,4 +1,4 @@
-[![codecov](https://codecov.io/gh/marshalling-ltd/third-eye-client/graph/badge.svg?token=W0Ys8TfmQA)](https://codecov.io/gh/marshalling-ltd/third-eye-client)
+[![codecov](https://codecov.io/gh/marshalling-ltd/third-eye-client/graph/badge.svg?token=W0Ys8TfmQA)](https://codecov.io/gh/marshalling-ltd/third-eye-client)![CI](https://github.com/marshalling-ltd/third-eye-client/actions/workflows/ci.yml/badge.svg)![Release](https://github.com/marshalling-ltd/third-eye-client/actions/workflows/release.yml/badge.svg)
 
 # third-eye-client
 
