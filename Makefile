@@ -13,6 +13,7 @@ code:
 	@cargo fix --allow-dirty --allow-no-vcs --allow-staged
 	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features -- -W clippy::pedantic
 	@cargo clippy -- -W clippy::pedantic
+	@cargo test --doc
 
 check: code nextest
 

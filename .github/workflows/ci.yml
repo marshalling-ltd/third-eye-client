@@ -11,7 +11,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Lint — format check + clippy pedantic (ubuntu only, fast)
+  # Lint — format check + clippy pedantic (ubuntu only, fast) + doc tests
   # ---------------------------------------------------------------------------
   lint:
     runs-on: ubuntu-latest
@@ -40,6 +40,9 @@ jobs:
 
       - name: cargo clippy (pedantic)
         run: cargo clippy --all-targets --all-features -- -W clippy::pedantic -D warnings
+
+      - name: cargo test --doc
+        run: cargo test --doc
 
   # ---------------------------------------------------------------------------
   # Test — cargo nextest on macOS, Windows, Linux
