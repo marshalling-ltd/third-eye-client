@@ -4,6 +4,8 @@
 
 Cross-platform desktop client for controlling and interacting with Chasing underwater ROVs. Built with Rust and [Slint](https://slint.dev/) for a native GUI on macOS, Windows, and Linux.
 
+> **New here?** Read the **[Operating Guide](OPERATIONS.md)** first — a plain-English, step-by-step manual for connecting the Chasing M2S, streaming video, and getting GPS on the map.
+
 ## Features
 
 ### Live Video Stream
