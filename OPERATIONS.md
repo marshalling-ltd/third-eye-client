@@ -19,10 +19,13 @@ and cannot see GPS satellites.
 
 ## What you need before you start
 
-- A laptop (this app is tested on **macOS** and **Windows**).
+- A laptop running **macOS**, **Windows**, or **Linux**. (Most field testing so
+  far has been on macOS and Windows, but Linux is a first-class target and works
+  too.)
 - Your **Chasing M2S ROV** and its cable reel / controller box.
-- **One of these** to connect the laptop to the ROV:
-  - the ROV's **Wi‑Fi** (easiest, **Windows only** — see below), **or**
+- **One of these** to connect the laptop to the ROV — **either one works on any
+  operating system**:
+  - the ROV's **Wi‑Fi** (easiest), **or**
   - a **USB‑to‑Ethernet adapter** and the ROV's network cable.
 - Optional, for GPS on the map: your **phone** with a free GPS app, or a
   Bluetooth GPS device.
@@ -47,37 +50,29 @@ the way its own manual describes.
 
 ### Step 1: Connect your laptop to the ROV
 
-**How you connect depends on your operating system.** Find yours below and
-follow only that path — you don't need the other one.
+**Both connection types work on every operating system** — macOS, Windows, and
+Linux. Pick whichever is easier for you; you do **not** need both.
 
-#### On macOS — use the USB cable
+> **The app doesn't care how you connect.** It talks to the ROV the same way
+> over Wi‑Fi or a wired USB link, so if a setup works over Wi‑Fi it works over a
+> USB (wired data) connection too — and the other way around. The connection
+> type never changes what the app can do.
 
-Direct Wi‑Fi to the ROV is **not** supported on macOS, so use a wired
-connection:
+#### Option A — Wi‑Fi (easiest)
 
-1. Plug a **USB‑to‑Ethernet adapter** into your Mac.
+1. On the ROV, turn on its Wi‑Fi (see the ROV manual).
+2. On your laptop, open Wi‑Fi settings and **connect to the ROV's Wi‑Fi
+   network**, exactly like joining any home/office Wi‑Fi. Your laptop is now on
+   the ROV's network.
+
+#### Option B — USB‑to‑Ethernet cable
+
+1. Plug a **USB‑to‑Ethernet adapter** into your laptop.
 2. Plug the **ROV's network cable** into that adapter.
 3. Give the adapter a fixed address so it can find the ROV:
    - The ROV lives at `192.168.1.88`.
    - Set your adapter to `192.168.1.103`, mask `255.255.255.0`.
    - Full click‑by‑click steps are in the README:
-     [Network Setup (USB Ethernet to ROV)](README.md#network-setup-usb-ethernet-to-rov).
-
-#### On Windows — try Wi‑Fi first, cable second
-
-Wi‑Fi is the easiest option and is the recommended first try on Windows.
-
-1. **First, try Wi‑Fi:**
-   - On the ROV, turn on its Wi‑Fi (see the ROV manual).
-   - On your laptop, open Wi‑Fi settings and **connect to the ROV's Wi‑Fi
-     network**, exactly like joining any home/office Wi‑Fi. Your laptop is now
-     on the ROV's network.
-2. **If Wi‑Fi doesn't work, use the USB cable:**
-   - Plug a **USB‑to‑Ethernet adapter** into your laptop, then plug the **ROV's
-     network cable** into it.
-   - Set the adapter to `192.168.1.103`, mask `255.255.255.0` (the ROV is at
-     `192.168.1.88`).
-   - Full steps are in the README:
      [Network Setup (USB Ethernet to ROV)](README.md#network-setup-usb-ethernet-to-rov).
 
 ### Step 2: Press "Recalibrate" and let the app figure it out
