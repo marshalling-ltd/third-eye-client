@@ -9,51 +9,116 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 
+/// The UDP port the ROV broadcasts status packets on.
 pub const ROV_STATUS_UDP_PORT: u16 = 8500;
 const ROV_STATUS_PACKET_ID: u8 = 0x03;
 const ROV_STATUS_PACKET_TYPE: u8 = 0x01;
 const ROV_STATUS_PACKET_HEADER_SIZE: usize = 12;
 
+/// A single ROV status reading, decoded from a status UDP packet's JSON payload.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rov_status::{Imu, Status};
+///
+/// let status = Status {
+///     pitch: 0.1,
+///     roll: -0.2,
+///     yaw: 3.0,
+///     depth: 12.5,
+///     lat: 45_123_456,
+///     lon: 16_123_456,
+///     temperature: 22.0,
+///     batteries: Vec::new(),
+///     imu: Imu::default(),
+/// };
+/// println!("depth: {} m", status.depth);
+/// ```
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Status {
+    /// Pitch angle in degrees.
     #[serde(rename = "pitch")]
     pub pitch: f32,
+    /// Roll angle in degrees.
     #[serde(rename = "roll")]
     pub roll: f32,
+    /// Yaw angle in degrees.
     #[serde(rename = "yaw")]
     pub yaw: f32,
+    /// Depth in meters.
     #[serde(rename = "depth")]
     pub depth: f32,
+    /// Latitude in degrees, scaled by 1e7 (as reported by the ROV).
     #[serde(rename = "lat")]
     pub lat: i32,
+    /// Longitude in degrees, scaled by 1e7 (as reported by the ROV).
     #[serde(rename = "lon")]
     pub lon: i32,
+    /// Internal temperature in degrees Celsius.
     #[serde(rename = "temperature")]
     pub temperature: f32,
+    /// Battery readings; empty if the ROV did not report any.
     #[serde(rename = "batteries", default)]
     pub batteries: Vec<Battery>,
+    /// Gyroscope reading; defaults to zero if the ROV did not report one.
     #[serde(rename = "imu", default)]
     pub imu: Imu,
 }
 
+/// A single battery's voltage, current, and remaining charge, as reported by the ROV.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rov_status::Battery;
+///
+/// let battery = Battery {
+///     id: 0,
+///     voltage: 16_800,
+///     current: -1_250,
+///     remaining: 87,
+/// };
+/// assert_eq!(battery.remaining, 87);
+/// ```
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Battery {
+    /// Battery index, as assigned by the ROV.
     #[serde(rename = "id")]
     pub id: u8,
+    /// Voltage in millivolts.
     #[serde(rename = "volt")]
     pub voltage: u16,
+    /// Current in milliamps; negative when discharging.
     #[serde(rename = "current")]
     pub current: i16,
+    /// Remaining charge as a percentage (0-100).
     #[serde(rename = "remain")]
     pub remaining: u8,
 }
 
+/// Raw gyroscope readings from the ROV's IMU.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rov_status::Imu;
+///
+/// let imu = Imu::default();
+/// assert_eq!(imu.gyro_x, 0);
+///
+/// let imu = Imu { gyro_x: 10, gyro_y: -5, gyro_z: 2 };
+/// assert_eq!(imu.gyro_z, 2);
+/// ```
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Imu {
+    /// Angular rate around the X axis.
     #[serde(rename = "gx")]
     pub gyro_x: i16,
+    /// Angular rate around the Y axis.
     #[serde(rename = "gy")]
     pub gyro_y: i16,
+    /// Angular rate around the Z axis.
     #[serde(rename = "gz")]
     pub gyro_z: i16,
 }
@@ -64,6 +129,19 @@ enum UdpStatusEvent {
     Ended,
 }
 
+/// Tracks a background UDP listener for ROV status broadcasts and the latest
+/// decoded [`Status`], polled from the UI thread via [`UdpStatusState::poll_events`].
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rov_status::UdpStatusState;
+///
+/// let mut state = UdpStatusState::default();
+/// assert!(!state.is_running());
+/// assert_eq!(state.packets_received(), 0);
+/// assert!(state.latest_status().is_none());
+/// ```
 #[derive(Default)]
 pub struct UdpStatusState {
     event_rx: Option<Receiver<UdpStatusEvent>>,
@@ -74,6 +152,36 @@ pub struct UdpStatusState {
 }
 
 impl UdpStatusState {
+    /// Binds a UDP socket and spawns a background thread that decodes incoming
+    /// ROV status packets, replacing any previously running listener.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_host` - The local address to bind to (e.g. `"0.0.0.0"` or `"127.0.0.1"`).
+    /// * `port` - The local UDP port to bind to.
+    /// * `interface` - An optional network interface name to restrict the socket to.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<String>` - A human-readable status message on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bind_host` is empty, or if the socket cannot be bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let mut state = UdpStatusState::default();
+    /// let message = state.start("127.0.0.1", 0, None).unwrap();
+    /// assert!(message.contains("Listening"));
+    /// assert!(state.is_running());
+    ///
+    /// state.stop();
+    /// assert!(!state.is_running());
+    /// ```
     pub fn start(&mut self, bind_host: &str, port: u16, interface: Option<&str>) -> Result<String> {
         let bind_host = bind_host.trim();
         if bind_host.is_empty() {
@@ -103,6 +211,21 @@ impl UdpStatusState {
         Ok(self.status.clone())
     }
 
+    /// Stops the background listener thread, if one is running. Safe to call
+    /// even if no listener is running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let mut state = UdpStatusState::default();
+    /// state.start("127.0.0.1", 0, None).unwrap();
+    ///
+    /// state.stop();
+    /// assert!(!state.is_running());
+    /// assert_eq!(state.status_text(), "ROV status listener stopped.");
+    /// ```
     pub fn stop(&mut self) {
         if let Some(mut controller) = self.controller.take() {
             controller.stop();
@@ -111,11 +234,44 @@ impl UdpStatusState {
         self.event_rx = None;
     }
 
+    /// Returns whether a background listener thread is currently running.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if [`UdpStatusState::start`] succeeded and
+    ///   [`UdpStatusState::stop`] has not since been called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let state = UdpStatusState::default();
+    /// assert!(!state.is_running());
+    /// ```
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.controller.is_some()
     }
 
+    /// Drains events from the background listener thread, updating the latest
+    /// status, packet count, and status text. Call this periodically from the
+    /// UI thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let mut state = UdpStatusState::default();
+    /// state.start("127.0.0.1", 0, None).unwrap();
+    ///
+    /// // No packets have arrived yet, but polling is always safe.
+    /// state.poll_events();
+    /// assert_eq!(state.packets_received(), 0);
+    ///
+    /// state.stop();
+    /// ```
     pub fn poll_events(&mut self) {
         let mut disconnected = false;
         if let Some(rx) = &self.event_rx {
@@ -147,20 +303,85 @@ impl UdpStatusState {
         }
     }
 
+    /// Returns the current human-readable status message.
+    ///
+    /// # Returns
+    ///
+    /// * `&str` - The current status message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let mut state = UdpStatusState::default();
+    /// state.start("127.0.0.1", 0, None).unwrap();
+    /// assert_eq!(
+    ///     state.status_text(),
+    ///     "Listening for UDP ROV status broadcasts on 127.0.0.1:0."
+    /// );
+    /// state.stop();
+    /// ```
     #[must_use]
     pub fn status_text(&self) -> &str {
         &self.status
     }
 
+    /// Overwrites the current status message.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The new status message to display.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let mut state = UdpStatusState::default();
+    /// state.set_status_text("Waiting for configuration.".to_string());
+    /// assert_eq!(state.status_text(), "Waiting for configuration.");
+    /// ```
     pub fn set_status_text(&mut self, text: String) {
         self.status = text;
     }
 
+    /// Returns the number of status packets successfully received and decoded
+    /// since the listener was last started.
+    ///
+    /// # Returns
+    ///
+    /// * `u64` - The number of packets received.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let state = UdpStatusState::default();
+    /// assert_eq!(state.packets_received(), 0);
+    /// ```
     #[must_use]
     pub fn packets_received(&self) -> u64 {
         self.packets_received
     }
 
+    /// Returns the most recently decoded [`Status`], if any packets have been
+    /// received yet.
+    ///
+    /// # Returns
+    ///
+    /// * `Option<&Status>` - The latest status, or `None` if no packet has
+    ///   arrived since the listener was started.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::rov_status::UdpStatusState;
+    ///
+    /// let state = UdpStatusState::default();
+    /// assert!(state.latest_status().is_none());
+    /// ```
     #[must_use]
     pub fn latest_status(&self) -> Option<&Status> {
         self.latest_status.as_ref()
@@ -285,6 +506,9 @@ fn bind_socket_to_interface(socket: &Socket, iface: &str) -> Result<()> {
 }
 
 /// Resolves a network interface name (e.g. `"en10"`) to its OS index.
+///
+/// No doctest is provided since valid interface names are specific to the
+/// host machine running the docs build.
 #[cfg(target_os = "macos")]
 pub fn interface_name_to_index(name: &str) -> Result<std::num::NonZeroU32> {
     let c_name =
@@ -301,6 +525,44 @@ pub fn interface_name_to_index(name: &str) -> Result<std::num::NonZeroU32> {
         .expect("if_nametoindex returned non-zero but NonZeroU32::new failed"))
 }
 
+/// Parses a raw ROV status UDP datagram into a [`Status`].
+///
+/// The wire format is a 12-byte header followed by a JSON payload:
+/// `[id: u8, _: u8, _: u8, _: u8, payload_len: u32, type: u8, _: u8, _: u8, _: u8, payload: [u8]]`,
+/// where `id` must be `0x03` and `type` must be `0x01`. `payload_len` is
+/// accepted as either little- or big-endian, whichever is consistent with the
+/// datagram's actual length.
+///
+/// # Arguments
+///
+/// * `datagram` - The raw bytes received from the UDP socket.
+///
+/// # Returns
+///
+/// * `Result<Status>` - The decoded status on success.
+///
+/// # Errors
+///
+/// Returns an error if the datagram is shorter than the header, has an
+/// unexpected packet id or type, the payload length doesn't fit the datagram,
+/// or the payload is not valid JSON for [`Status`].
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rov_status::parse_status_packet;
+///
+/// let payload = br#"{"pitch":0.0,"roll":0.0,"yaw":0.0,"depth":0.0,"lat":0,"lon":0,"temperature":20.0}"#;
+///
+/// let mut packet = vec![0x03_u8, 0x01, 0x00, 0x00];
+/// packet.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+/// packet.push(0x01); // payload type
+/// packet.extend_from_slice(&[0x00, 0x00, 0x00]);
+/// packet.extend_from_slice(payload);
+///
+/// let status = parse_status_packet(&packet).unwrap();
+/// assert!((status.temperature - 20.0).abs() < f32::EPSILON);
+/// ```
 pub fn parse_status_packet(datagram: &[u8]) -> Result<Status> {
     if datagram.len() < ROV_STATUS_PACKET_HEADER_SIZE {
         anyhow::bail!(
