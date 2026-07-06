@@ -17,16 +17,6 @@ code:
 
 check: code nextest
 
-# --- CI-friendly targets (no extra tools beyond rustup components) ---
-
-ci: lint nextest
-	@echo "third-eye-client: CI passed ✓"
-
-lint:
-	@echo "third-eye-client: lint\n"
-	@cargo fmt --check
-	@cargo clippy --all-targets --all-features -- -W clippy::pedantic -D warnings
-
 # --- Test targets ---
 
 nextest:

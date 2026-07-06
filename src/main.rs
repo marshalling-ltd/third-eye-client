@@ -3529,12 +3529,13 @@ fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()>
     ensure_rov_route_for_rtsp(&dummy_rtsp, interface)
 }
 
-/// Like [`ensure_rov_external_route`] but always re-runs the osascript admin
-/// prompt, even when a valid route already exists. Used by the Recalibrate
+/// Like [`ensure_rov_external_route`] but re-runs the osascript admin prompt
+/// when the route/ARP actually needs (re)building. Used by the Recalibrate
 /// button so the user can force a re-setup after changing network conditions.
 ///
-/// On macOS: does NOT block on an HTTP probe — the route setup itself is
-/// what makes the ROV reachable, so we run osascript immediately.
+/// On macOS: the interface's static IP is assigned *inside* the osascript, so
+/// we set up the route first and then run an ARP-warming HTTP probe — the macOS
+/// equivalent of the non-macOS pre-probe. It needs no extra admin prompt.
 /// On Windows: performs the HTTP probe (to populate ARP) then runs the
 /// normal `route ADD` / UAC elevation path.
 fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
@@ -3547,7 +3548,24 @@ fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> 
     let host =
         parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
     let dummy_rtsp = format!("rtsp://x@{host}:8554/");
-    force_rov_route_for_rtsp(&dummy_rtsp, interface)
+    force_rov_route_for_rtsp(&dummy_rtsp, interface)?;
+
+    // On macOS the static IP is assigned by the osascript above (asynchronously
+    // via configd), so an interface-bound probe can only reach the ROV now.
+    // Wait briefly for the IPv4 to land, then probe so the ROV's MAC resolves
+    // into the ARP cache. This fixes ARP without a second password prompt.
+    #[cfg(target_os = "macos")]
+    {
+        for _ in 0..6 {
+            if interface_has_rov_subnet_ipv4(interface, &host) {
+                let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
+                let _ = client.list_medias(None::<MediaScene>);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    Ok(())
 }
 
 /// Removes a stale host route for `rov_host` that may have been created by a
@@ -3738,9 +3756,11 @@ fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
     }
 }
 
-/// Always runs the osascript admin prompt, even when a valid route already
-/// exists. Used by the Recalibrate button so the user can force a re-setup
-/// after changing the ROV IP, interface, or network.
+/// Sets up the host route + ARP entry for the ROV, prompting for admin
+/// privileges via osascript **only when needed**. When a valid host route with
+/// a resolved ARP entry already exists this is a no-op (no password prompt), so
+/// Recalibrate can be pressed repeatedly without re-prompting. This mirrors the
+/// macOS `ensure_rov_route_for_rtsp` behavior.
 ///
 /// If the ROV's MAC is available in the ARP table, the full route + ARP
 /// setup is performed.  Otherwise, only the host route is created (the OS
@@ -3752,6 +3772,11 @@ fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
         .host_str()
         .context("RTSP URL has no host")?
         .to_owned();
+    // Don't call osascript every time: skip the prompt when the host route and
+    // ARP entry are already valid.
+    if has_valid_rov_route(&rov_host, interface) {
+        return Ok(());
+    }
     match read_arp_mac_on_interface(&rov_host, interface) {
         Some(rov_mac) => run_rov_route_osascript(&rov_host, interface, &rov_mac),
         None => run_rov_route_only_osascript(&rov_host, interface),

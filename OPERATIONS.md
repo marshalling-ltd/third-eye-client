@@ -86,9 +86,10 @@ checks for you.
 
 What "Recalibrate" does, in plain terms:
 
-- It **looks for the USB cable** connection to the ROV first.
-- **If a cable is found**, it uses the cable and prepares the video route.
-- **If no cable is found**, it automatically **falls back to Wi‑Fi**.
+- **Wi‑Fi comes first, on every OS.** Wi‑Fi is the primary, first‑supported way
+  to reach the ROV, so if your laptop is on the ROV's Wi‑Fi the app uses it.
+- **Then everything else.** If you're on the USB cable instead, Recalibrate
+  detects it and prepares the wired video route.
 - On a Mac it may ask for your **admin password** once — this is normal and only
   needed to set up the video stream. Type it in.
 
@@ -189,5 +190,3 @@ A full symptom → cause → fix table is in the README:
 
 - **[README](README.md)** — full feature list, exact network setup, build
   instructions, and the troubleshooting tables.
-- **[CHASING_M2S.md](CHASING_M2S.md)** — developer notes on cross‑platform
-  behavior (for people working on the app itself).
