@@ -476,6 +476,11 @@ struct ThirdEyeState {
     /// ignored until this passes or the new zoom's tiles have been applied.
     /// `0` means not engaged. See `scroll_zoom_allowed`.
     zoom_settle_until_ms: i64,
+    /// Zoom level captured when the current pinch gesture starts.
+    pinch_start_zoom: Option<u32>,
+    /// Last discrete step applied during an active pinch gesture.
+    /// Values are clamped to [-2, 2].
+    pinch_last_step: i32,
     config: AppConfig,
     map: MapState,
     map_tiles: MapTilesState,
@@ -591,6 +596,8 @@ impl ThirdEyeState {
             last_screen: Screen::Configuration,
             suppress_next_map_flick: false,
             zoom_settle_until_ms: 0,
+            pinch_start_zoom: None,
+            pinch_last_step: 0,
             config,
             map: MapState {
                 zoom: DEFAULT_ZOOM,
@@ -1716,6 +1723,10 @@ fn current_unix_ms() -> i64 {
 /// offline or tile-server errors). This bounds the gate so scroll zoom can't
 /// get stuck, while still rate-limiting fast scroll/gesture bursts.
 const ZOOM_SETTLE_TIMEOUT_MS: i64 = 700;
+const PINCH_STEP_ONE_IN_SCALE: f32 = 1.12;
+const PINCH_STEP_TWO_IN_SCALE: f32 = 1.30;
+const PINCH_STEP_ONE_OUT_SCALE: f32 = 0.90;
+const PINCH_STEP_TWO_OUT_SCALE: f32 = 0.77;
 
 /// Returns `true` when a scroll/gesture (mouse-wheel, trackpad, touchscreen)
 /// zoom step is currently allowed.
@@ -1728,6 +1739,22 @@ const ZOOM_SETTLE_TIMEOUT_MS: i64 = 700;
 /// the +/- buttons); the user repeats the gesture to keep zooming.
 fn scroll_zoom_allowed(now_ms: i64, settle_until_ms: i64, fallback_zoom: Option<u32>) -> bool {
     settle_until_ms == 0 || fallback_zoom.is_none() || now_ms >= settle_until_ms
+}
+
+/// Converts cumulative pinch scale into a discrete zoom-step offset relative
+/// to gesture start, capped to [-2, 2].
+fn pinch_zoom_step_from_scale(scale: f32) -> i32 {
+    if scale >= PINCH_STEP_TWO_IN_SCALE {
+        2
+    } else if scale >= PINCH_STEP_ONE_IN_SCALE {
+        1
+    } else if scale <= PINCH_STEP_TWO_OUT_SCALE {
+        -2
+    } else if scale <= PINCH_STEP_ONE_OUT_SCALE {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Reconciles the ROV media list and writes a `capture_metadata` row for the
@@ -1957,6 +1984,70 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_map_runtime_to_ui(&ui, &state);
         },
     );
+
+    let state_for_map_pinch_zoom_start = Rc::clone(&state);
+    ui.on_map_pinch_zoom_start(move || {
+        let Ok(mut state) = state_for_map_pinch_zoom_start.try_borrow_mut() else {
+            return;
+        };
+        state.pinch_start_zoom = Some(state.map.zoom);
+        state.pinch_last_step = 0;
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_map_pinch_zoom_update = Rc::clone(&state);
+    ui.on_map_pinch_zoom_update(
+        move |scale, focus_x, focus_y, viewport_x, viewport_y, viewport_width, viewport_height| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let Ok(mut state) = state_for_map_pinch_zoom_update.try_borrow_mut() else {
+                return;
+            };
+            state.set_map_visible_size(f64::from(viewport_width), f64::from(viewport_height));
+            state.set_map_viewport(f64::from(viewport_x), f64::from(viewport_y));
+            state.viewport_anim = None;
+
+            let current_zoom = state.map.zoom;
+            let start_zoom = *state.pinch_start_zoom.get_or_insert(current_zoom);
+            let desired_step = pinch_zoom_step_from_scale(scale);
+            if desired_step == state.pinch_last_step {
+                return;
+            }
+
+            // Reuse the same settle gate as wheel/scroll zoom:
+            // fast tile availability allows the next step quickly, while slow
+            // or missing tiles naturally slow further zoom progression.
+            if !scroll_zoom_allowed(
+                current_unix_ms(),
+                state.zoom_settle_until_ms,
+                state.map_tiles.fallback_zoom,
+            ) {
+                return;
+            }
+
+            let target_zoom =
+                (start_zoom as i32 + desired_step).clamp(MIN_ZOOM as i32, MAX_ZOOM as i32) as u32;
+            state.pinch_last_step = desired_step;
+            if target_zoom == state.map.zoom {
+                return;
+            }
+            state.set_map_zoom(target_zoom, f64::from(focus_x), f64::from(focus_y));
+            state.suppress_next_map_flick = true;
+            state.zoom_settle_until_ms = current_unix_ms() + ZOOM_SETTLE_TIMEOUT_MS;
+            state.map.status = format!("Pinch zoomed to {}.", state.map.zoom);
+            apply_map_runtime_to_ui(&ui, &state);
+        },
+    );
+
+    let state_for_map_pinch_zoom_end = Rc::clone(&state);
+    ui.on_map_pinch_zoom_end(move || {
+        let Ok(mut state) = state_for_map_pinch_zoom_end.try_borrow_mut() else {
+            return;
+        };
+        state.pinch_start_zoom = None;
+        state.pinch_last_step = 0;
+    });
 
     let ui_weak = ui.as_weak();
     let state_for_map_center_on_pin = Rc::clone(&state);
@@ -4574,7 +4665,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZOOM_SETTLE_TIMEOUT_MS, scroll_zoom_allowed};
+    use super::{ZOOM_SETTLE_TIMEOUT_MS, pinch_zoom_step_from_scale, scroll_zoom_allowed};
 
     #[test]
     fn scroll_zoom_allowed_when_gate_not_engaged() {
@@ -4612,5 +4703,16 @@ mod tests {
             settle_until,
             Some(13)
         ));
+    }
+
+    #[test]
+    fn pinch_zoom_step_mapping_is_discrete_and_capped() {
+        assert_eq!(pinch_zoom_step_from_scale(1.00), 0);
+        assert_eq!(pinch_zoom_step_from_scale(1.15), 1);
+        assert_eq!(pinch_zoom_step_from_scale(1.35), 2);
+        assert_eq!(pinch_zoom_step_from_scale(0.88), -1);
+        assert_eq!(pinch_zoom_step_from_scale(0.70), -2);
+        assert_eq!(pinch_zoom_step_from_scale(4.0), 2);
+        assert_eq!(pinch_zoom_step_from_scale(0.05), -2);
     }
 }

@@ -194,6 +194,11 @@ export component AppWindow inherits Window {
     // Positive delta_y zooms in, negative zooms out; the Rust side rate-limits
     // so one scroll/gesture advances at most one zoom level.
     callback map_scroll_zoom(length, length, length, length, length);
+    // Pinch gesture zoom. `scale` is cumulative from gesture start
+    // (1.0 = unchanged, >1 zoom in, <1 zoom out).
+    callback map_pinch_zoom_start();
+    callback map_pinch_zoom_update(float, length, length, length, length, length, length);
+    callback map_pinch_zoom_end();
     callback center_map_on_pin(length, length, length, length);
 
     callback start_stream();
@@ -1215,28 +1220,6 @@ export component AppWindow inherits Window {
                         viewport-width: root.map_viewport_width;
                         viewport-height: root.map_viewport_height;
 
-                        // Invisible layer tracking the visible map area. It
-                        // turns mouse-wheel / trackpad / touchscreen scroll
-                        // gestures into single-step zoom. Returning `accept`
-                        // stops the Flickable from panning on scroll; press +
-                        // drag still pans as before.
-                        TouchArea {
-                            x: -parent.viewport-x;
-                            y: -parent.viewport-y;
-                            width: parent.width;
-                            height: parent.height;
-                            scroll-event(event) => {
-                                root.map_scroll_zoom(
-                                    event.delta-y,
-                                    parent.viewport-x,
-                                    parent.viewport-y,
-                                    map_canvas.width,
-                                    map_canvas.height
-                                );
-                                accept
-                            }
-                        }
-
                         for tile in root.map_tiles : Image {
                             x: tile.x;
                             y: tile.y;
@@ -1305,6 +1288,36 @@ export component AppWindow inherits Window {
 
                         flicked => {
                             root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                        }
+                    }
+
+                    // Pinch-to-zoom overlay: lets the user zoom with touchpad
+                    // pinch or touchscreen pinch gestures while preserving
+                    // normal two-finger panning in Flickable.
+                    ScaleRotateGestureHandler {
+                        x: 0px;
+                        y: 0px;
+                        width: map_canvas.width;
+                        height: map_canvas.height;
+                        started => {
+                            root.map_pinch_zoom_start();
+                        }
+                        updated => {
+                            root.map_pinch_zoom_update(
+                                self.scale,
+                                self.center.x,
+                                self.center.y,
+                                map_fli.viewport-x,
+                                map_fli.viewport-y,
+                                map_canvas.width,
+                                map_canvas.height
+                            );
+                        }
+                        ended => {
+                            root.map_pinch_zoom_end();
+                        }
+                        cancelled => {
+                            root.map_pinch_zoom_end();
                         }
                     }
 
