@@ -43,6 +43,7 @@ use map::{
     check_corelocation_warmup_fix, corelocation_debug_status, prime_corelocation_at_startup,
 };
 use reqwest::Url;
+use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
 use third_eye_client::formatting::{
@@ -68,6 +69,10 @@ const DEFAULT_ROV_CLIENT_IP: &str = "192.168.1.103";
 #[cfg(target_os = "macos")]
 const DEFAULT_ROV_CLIENT_NETMASK: &str = "255.255.255.0";
 const DEFAULT_ROV_UDP_BIND_HOST: &str = "0.0.0.0";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases/latest";
+const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
 
 slint::include_modules!();
 
@@ -408,6 +413,60 @@ enum MediaEvent {
     },
 }
 
+struct UpdateUiState {
+    status_text: String,
+    current_version: String,
+    latest_version: String,
+    download_url: String,
+    update_available: bool,
+    check_in_progress: bool,
+    event_tx: mpsc::Sender<UpdateEvent>,
+    event_rx: mpsc::Receiver<UpdateEvent>,
+}
+
+impl UpdateUiState {
+    fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        let current_version = APP_VERSION.to_owned();
+        Self {
+            status_text: format!("Installed version {current_version}."),
+            current_version: current_version.clone(),
+            latest_version: current_version,
+            download_url: String::new(),
+            update_available: false,
+            check_in_progress: false,
+            event_tx,
+            event_rx,
+        }
+    }
+}
+
+enum UpdateEvent {
+    CheckFinished {
+        result: Result<UpdateCheckResult, String>,
+    },
+}
+
+struct UpdateCheckResult {
+    latest_version: String,
+    update_available: bool,
+    has_platform_asset: bool,
+    download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
@@ -447,6 +506,8 @@ struct ThirdEyeState {
     /// `ensure_rov_external_route` (which assigns the IP via osascript) even
     /// when `rov_network_interface` is empty.
     rov_detected_interface: String,
+    /// In-app updater state (GitHub release checks and download CTA).
+    update: UpdateUiState,
     /// Background startup location warmup (Windows only). A background thread
     /// calls the blocking GPS API and sends the result here; the timer loop
     /// picks it up and applies it without blocking the UI.
@@ -551,9 +612,29 @@ impl ThirdEyeState {
             recalibrate_rx,
             recalibrate_in_progress: false,
             rov_detected_interface: String::new(),
+            update: UpdateUiState::new(),
             #[cfg(target_os = "windows")]
             startup_location_rx: None,
         }
+    }
+
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update.check_in_progress {
+            return;
+        }
+        self.update.check_in_progress = true;
+        self.update.status_text = if manual {
+            "Checking for updates...".to_string()
+        } else {
+            "Checking for updates in background...".to_string()
+        };
+        let tx = self.update.event_tx.clone();
+        let current_version = self.update.current_version.clone();
+        thread::spawn(move || {
+            let result =
+                check_for_updates_blocking(&current_version).map_err(|err| format!("{err:#}"));
+            let _ = tx.send(UpdateEvent::CheckFinished { result });
+        });
     }
 
     fn load_map_tile_for_current_location(&mut self, success_status: String) {
@@ -784,6 +865,11 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_use_saved_map_tiles(state.config.use_saved_map_tiles());
     ui.set_max_tile_storage_mb(state.config.max_tile_storage_mb.clone().into());
     ui.set_tile_cache_size_text(state.tile_cache_size_text.clone().into());
+    ui.set_app_version(state.update.current_version.clone().into());
+    ui.set_update_status_text(state.update.status_text.clone().into());
+    ui.set_update_latest_version(state.update.latest_version.clone().into());
+    ui.set_update_available(state.update.update_available);
+    ui.set_update_check_in_progress(state.update.check_in_progress);
     apply_map_runtime_to_ui(ui, state);
     apply_stream_and_rov_runtime_to_ui(ui, state);
     apply_media_runtime_to_ui(ui, state);
@@ -2196,6 +2282,47 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         persist_config(&state, &store_for_default_server_url);
         apply_state_to_ui(&ui, &state);
     });
+    let ui_weak = ui.as_weak();
+    let state_for_check_updates = Rc::clone(&state);
+    ui.on_check_for_updates(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_check_updates.try_borrow_mut() else {
+            return;
+        };
+        state.start_update_check(true);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_download_update = Rc::clone(&state);
+    ui.on_download_update(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_download_update.try_borrow_mut() else {
+            return;
+        };
+        if !state.update.update_available || state.update.download_url.trim().is_empty() {
+            state.update.status_text =
+                "No update download is available yet. Check for updates first.".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        match webbrowser::open(&state.update.download_url) {
+            Ok(()) => {
+                state.update.status_text = format!(
+                    "Opened download link for v{} in your browser.",
+                    state.update.latest_version
+                );
+            }
+            Err(err) => {
+                state.update.status_text = format!("Failed to open update download link: {err:#}");
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
 
     let ui_weak = ui.as_weak();
     let state_for_list_medias = Rc::clone(&state);
@@ -3161,6 +3288,149 @@ fn poll_media_events(state: &mut ThirdEyeState, store: &AppStore) -> bool {
         }
     }
     changed
+}
+
+/// Polls background update-check events and updates updater UI state.
+/// Returns `true` when updater bindings changed.
+fn poll_update_events(state: &mut ThirdEyeState) -> bool {
+    let mut changed = false;
+    while let Ok(event) = state.update.event_rx.try_recv() {
+        changed = true;
+        match event {
+            UpdateEvent::CheckFinished { result } => {
+                state.update.check_in_progress = false;
+                match result {
+                    Ok(update_result) => {
+                        state
+                            .update
+                            .latest_version
+                            .clone_from(&update_result.latest_version);
+                        state.update.update_available = update_result.update_available;
+                        state.update.download_url = update_result.download_url;
+                        if update_result.update_available {
+                            let mut text = format!(
+                                "Update available: v{} (installed v{}).",
+                                update_result.latest_version, state.update.current_version
+                            );
+                            if !update_result.has_platform_asset {
+                                text.push_str(
+                                    " No platform-specific installer was found; opening the release page instead.",
+                                );
+                            }
+                            state.update.status_text = text;
+                        } else {
+                            state.update.status_text =
+                                format!("You're up to date on v{}.", state.update.current_version);
+                        }
+                    }
+                    Err(err) => {
+                        state.update.status_text = format!("Update check failed: {err}");
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client for update checks")?;
+    let release = client
+        .get(GITHUB_LATEST_RELEASE_API_URL)
+        .header(reqwest::header::USER_AGENT, UPDATE_CHECK_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .context("failed to query latest GitHub release")?
+        .error_for_status()
+        .context("latest release API returned an error")?
+        .json::<GithubRelease>()
+        .context("failed to parse latest release metadata")?;
+
+    let latest_version = normalize_release_tag(&release.tag_name)
+        .ok_or_else(|| anyhow::anyhow!("invalid release tag '{}'", release.tag_name))?;
+    let current = parse_version_triplet(current_version).ok_or_else(|| {
+        anyhow::anyhow!("invalid current app version '{current_version}' in Cargo metadata")
+    })?;
+    let latest = parse_version_triplet(&latest_version).ok_or_else(|| {
+        anyhow::anyhow!("release tag '{}' is not semantic x.y.z", release.tag_name)
+    })?;
+    let update_available = latest > current;
+
+    let (download_url, has_platform_asset) = if update_available {
+        match pick_download_url_for_platform(&release.assets) {
+            Some((url, exact_platform_asset)) => (url, exact_platform_asset),
+            None => (release.html_url.clone(), false),
+        }
+    } else {
+        (String::new(), false)
+    };
+
+    Ok(UpdateCheckResult {
+        latest_version,
+        update_available,
+        has_platform_asset,
+        download_url,
+    })
+}
+
+fn normalize_release_tag(tag: &str) -> Option<String> {
+    let stripped = tag.trim().trim_start_matches(['v', 'V']);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_owned())
+    }
+}
+
+fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next()?;
+    let mut pieces = core.split('.');
+    let major = pieces.next()?.parse::<u64>().ok()?;
+    let minor = pieces.next()?.parse::<u64>().ok()?;
+    let patch = pieces.next()?.parse::<u64>().ok()?;
+    if pieces.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn pick_download_url_for_platform(assets: &[GithubReleaseAsset]) -> Option<(String, bool)> {
+    if let Some(asset) = assets
+        .iter()
+        .find(|asset| is_platform_release_asset(&asset.name))
+    {
+        return Some((asset.browser_download_url.clone(), true));
+    }
+    assets
+        .first()
+        .map(|asset| (asset.browser_download_url.clone(), false))
+}
+
+fn is_platform_release_asset(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    #[cfg(target_os = "macos")]
+    {
+        return std::path::Path::new(&lowered)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dmg"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return std::path::Path::new(&lowered)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::path::Path::new(&lowered)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("appimage"));
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 fn stream_stderr_loop(
@@ -4144,6 +4414,7 @@ fn main() -> Result<()> {
         let mut s = state.borrow_mut();
         refresh_rov_network(&mut s, false);
         persist_config(&s, &store);
+        s.start_update_check(false);
     }
 
     {
@@ -4279,7 +4550,9 @@ fn main() -> Result<()> {
                 apply_state_to_ui(&ui, &state);
             }
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
-            if poll_media_events(&mut state, &poll_store) {
+            let media_changed = poll_media_events(&mut state, &poll_store);
+            let update_changed = poll_update_events(&mut state);
+            if media_changed || update_changed {
                 apply_state_to_ui(&ui, &state);
             }
         },

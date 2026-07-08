@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - release
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -197,15 +200,36 @@ jobs:
           path: Third.Eye.Client.linux-x64.AppImage
 
   # ---------------------------------------------------------------------------
-  # Publish — create/overwrite the rolling "latest" GitHub Release
+  # Publish — only when a semantic version tag is pushed (e.g. v0.1.1)
   # ---------------------------------------------------------------------------
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          APP_VERSION="$(python3 - <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          match = re.search(r'^version = "([0-9]+\.[0-9]+\.[0-9]+)"$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Could not find package version in Cargo.toml")
+          print(match.group(1))
+          PY
+          )"
+
+          if [[ "$TAG" != "v$APP_VERSION" ]]; then
+            echo "Tag ($TAG) does not match Cargo.toml version (v$APP_VERSION)." >&2
+            exit 1
+          fi
 
       - uses: actions/download-artifact@v8
         with:
@@ -222,19 +246,15 @@ jobs:
           name: linux-appimage
           path: artifacts/
 
-      - name: Create latest release
+      - name: Create tagged release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-
-          # Delete the existing latest release + tag so we can recreate it.
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-
-          gh release create latest \
-            --title "Latest (${SHORT_SHA})" \
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" \
+            --title "$TAG" \
             --notes "$(cat <<EOF
-          Built from commit \`${GITHUB_SHA}\` on the \`release\` branch.
+          Built from commit \`${GITHUB_SHA}\`.
 
           ## Downloads
 
@@ -245,7 +265,6 @@ jobs:
           | **Linux** x64 | \`Third.Eye.Client.linux-x64.AppImage\` | \`chmod +x\` then run — no install needed. ffmpeg included. |
           EOF
           )" \
-            --prerelease \
             artifacts/Third.Eye.Client.macos-universal.dmg \
             artifacts/Third.Eye.Client.windows-x64-setup.exe \
             artifacts/Third.Eye.Client.linux-x64.AppImage

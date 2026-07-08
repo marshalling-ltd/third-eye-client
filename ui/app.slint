@@ -67,6 +67,11 @@ export component AppWindow inherits Window {
     in-out property <string> auth_status_text;
     in-out property <string> auth_signed_in_as;
     in-out property <bool> auth_is_signed_in: false;
+    in-out property <string> app_version;
+    in-out property <string> update_status_text;
+    in-out property <string> update_latest_version;
+    in-out property <bool> update_available: false;
+    in-out property <bool> update_check_in_progress: false;
 
     // Per-capture ROV telemetry summary surfaced after a successful capture.
     in-out property <string> attached_metadata_text;
@@ -175,6 +180,8 @@ export component AppWindow inherits Window {
     callback sign_in();
     callback sign_out();
     callback use_default_server_base_url();
+    callback check_for_updates();
+    callback download_update();
 
     callback detect_location(length, length);
     callback load_map_tile(length, length);
@@ -358,6 +365,37 @@ export component AppWindow inherits Window {
                         text: "Current tile cache size on disk: " + root.tile_cache_size_text + ".";
                         color: #8f96a3;
                         font-size: 12px;
+                    }
+
+                    Rectangle { height: 1px; background: #3f4148; }
+                    Text { text: "Application updates"; font-size: 18px; }
+                    Text {
+                        text: "Installed version: v" + root.app_version;
+                        color: #8f96a3;
+                    }
+                    if root.update_available : Text {
+                        text: "Latest available: v" + root.update_latest_version;
+                        color: #22cc44;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: root.update_check_in_progress ? "Checking..." : "Check for updates";
+                            enabled: !root.update_check_in_progress;
+                            clicked => { root.check_for_updates(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Download update";
+                            enabled: root.update_available;
+                            clicked => { root.download_update(); }
+                        }
+                    }
+                    Text {
+                        text: root.update_status_text;
+                        wrap: word-wrap;
+                        color: #8f96a3;
                     }
 
                     Rectangle { height: 1px; background: #3f4148; }

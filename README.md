@@ -64,6 +64,22 @@ Cross-platform desktop client for controlling and interacting with Chasing under
 - **macOS** – universal binary (arm64 + x86_64) `.app` bundle with ad-hoc code signing (`scripts/build_macos_app.sh`)
 - **Windows** – cross-compiled from macOS via MinGW, packaged as a zip (`scripts/build_windows.sh`)
 - **Linux** – native build packaged as an AppImage (`scripts/build_linux.sh`, must run on Linux)
+## Release checklist
+
+1. Merge or cherry-pick only release-ready commits into the `release` branch.
+2. Bump app version (patch bump helper):
+   - `make bump-patch`
+3. Commit and push the version bump to `release`.
+4. Wait for the `Release` workflow to finish all three platform builds on `release`.
+   - This run is for validation/artifacts only; it does **not** publish a user-facing GitHub release.
+5. Verify build artifacts from that run (macOS DMG, Windows installer, Linux AppImage).
+6. Create and push a semantic version tag that matches `Cargo.toml` exactly:
+   - `git tag vX.Y.Z`
+   - `git push origin vX.Y.Z`
+7. Confirm the `publish` job creates the GitHub Release for that tag and attaches all three artifacts.
+8. Smoke-test updater flow in the app:
+   - Restart app (or click **Check for updates** in Configuration).
+   - Confirm it detects the new tag and opens the correct platform download when **Download update** is clicked.
 
 ## Network Setup (USB Ethernet to ROV)
 

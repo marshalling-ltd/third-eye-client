@@ -48,7 +48,10 @@ clean:
 	cargo clean
 
 upgrade:
-	cargo upgrade --verbose
+	@cargo upgrade --verbose
+
+bump-patch:
+	@bash ./scripts/bump_patch_version.sh
 
 requirements:
 	@echo "third-eye-client: requirements\n"
