@@ -71,8 +71,8 @@ Cross-platform desktop client for controlling and interacting with Chasing under
    - `make bump-patch`
 3. Commit and push the version bump to `release`.
 4. Wait for the `Release` workflow to finish all three platform builds on `release`.
-   - This run is for validation/artifacts only; it does **not** publish a user-facing GitHub release.
-5. Verify build artifacts from that run (macOS DMG, Windows installer, Linux AppImage).
+   - This run refreshes the rolling `latest` **pre-release** with all three installers.
+5. Verify the `latest` pre-release assets (macOS DMG, Windows installer, Linux AppImage).
 6. Create and push a semantic version tag that matches `Cargo.toml` exactly:
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`

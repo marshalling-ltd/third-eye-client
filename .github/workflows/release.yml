@@ -200,10 +200,10 @@ jobs:
           path: Third.Eye.Client.linux-x64.AppImage
 
   # ---------------------------------------------------------------------------
-  # Publish — only when a semantic version tag is pushed (e.g. v0.1.1)
+  # Publish — semantic release on tags, prerelease mirror on release branch
   # ---------------------------------------------------------------------------
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
     needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
@@ -212,6 +212,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Validate tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           APP_VERSION="$(python3 - <<'PY'
@@ -247,6 +248,7 @@ jobs:
           path: artifacts/
 
       - name: Create tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -271,6 +273,7 @@ jobs:
           fi
 
       - name: Upload tagged release assets
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -285,15 +288,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            SOURCE_LABEL="${GITHUB_REF#refs/tags/}"
+            CONTEXT_LINE="Tagged release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${SOURCE_LABEL}"
+          else
+            SOURCE_LABEL="release-${GITHUB_SHA::7}"
+            CONTEXT_LINE="Release branch build (no semantic tag yet)."
+          fi
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest \
-            --title "Latest (${TAG})" \
+            --title "Latest (${SOURCE_LABEL})" \
             --prerelease \
             --notes "$(cat <<EOF
-          Rolling latest mirror of \`${TAG}\` built from commit \`${GITHUB_SHA}\`.
+          Rolling latest pre-release mirror built from commit \`${GITHUB_SHA}\`.
 
-          Tagged release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}
+          ${CONTEXT_LINE}
 
           ## Downloads
 
