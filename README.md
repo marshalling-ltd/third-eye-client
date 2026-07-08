@@ -76,7 +76,9 @@ Cross-platform desktop client for controlling and interacting with Chasing under
 6. Create and push a semantic version tag that matches `Cargo.toml` exactly:
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`
-7. Confirm the `publish` job creates the GitHub Release for that tag and attaches all three artifacts.
+7. Confirm the `publish` job creates:
+   - the tagged GitHub Release (`vX.Y.Z`) with all three artifacts, and
+   - the refreshed `latest` prerelease mirror with the same artifacts.
 8. Smoke-test updater flow in the app:
    - Restart app (or click **Check for updates** in Configuration).
    - Confirm it detects the new tag and opens the correct platform download when **Download update** is clicked.

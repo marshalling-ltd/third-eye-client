@@ -251,10 +251,49 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes "$(cat <<EOF
+          NOTES="$(cat <<EOF
           Built from commit \`${GITHUB_SHA}\`.
+
+          ## Downloads
+
+          | Platform | File | Notes |
+          |----------|------|-------|
+          | **macOS** (Apple Silicon + Intel) | \`Third.Eye.Client.macos-universal.dmg\` | Mount DMG → drag app to Applications. ffmpeg included. |
+          | **Windows** x64 | \`Third.Eye.Client.windows-x64-setup.exe\` | Installs to Program Files, includes ffmpeg |
+          | **Linux** x64 | \`Third.Eye.Client.linux-x64.AppImage\` | \`chmod +x\` then run — no install needed. ffmpeg included. |
+          EOF
+          )"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          fi
+
+      - name: Upload tagged release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release upload "$TAG" \
+            artifacts/Third.Eye.Client.macos-universal.dmg \
+            artifacts/Third.Eye.Client.windows-x64-setup.exe \
+            artifacts/Third.Eye.Client.linux-x64.AppImage \
+            --clobber
+
+      - name: Create/update latest release mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --title "Latest (${TAG})" \
+            --prerelease \
+            --notes "$(cat <<EOF
+          Rolling latest mirror of \`${TAG}\` built from commit \`${GITHUB_SHA}\`.
+
+          Tagged release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}
 
           ## Downloads
 

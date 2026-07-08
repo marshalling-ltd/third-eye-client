@@ -70,8 +70,8 @@ const DEFAULT_ROV_CLIENT_IP: &str = "192.168.1.103";
 const DEFAULT_ROV_CLIENT_NETMASK: &str = "255.255.255.0";
 const DEFAULT_ROV_UDP_BIND_HOST: &str = "0.0.0.0";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB_LATEST_RELEASE_API_URL: &str =
-    "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases/latest";
+const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases?per_page=30";
 const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
 
 slint::include_modules!();
@@ -450,14 +450,13 @@ enum UpdateEvent {
 struct UpdateCheckResult {
     latest_version: String,
     update_available: bool,
-    has_platform_asset: bool,
     download_url: String,
 }
 
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    html_url: String,
+    draft: bool,
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -3308,15 +3307,10 @@ fn poll_update_events(state: &mut ThirdEyeState) -> bool {
                         state.update.update_available = update_result.update_available;
                         state.update.download_url = update_result.download_url;
                         if update_result.update_available {
-                            let mut text = format!(
+                            let text = format!(
                                 "Update available: v{} (installed v{}).",
                                 update_result.latest_version, state.update.current_version
                             );
-                            if !update_result.has_platform_asset {
-                                text.push_str(
-                                    " No platform-specific installer was found; opening the release page instead.",
-                                );
-                            }
                             state.update.status_text = text;
                         } else {
                             state.update.status_text =
@@ -3338,40 +3332,43 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
         .timeout(Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client for update checks")?;
-    let release = client
-        .get(GITHUB_LATEST_RELEASE_API_URL)
+    let releases = client
+        .get(GITHUB_RELEASES_API_URL)
         .header(reqwest::header::USER_AGENT, UPDATE_CHECK_USER_AGENT)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
-        .context("failed to query latest GitHub release")?
+        .context("failed to query GitHub releases")?
         .error_for_status()
-        .context("latest release API returned an error")?
-        .json::<GithubRelease>()
-        .context("failed to parse latest release metadata")?;
-
-    let latest_version = normalize_release_tag(&release.tag_name)
-        .ok_or_else(|| anyhow::anyhow!("invalid release tag '{}'", release.tag_name))?;
+        .context("GitHub releases API returned an error")?
+        .json::<Vec<GithubRelease>>()
+        .context("failed to parse GitHub release metadata")?;
     let current = parse_version_triplet(current_version).ok_or_else(|| {
         anyhow::anyhow!("invalid current app version '{current_version}' in Cargo metadata")
     })?;
-    let latest = parse_version_triplet(&latest_version).ok_or_else(|| {
-        anyhow::anyhow!("release tag '{}' is not semantic x.y.z", release.tag_name)
-    })?;
-    let update_available = latest > current;
+    let latest_with_asset = releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let normalized = normalize_release_tag(&release.tag_name)?;
+            let version = parse_version_triplet(&normalized)?;
+            let download_url = pick_download_url_for_platform(&release.assets)?;
+            Some((version, normalized, download_url))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0));
 
-    let (download_url, has_platform_asset) = if update_available {
-        match pick_download_url_for_platform(&release.assets) {
-            Some((url, exact_platform_asset)) => (url, exact_platform_asset),
-            None => (release.html_url.clone(), false),
-        }
+    let Some((latest, latest_version, download_url)) = latest_with_asset else {
+        anyhow::bail!("No downloadable installer found in GitHub releases for this platform");
+    };
+    let update_available = latest > current;
+    let download_url = if update_available {
+        download_url
     } else {
-        (String::new(), false)
+        String::new()
     };
 
     Ok(UpdateCheckResult {
         latest_version,
         update_available,
-        has_platform_asset,
         download_url,
     })
 }
@@ -3397,16 +3394,14 @@ fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn pick_download_url_for_platform(assets: &[GithubReleaseAsset]) -> Option<(String, bool)> {
+fn pick_download_url_for_platform(assets: &[GithubReleaseAsset]) -> Option<String> {
     if let Some(asset) = assets
         .iter()
         .find(|asset| is_platform_release_asset(&asset.name))
     {
-        return Some((asset.browser_download_url.clone(), true));
+        return Some(asset.browser_download_url.clone());
     }
-    assets
-        .first()
-        .map(|asset| (asset.browser_download_url.clone(), false))
+    None
 }
 
 fn is_platform_release_asset(name: &str) -> bool {
