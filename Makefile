@@ -49,3 +49,14 @@ clean:
 
 upgrade:
 	cargo upgrade --verbose
+
+requirements:
+	@echo "third-eye-client: requirements\n"
+	@rustup update
+	@cargo install cargo-audit
+	@cargo install cargo-deny
+	@cargo install cargo-edit
+	@cargo install cargo-llvm-cov
+	@cargo install cargo-machete
+	@cargo install cargo-nextest --locked
+	@cargo install typos-cli
