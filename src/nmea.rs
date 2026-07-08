@@ -35,6 +35,20 @@ pub const DEFAULT_BT_BAUD_RATE: u32 = 9600;
 ///
 /// On macOS the paired Bluetooth device shows up as `/dev/cu.<DeviceName>`.
 /// On Windows it appears as a `COM` port number. The list is unsorted.
+///
+/// # Returns
+///
+/// * `Vec<String>` - The port names currently visible to the OS; empty if
+///   none are available.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::list_serial_ports;
+///
+/// let ports = list_serial_ports();
+/// println!("number of serial ports found: {}", ports.len());
+/// ```
 pub fn list_serial_ports() -> Vec<String> {
     serialport::available_ports()
         .unwrap_or_default()
@@ -53,6 +67,20 @@ pub fn list_serial_ports() -> Vec<String> {
 /// - **Linux**: `/dev/rfcomm*` ports (BT RFCOMM channels).
 ///
 /// Falls back to the full `list_serial_ports()` on unsupported platforms.
+///
+/// # Returns
+///
+/// * `Vec<String>` - The Bluetooth SPP port names currently visible to the
+///   OS; empty if none are paired/available.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::list_bluetooth_ports;
+///
+/// let ports = list_bluetooth_ports();
+/// println!("number of bluetooth ports found: {}", ports.len());
+/// ```
 pub fn list_bluetooth_ports() -> Vec<String> {
     let ports = serialport::available_ports().unwrap_or_default();
 
@@ -146,6 +174,21 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Tracks a background GPS listener (TCP server, TCP client, or Bluetooth/
+/// serial) and the latest decoded fix, polled from the UI thread via
+/// [`NmeaGpsState::poll_events`]. Only one connection mode can be active at
+/// a time.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::NmeaGpsState;
+///
+/// let state = NmeaGpsState::default();
+/// assert!(!state.is_running());
+/// assert_eq!(state.fixes_received(), 0);
+/// assert!(state.latest_location().is_none());
+/// ```
 #[derive(Default)]
 pub struct NmeaGpsState {
     event_rx: Option<Receiver<NmeaGpsEvent>>,
@@ -161,6 +204,20 @@ impl NmeaGpsState {
     /// Opens a Bluetooth (SPP) or wired serial port and starts reading NMEA
     /// sentences. `port_path` is e.g. `/dev/cu.GPS-SPPSlave` (macOS) or
     /// `COM5` (Windows). The baud rate defaults to [`DEFAULT_BT_BAUD_RATE`].
+    ///
+    /// # Arguments
+    ///
+    /// * `port_path` - The serial/SPP port to open.
+    /// * `protocol` - Which sentence format to parse fixes from.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<String>` - A human-readable status message on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `port_path` is empty or the worker thread cannot
+    /// be spawned.
     pub fn start_bluetooth(&mut self, port_path: &str, protocol: GpsProtocol) -> Result<String> {
         let port_path = port_path.trim().to_owned();
         if port_path.is_empty() {
@@ -192,6 +249,36 @@ impl NmeaGpsState {
     /// Connects as a TCP **client** to a phone running an NMEA server app.
     /// The laptop dials `host:port` and reads NMEA sentences from the
     /// connection. Automatically retries on disconnect.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The phone's address to dial.
+    /// * `port` - The phone's NMEA server TCP port.
+    /// * `protocol` - Which sentence format to parse fixes from.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<String>` - A human-readable status message on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `host` is empty or the worker thread cannot be
+    /// spawned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
+    ///
+    /// let mut state = NmeaGpsState::default();
+    /// // Port 0 has nothing listening, so this connects and immediately
+    /// // starts retrying in the background — enough to exercise the API.
+    /// state.start_client("127.0.0.1", 0, GpsProtocol::Nmea).unwrap();
+    /// assert!(state.is_running());
+    ///
+    /// state.stop();
+    /// assert!(!state.is_running());
+    /// ```
     pub fn start_client(&mut self, host: &str, port: u16, protocol: GpsProtocol) -> Result<String> {
         let host = host.trim();
         if host.is_empty() {
@@ -221,6 +308,34 @@ impl NmeaGpsState {
 
     /// Starts a TCP **server** (listener) that accepts connections from phone
     /// GPS apps like GPS2IP.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The local address to bind to (empty binds to all interfaces).
+    /// * `port` - The local TCP port to listen on.
+    /// * `protocol` - Which sentence format to parse fixes from.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<String>` - A human-readable status message on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worker thread cannot be spawned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
+    ///
+    /// let mut state = NmeaGpsState::default();
+    /// let message = state.start("127.0.0.1", 0, GpsProtocol::Nmea).unwrap();
+    /// assert!(message.contains("Listening"));
+    /// assert!(state.is_running());
+    ///
+    /// state.stop();
+    /// assert!(!state.is_running());
+    /// ```
     pub fn start(&mut self, host: &str, port: u16, protocol: GpsProtocol) -> Result<String> {
         let host = host.trim();
         let bind_addr = if host.is_empty() {
@@ -250,6 +365,21 @@ impl NmeaGpsState {
         Ok(self.status.clone())
     }
 
+    /// Stops the background listener thread, if one is running, and resets
+    /// the fix count. Safe to call even if no listener is running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
+    ///
+    /// let mut state = NmeaGpsState::default();
+    /// state.start("127.0.0.1", 0, GpsProtocol::Nmea).unwrap();
+    ///
+    /// state.stop();
+    /// assert!(!state.is_running());
+    /// assert_eq!(state.status_text(), "NMEA GPS listener stopped.");
+    /// ```
     pub fn stop(&mut self) {
         if let Some(mut controller) = self.controller.take() {
             controller.stop();
@@ -263,6 +393,14 @@ impl NmeaGpsState {
     /// Runs `blueutil --unpair / --pair / --connect` for the given port,
     /// then opens System Settings so the user can click Connect.
     /// Returns a status message for the UI.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_path` - The `/dev/cu.*` Bluetooth serial port to reset.
+    ///
+    /// # Returns
+    ///
+    /// * `String` - A human-readable status message describing the outcome.
     #[cfg(target_os = "macos")]
     pub fn prepare_bluetooth(port_path: &str) -> String {
         let port_path = port_path.trim();
@@ -331,17 +469,66 @@ impl NmeaGpsState {
         )
     }
 
+    /// Non-macOS fallback: returns written pairing instructions instead of
+    /// automating the pairing flow. Delegates to [`bluetooth_pairing_guidance`]
+    /// using the current OS.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_path` - The Bluetooth serial port the user selected, if any.
+    ///
+    /// # Returns
+    ///
+    /// * `String` - Platform-specific pairing instructions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let message = NmeaGpsState::prepare_bluetooth("/dev/rfcomm0");
+    /// assert!(!message.is_empty());
+    /// ```
     #[cfg(not(target_os = "macos"))]
     pub fn prepare_bluetooth(port_path: &str) -> String {
         bluetooth_pairing_guidance(std::env::consts::OS, port_path)
     }
 
+    /// Returns whether a background listener thread is currently running.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if a `start*` method succeeded and [`NmeaGpsState::stop`]
+    ///   has not since been called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let state = NmeaGpsState::default();
+    /// assert!(!state.is_running());
+    /// ```
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.controller.is_some()
     }
 
     /// Drains pending events from the worker thread. Call from the UI timer.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if a new GPS fix was recorded during this call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let mut state = NmeaGpsState::default();
+    /// // No listener has been started, so there is nothing to poll.
+    /// assert!(!state.poll_events());
+    /// ```
     pub fn poll_events(&mut self) -> bool {
         let mut got_fix = false;
         let mut disconnected = false;
@@ -379,11 +566,40 @@ impl NmeaGpsState {
         got_fix
     }
 
+    /// Returns the most recently decoded fix, if any has been received yet.
+    ///
+    /// # Returns
+    ///
+    /// * `Option<(f64, f64)>` - The latest `(latitude, longitude)`, or `None`
+    ///   if no fix has arrived since the listener was started.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let state = NmeaGpsState::default();
+    /// assert!(state.latest_location().is_none());
+    /// ```
     #[must_use]
     pub fn latest_location(&self) -> Option<(f64, f64)> {
         self.latest_fix
     }
 
+    /// Returns the current human-readable status message.
+    ///
+    /// # Returns
+    ///
+    /// * `&str` - The current status message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let state = NmeaGpsState::default();
+    /// assert_eq!(state.status_text(), "");
+    /// ```
     #[must_use]
     pub fn status_text(&self) -> &str {
         &self.status
@@ -391,10 +607,39 @@ impl NmeaGpsState {
 
     /// Directly overwrite the status string (used for non-event messages like
     /// the serial port list returned by `list_serial_ports`).
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - The new status message to display.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let mut state = NmeaGpsState::default();
+    /// state.set_status("Waiting for configuration.".to_string());
+    /// assert_eq!(state.status_text(), "Waiting for configuration.");
+    /// ```
     pub fn set_status(&mut self, status: String) {
         self.status = status;
     }
 
+    /// Returns the number of GPS fixes received since the listener was last
+    /// started.
+    ///
+    /// # Returns
+    ///
+    /// * `u64` - The number of fixes received.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let state = NmeaGpsState::default();
+    /// assert_eq!(state.fixes_received(), 0);
+    /// ```
     #[must_use]
     pub fn fixes_received(&self) -> u64 {
         self.fixes_received
@@ -402,6 +647,24 @@ impl NmeaGpsState {
 
     /// Returns `true` when the service is running and has received a fix
     /// within `stale_timeout_ms` milliseconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `stale_timeout_ms` - How old (in milliseconds) the most recent fix
+    ///   may be before it's considered stale.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if running and the last fix is within the timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::NmeaGpsState;
+    ///
+    /// let state = NmeaGpsState::default();
+    /// assert!(!state.has_recent_fix(5_000));
+    /// ```
     #[must_use]
     pub fn has_recent_fix(&self, stale_timeout_ms: i64) -> bool {
         self.controller.is_some()
@@ -442,6 +705,24 @@ impl Drop for NmeaGpsController {
 /// the automated macOS pairing flow. `target_os` is a value like
 /// [`std::env::consts::OS`] (`"linux"`, `"windows"`, ...). Pure, so it is
 /// unit-testable on any host.
+///
+/// # Arguments
+///
+/// * `target_os` - The OS to build guidance for, e.g. `"linux"`, `"windows"`.
+/// * `port_path` - The Bluetooth serial port the user selected, if any.
+///
+/// # Returns
+///
+/// * `String` - Written pairing instructions for the given OS.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::bluetooth_pairing_guidance;
+///
+/// let message = bluetooth_pairing_guidance("linux", "/dev/rfcomm0");
+/// assert!(message.contains("bluetoothctl"));
+/// ```
 #[must_use]
 pub fn bluetooth_pairing_guidance(target_os: &str, port_path: &str) -> String {
     let port = port_path.trim();
@@ -894,6 +1175,14 @@ fn pump_nmea_lines<R: BufRead>(
 }
 
 /// GPS protocol selector for worker threads.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::GpsProtocol;
+///
+/// assert_eq!(GpsProtocol::default(), GpsProtocol::Nmea);
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GpsProtocol {
     #[default]
@@ -903,6 +1192,25 @@ pub enum GpsProtocol {
 
 impl GpsProtocol {
     /// Parses the protocol from a config string: `"0"` = NMEA, `"1"` = TAIP.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The saved config string.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - The corresponding protocol; defaults to [`GpsProtocol::Nmea`]
+    ///   for any value other than `"1"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::GpsProtocol;
+    ///
+    /// assert_eq!(GpsProtocol::from_config("1"), GpsProtocol::Taip);
+    /// assert_eq!(GpsProtocol::from_config("0"), GpsProtocol::Nmea);
+    /// assert_eq!(GpsProtocol::from_config("garbage"), GpsProtocol::Nmea);
+    /// ```
     #[must_use]
     pub fn from_config(value: &str) -> Self {
         match value.trim() {
@@ -912,6 +1220,19 @@ impl GpsProtocol {
     }
 
     /// Returns the config string for persistence.
+    ///
+    /// # Returns
+    ///
+    /// * `&'static str` - `"0"` for NMEA, `"1"` for TAIP.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use third_eye_client::nmea::GpsProtocol;
+    ///
+    /// assert_eq!(GpsProtocol::Nmea.as_config_str(), "0");
+    /// assert_eq!(GpsProtocol::Taip.as_config_str(), "1");
+    /// ```
     #[must_use]
     pub fn as_config_str(self) -> &'static str {
         match self {
@@ -927,6 +1248,27 @@ impl GpsProtocol {
 
 /// Attempts to parse a lat/lon fix from a line, trying the protocol-specific
 /// parser first. Falls back to the other protocol if the first fails.
+///
+/// # Arguments
+///
+/// * `line` - A single GPS sentence (NMEA or TAIP).
+/// * `protocol` - Which parser to try first.
+///
+/// # Returns
+///
+/// * `Option<(f64, f64)>` - The `(latitude, longitude)` in decimal degrees, or
+///   `None` if neither parser recognizes the line or reports no fix.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::{GpsProtocol, parse_gps_location};
+///
+/// let line = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47";
+/// let (lat, lon) = parse_gps_location(line, GpsProtocol::Nmea).unwrap();
+/// assert!((lat - 48.1173).abs() < 0.001);
+/// assert!((lon - 11.516_667).abs() < 0.001);
+/// ```
 #[must_use]
 pub fn parse_gps_location(line: &str, protocol: GpsProtocol) -> Option<(f64, f64)> {
     match protocol {
@@ -937,6 +1279,26 @@ pub fn parse_gps_location(line: &str, protocol: GpsProtocol) -> Option<(f64, f64
 
 /// Attempts to parse a lat/lon fix from a single NMEA sentence.
 /// Supports `$GPGGA`, `$GNGGA`, `$GPRMC`, and `$GNRMC`.
+///
+/// # Arguments
+///
+/// * `line` - A single NMEA sentence, e.g. `"$GPGGA,...*47"`.
+///
+/// # Returns
+///
+/// * `Option<(f64, f64)>` - The `(latitude, longitude)` in decimal degrees, or
+///   `None` if the sentence isn't a supported type or reports no fix.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::parse_nmea_location;
+///
+/// let line = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47";
+/// let (lat, lon) = parse_nmea_location(line).unwrap();
+/// assert!((lat - 48.1173).abs() < 0.001);
+/// assert!((lon - 11.516_667).abs() < 0.001);
+/// ```
 #[must_use]
 pub fn parse_nmea_location(line: &str) -> Option<(f64, f64)> {
     let line = line.trim();
@@ -1017,6 +1379,26 @@ fn parse_nmea_coordinate(value: &str, hemisphere: &str) -> Option<f64> {
 /// Latitude is `±DD.DDDDD` (sign + 2-digit degrees + 5-digit decimal fraction).
 /// Longitude is `±DDD.DDDDD` (sign + 3-digit degrees + 5-digit decimal fraction).
 /// Fix mode `9` means no fix.
+///
+/// # Arguments
+///
+/// * `line` - A single TAIP RPV sentence, e.g. `">RPV...<"`.
+///
+/// # Returns
+///
+/// * `Option<(f64, f64)>` - The `(latitude, longitude)` in decimal degrees, or
+///   `None` if the sentence isn't a recognized RPV sentence or reports no fix.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::parse_taip_location;
+///
+/// let line = ">RPV15714+3739438-1220384601512612<";
+/// let (lat, lon) = parse_taip_location(line).unwrap();
+/// assert!((lat - 37.39438).abs() < 0.00001);
+/// assert!((lon - (-122.03846)).abs() < 0.00001);
+/// ```
 #[must_use]
 pub fn parse_taip_location(line: &str) -> Option<(f64, f64)> {
     let line = line.trim();
