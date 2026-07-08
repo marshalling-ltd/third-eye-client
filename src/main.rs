@@ -457,6 +457,7 @@ struct UpdateCheckResult {
 struct GithubRelease {
     tag_name: String,
     draft: bool,
+    prerelease: bool,
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -3308,13 +3309,15 @@ fn poll_update_events(state: &mut ThirdEyeState) -> bool {
                         state.update.download_url = update_result.download_url;
                         if update_result.update_available {
                             let text = format!(
-                                "Update available: v{} (installed v{}).",
+                                "Update available: v{} (installed v{}, latest stable).",
                                 update_result.latest_version, state.update.current_version
                             );
                             state.update.status_text = text;
                         } else {
-                            state.update.status_text =
-                                format!("You're up to date on v{}.", state.update.current_version);
+                            state.update.status_text = format!(
+                                "You're up to date on v{} (latest stable: v{}).",
+                                state.update.current_version, update_result.latest_version
+                            );
                         }
                     }
                     Err(err) => {
@@ -3347,7 +3350,7 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
     })?;
     let latest_with_asset = releases
         .iter()
-        .filter(|release| !release.draft)
+        .filter(|release| !release.draft && !release.prerelease)
         .filter_map(|release| {
             let normalized = normalize_release_tag(&release.tag_name)?;
             let version = parse_version_triplet(&normalized)?;
@@ -3357,7 +3360,9 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
         .max_by(|left, right| left.0.cmp(&right.0));
 
     let Some((latest, latest_version, download_url)) = latest_with_asset else {
-        anyhow::bail!("No downloadable installer found in GitHub releases for this platform");
+        anyhow::bail!(
+            "No stable release with a downloadable installer was found for this platform"
+        );
     };
     let update_available = latest > current;
     let download_url = if update_available {
