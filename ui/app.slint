@@ -68,6 +68,7 @@ export component AppWindow inherits Window {
     in-out property <string> auth_signed_in_as;
     in-out property <bool> auth_is_signed_in: false;
     in-out property <string> app_version;
+    in-out property <string> running_build_info;
     in-out property <string> update_status_text;
     in-out property <string> update_latest_version;
     in-out property <bool> update_available: false;
@@ -377,6 +378,12 @@ export component AppWindow inherits Window {
                     Text {
                         text: "Installed version: v" + root.app_version;
                         color: #8f96a3;
+                    }
+                    Text {
+                        text: "Running build: " + root.running_build_info;
+                        wrap: word-wrap;
+                        color: #8f96a3;
+                        font-size: 12px;
                     }
                     if root.update_available : Text {
                         text: "Latest available: v" + root.update_latest_version;

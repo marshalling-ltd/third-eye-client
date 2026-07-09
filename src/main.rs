@@ -76,6 +76,14 @@ const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
 
 slint::include_modules!();
 
+fn detect_running_build_info() -> String {
+    let exe = std::env::current_exe().map_or_else(
+        |_| "<unknown executable>".to_string(),
+        |path| path.display().to_string(),
+    );
+    format!("v{APP_VERSION} • {exe}")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Configuration,
@@ -491,6 +499,8 @@ struct ThirdEyeState {
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
+    /// Human-readable runtime identifier: version + executable path.
+    running_build_info: String,
     /// Human-readable current tile cache size (e.g. "42.3 MB").
     tile_cache_size_text: String,
     media: MediaUiState,
@@ -611,6 +621,7 @@ impl ThirdEyeState {
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
+            running_build_info: detect_running_build_info(),
             tile_cache_size_text: String::new(),
             media,
             location_detected_at_ms: 0,
@@ -869,6 +880,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_auth_signed_in_as(state.auth.signed_in_as.clone().into());
     ui.set_auth_is_signed_in(state.auth.is_signed_in);
     ui.set_attached_metadata_text(state.attached_metadata_text.clone().into());
+    ui.set_running_build_info(state.running_build_info.clone().into());
     ui.set_use_saved_map_tiles(state.config.use_saved_map_tiles());
     ui.set_max_tile_storage_mb(state.config.max_tile_storage_mb.clone().into());
     ui.set_tile_cache_size_text(state.tile_cache_size_text.clone().into());
@@ -3457,7 +3469,7 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
         releases
             .iter()
             .filter(|release| !release.draft)
-            .filter_map(|release| {
+            .find_map(|release| {
                 let normalized = normalize_release_tag(&release.tag_name)?;
                 let version = parse_version_triplet(&normalized)?;
                 if version != latest {
@@ -3465,10 +3477,8 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
                 }
                 pick_download_url_for_platform(&release.assets)
             })
-            // Fallback: rolling `latest` pre-release mirror carries installers
             // even when a tagged stable release was accidentally published
             // without assets.
-            .next()
             .or_else(|| {
                 releases
                     .iter()
