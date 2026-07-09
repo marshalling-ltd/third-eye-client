@@ -23,7 +23,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 imageproc = "0.27"
 ab_glyph = "0.2"
 libc = "0.2"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies", "json", "rustls", "query"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -32,6 +32,8 @@ sha2 = "0.11"
 slint = { version = "1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
 serialport = "4"
 socket2 = { version = "0.6", features = ["all"] }
+third-eye-openapi = { package = "openapi", path = "generated" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 if-addrs = "0.15"
 webbrowser = "1.2.1"

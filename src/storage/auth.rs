@@ -15,13 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use base64::Engine;
 use cookie::{Cookie, SameSite};
+use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
-use reqwest::blocking::{Client, Response};
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{HeaderValue, SET_COOKIE};
+use reqwest::header::HeaderValue;
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use third_eye_openapi::apis::Error as GeneratedApiError;
+use third_eye_openapi::apis::account_handler_api;
+use third_eye_openapi::apis::configuration as generated_configuration;
+use third_eye_openapi::models::LoginSchema;
 
 use super::db::SharedDb;
 
@@ -88,20 +91,6 @@ impl AuthError {
     }
 }
 
-#[derive(Serialize, Debug)]
-struct LoginRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-}
-
-#[derive(Deserialize, Debug)]
-struct TokenResponse {
-    #[serde(default)]
-    #[allow(dead_code)]
-    status: String,
-    access_token: String,
-}
-
 /// Authentication facade held by `AppStore`.
 pub struct AuthClient {
     db: SharedDb,
@@ -150,34 +139,19 @@ impl AuthClient {
 
     /// POST `/api/v1/account/login`.
     ///
-    /// On success, stores the JWT access token plus every `Set-Cookie` the
-    /// server returned (in particular the `HttpOnly` refresh cookie).
+    /// On success, stores the JWT access token; cookies are persisted by the
+    /// shared `PersistentCookieJar`.
     pub fn login(
         &self,
         server_base: &str,
         email: &str,
         password: &str,
     ) -> Result<LoginOutcome, AuthError> {
-        let url = join(server_base, "/api/v1/account/login")?;
-        let response = self
-            .http
-            .post(url.clone())
-            .json(&LoginRequest { email, password })
-            .send()
-            .map_err(AuthError::from_reqwest)?;
-
-        let status = response.status();
-        let set_cookies = take_set_cookie_headers(&response);
-        if !status.is_success() {
-            let message = response.text().unwrap_or_default();
-            return Err(AuthError::Server { status, message });
-        }
-
-        // Persist every cookie the server returned so the refresh cookie
-        // survives a restart.
-        self.jar.persist_set_cookies(&set_cookies, &url)?;
-
-        let payload: TokenResponse = response.json().map_err(AuthError::from_reqwest)?;
+        let configuration = self.generated_configuration(server_base)?;
+        let payload = Self::run_generated(account_handler_api::login_user_handler(
+            &configuration,
+            LoginSchema::new(email.to_owned(), password.to_owned()),
+        ))?;
         let exp_ms = decode_jwt_exp_ms(&payload.access_token);
         update_session_row(
             &self.db,
@@ -199,23 +173,10 @@ impl AuthClient {
     /// POST `/api/v1/account/refresh-access-token`. Requires a valid refresh
     /// cookie to already be in the jar.
     pub fn refresh(&self, server_base: &str) -> Result<String, AuthError> {
-        let url = join(server_base, "/api/v1/account/refresh-access-token")?;
-        let response = self
-            .http
-            .post(url.clone())
-            .send()
-            .map_err(AuthError::from_reqwest)?;
-
-        let status = response.status();
-        let set_cookies = take_set_cookie_headers(&response);
-        if !status.is_success() {
-            let message = response.text().unwrap_or_default();
-            return Err(AuthError::Server { status, message });
-        }
-
-        self.jar.persist_set_cookies(&set_cookies, &url)?;
-
-        let payload: TokenResponse = response.json().map_err(AuthError::from_reqwest)?;
+        let configuration = self.generated_configuration(server_base)?;
+        let payload = Self::run_generated(account_handler_api::refresh_access_token_handler(
+            &configuration,
+        ))?;
         let exp_ms = decode_jwt_exp_ms(&payload.access_token);
         update_session_token(&self.db, server_base, &payload.access_token, exp_ms)
             .map_err(AuthError::from_rusqlite)?;
@@ -228,43 +189,53 @@ impl AuthClient {
     /// the server responds with an error - the user clearly wants to be
     /// signed out.
     pub fn logout(&self, server_base: &str) -> Result<(), AuthError> {
-        let url = join(server_base, "/api/v1/account/logout")?;
-        // Attach Authorization if we still have a token.
-        let token = self.access_token().map_err(AuthError::Transport)?;
-        let mut request = self.http.get(url);
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        let result = request.send();
+        let configuration = self.generated_configuration(server_base)?;
+        let result = Self::run_generated(account_handler_api::logout_handler(&configuration));
         // Clear local state regardless of response.
         let _ = clear_session(&self.db);
         let _ = self.jar.clear_all();
-        match result {
-            Ok(response) if response.status().is_success() => Ok(()),
-            Ok(response) => Err(AuthError::Server {
-                status: response.status(),
-                message: response.text().unwrap_or_default(),
-            }),
-            Err(err) => Err(AuthError::from_reqwest(err)),
-        }
+        result
+    }
+
+    fn generated_configuration(
+        &self,
+        server_base: &str,
+    ) -> Result<generated_configuration::Configuration, AuthError> {
+        let mut configuration = generated_configuration::Configuration::new();
+        let base_url = Url::parse(server_base.trim())
+            .with_context(|| format!("invalid server URL {}", server_base.trim()))
+            .map_err(AuthError::Transport)?;
+        base_url
+            .as_str()
+            .trim_end_matches('/')
+            .clone_into(&mut configuration.base_path);
+        configuration.user_agent = None;
+        configuration.client = self.http.clone();
+        Ok(configuration)
+    }
+    fn run_generated<T, E, F>(future: F) -> Result<T, AuthError>
+    where
+        F: std::future::Future<Output = Result<T, GeneratedApiError<E>>>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("creating runtime for generated auth API")
+            .map_err(AuthError::Transport)?;
+        runtime.block_on(future).map_err(map_generated_error)
     }
 }
 
-fn join(base: &str, path: &str) -> Result<Url, AuthError> {
-    let base = base.trim_end_matches('/');
-    let url = format!("{base}{path}");
-    Url::parse(&url)
-        .with_context(|| format!("invalid server URL {url}"))
-        .map_err(AuthError::Transport)
-}
-
-fn take_set_cookie_headers(response: &Response) -> Vec<HeaderValue> {
-    response
-        .headers()
-        .get_all(SET_COOKIE)
-        .iter()
-        .cloned()
-        .collect()
+fn map_generated_error<E>(error: GeneratedApiError<E>) -> AuthError {
+    match error {
+        GeneratedApiError::ResponseError(content) => AuthError::Server {
+            status: content.status,
+            message: content.content,
+        },
+        GeneratedApiError::Reqwest(error) => AuthError::from_reqwest(error),
+        GeneratedApiError::Serde(error) => AuthError::Transport(anyhow::anyhow!(error)),
+        GeneratedApiError::Io(error) => AuthError::Transport(anyhow::anyhow!(error)),
+    }
 }
 
 fn update_session_row(
@@ -463,7 +434,12 @@ impl PersistentCookieJar {
 
 impl CookieStore for PersistentCookieJar {
     fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
-        self.inner.set_cookies(cookie_headers, url);
+        let headers: Vec<HeaderValue> = cookie_headers.cloned().collect();
+        let mut iter = headers.iter();
+        self.inner.set_cookies(&mut iter, url);
+        if let Err(err) = self.persist_set_cookies(&headers, url) {
+            eprintln!("third-eye-client: warning: failed to persist auth cookies: {err}");
+        }
     }
 
     fn cookies(&self, url: &Url) -> Option<HeaderValue> {

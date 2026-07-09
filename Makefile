@@ -53,6 +53,9 @@ upgrade:
 bump-patch:
 	@bash ./scripts/bump_patch_version.sh
 
+open-api:
+	@openapi-generator-cli generate -i https://third-eye.marshalling.eu/api/v1/api-doc/openapi.json -g rust -o ./generated --skip-validate-spec
+
 requirements:
 	@echo "third-eye-client: requirements\n"
 	@rustup update
