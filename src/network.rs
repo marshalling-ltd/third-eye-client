@@ -6,6 +6,20 @@
 use reqwest::Url;
 
 /// Result of a background ROV network recalibration.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::RecalibrateResult;
+///
+/// let result = RecalibrateResult {
+///     interface: "en10".to_string(),
+///     rov_info: "Detected ROV interface en10.".to_string(),
+/// };
+///
+/// assert_eq!(result.interface, "en10");
+/// assert!(result.rov_info.contains("en10"));
+/// ```
 pub struct RecalibrateResult {
     /// Detected interface name, or empty if none found.
     pub interface: String,
@@ -15,8 +29,40 @@ pub struct RecalibrateResult {
 
 /// Extracts the host from an HTTP base URL string.
 ///
-/// Prepends `http://` if no scheme is present so bare IPs like
-/// `"192.168.1.88"` work correctly.
+/// If `base` has no scheme, `http://` is prepended so bare IP addresses such
+/// as `"192.168.1.88"` are accepted.
+///
+/// # Arguments
+///
+/// * `base` - A full HTTP URL, hostname, or bare IP address.
+///
+/// # Returns
+///
+/// * `Option<String>` - The extracted host, or `None` if the input cannot be
+///   parsed as a URL.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::parse_host_from_http_base;
+///
+/// assert_eq!(
+///     parse_host_from_http_base("http://192.168.1.88"),
+///     Some("192.168.1.88".to_string())
+/// );
+///
+/// assert_eq!(
+///     parse_host_from_http_base("192.168.1.88"),
+///     Some("192.168.1.88".to_string())
+/// );
+///
+/// assert_eq!(
+///     parse_host_from_http_base("http://10.0.0.1:8080/v1/api"),
+///     Some("10.0.0.1".to_string())
+/// );
+///
+/// assert_eq!(parse_host_from_http_base(""), None);
+/// ```
 pub fn parse_host_from_http_base(base: &str) -> Option<String> {
     let normalized = if base.contains("://") {
         base.trim().to_owned()
@@ -30,10 +76,30 @@ pub fn parse_host_from_http_base(base: &str) -> Option<String> {
 
 /// Finds the network interface that is on the same subnet as `rov_host`.
 ///
-/// Uses `if-addrs` for cross-platform interface enumeration. On macOS wired
-/// links are preferred over Wi-Fi by inspecting `ifconfig` media types, so a
-/// wired `en0` (desktop / Thunderbolt dock) is usable; on other platforms a
-/// wired-looking interface name is preferred over a wireless one.
+/// Uses `if-addrs` for cross-platform interface enumeration. On macOS, wired
+/// links are preferred by inspecting `ifconfig` media types. On other
+/// platforms, interface names that do not look wireless are preferred.
+///
+/// # Arguments
+///
+/// * `rov_host` - The ROV IPv4 address as a string.
+///
+/// # Returns
+///
+/// * `Option<String>` - The detected interface name, or `None` if no matching
+///   interface is found or `rov_host` is not a valid IPv4 address.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::detect_rov_interface;
+///
+/// assert!(detect_rov_interface("not-an-ip").is_none());
+/// assert!(detect_rov_interface("").is_none());
+/// ```
+///
+/// No doctest is provided for successful detection because available network
+/// interfaces depend on the host running the test.
 pub fn detect_rov_interface(rov_host: &str) -> Option<String> {
     let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
     let interfaces = if_addrs::get_if_addrs().ok()?;
@@ -81,6 +147,18 @@ pub fn detect_rov_interface(rov_host: &str) -> Option<String> {
     }
 }
 
+/// Returns the full `ifconfig -a` output on macOS.
+///
+/// This is used to inspect interface media types so wired Ethernet adapters can
+/// be preferred over Wi-Fi.
+///
+/// # Returns
+///
+/// * `Option<String>` - The command output, or `None` if `ifconfig` cannot be
+///   executed.
+///
+/// No doctest is provided because this function depends on the host operating
+/// system and installed system tools.
 #[cfg(target_os = "macos")]
 fn macos_ifconfig_text() -> Option<String> {
     let output = std::process::Command::new("ifconfig")
@@ -90,10 +168,37 @@ fn macos_ifconfig_text() -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Returns `true` when the named interface in `ifconfig -a` output is a wired
-/// Ethernet link: its block has a hardware `ether` address and a wired
-/// `media: ...base...` line (for example `1000baseT`). Wi-Fi adapters report
-/// no `base` media type, so they are classified as not wired.
+/// Returns whether a named macOS interface appears to be wired Ethernet.
+///
+/// The function inspects one interface block from `ifconfig -a` output. An
+/// interface is considered wired when it has both a hardware `ether` address
+/// and a `media:` line containing a wired `base` media type, such as
+/// `1000baseT`.
+///
+/// # Arguments
+///
+/// * `ifconfig_text` - Text output from `ifconfig -a`.
+/// * `name` - Interface name, for example `"en5"`.
+///
+/// # Returns
+///
+/// * `bool` - `true` if the named interface looks like wired Ethernet.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::macos_interface_is_wired;
+///
+/// let ifconfig = concat!(
+///     "en5: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n",
+///     "\tether ac:de:48:00:11:22\n",
+///     "\tmedia: autoselect (1000baseT <full-duplex>)\n",
+///     "\tstatus: active\n",
+/// );
+///
+/// assert!(macos_interface_is_wired(ifconfig, "en5"));
+/// assert!(!macos_interface_is_wired(ifconfig, "en9"));
+/// ```
 #[must_use]
 pub fn macos_interface_is_wired(ifconfig_text: &str, name: &str) -> bool {
     let mut in_block = false;
@@ -116,13 +221,41 @@ pub fn macos_interface_is_wired(ifconfig_text: &str, name: &str) -> bool {
     has_ether && wired_media
 }
 
-/// Picks a non-wireless interface from `candidates`, used on Linux/Windows
-/// where `ifconfig` media metadata is not consulted.
+/// Picks a non-wireless interface from a list of candidates.
 ///
-/// Returns the first candidate whose name does not look wireless (`wl`,
-/// `wlan`, `wlp`, `wifi`, `wi-fi`, `wireless`, case-insensitive). If every
-/// name looks wireless the first candidate is returned; an empty list yields
-/// `None`.
+/// This is used on Linux and Windows, where macOS `ifconfig` media metadata is
+/// not consulted. Interface names containing common wireless markers such as
+/// `wlan`, `wlp`, `wifi`, `wi-fi`, `wireless`, or `wl` are skipped when
+/// possible.
+///
+/// # Arguments
+///
+/// * `candidates` - Candidate interface names.
+///
+/// # Returns
+///
+/// * `Option<String>` - The preferred wired-looking interface, the first
+///   candidate if all look wireless, or `None` if the list is empty.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::prefer_wired_interface;
+///
+/// let candidates = vec!["wlan0".to_string(), "eth0".to_string()];
+/// assert_eq!(
+///     prefer_wired_interface(&candidates),
+///     Some("eth0".to_string())
+/// );
+///
+/// let candidates = vec!["wlan0".to_string(), "wlp2s0".to_string()];
+/// assert_eq!(
+///     prefer_wired_interface(&candidates),
+///     Some("wlan0".to_string())
+/// );
+///
+/// assert_eq!(prefer_wired_interface(&[]), None);
+/// ```
 #[must_use]
 pub fn prefer_wired_interface(candidates: &[String]) -> Option<String> {
     fn looks_wireless(name: &str) -> bool {
@@ -140,10 +273,36 @@ pub fn prefer_wired_interface(candidates: &[String]) -> Option<String> {
 
 /// Selects an active wired macOS `en*` adapter from `ifconfig -a` output.
 ///
-/// This catches USB Ethernet adapters that are physically active but do not
-/// have an IPv4 address yet. Selection is by media type, not name: a Wi-Fi
-/// adapter (no wired `base` media) is never selected, while a wired `en0`
-/// (desktop / dock) is eligible.
+/// This catches USB or Thunderbolt Ethernet adapters that are physically active
+/// but do not yet have an IPv4 address. Selection is based on media type rather
+/// than interface name, so a wired `en0` can be selected while Wi-Fi is ignored.
+///
+/// # Arguments
+///
+/// * `ifconfig_text` - Text output from `ifconfig -a`.
+///
+/// # Returns
+///
+/// * `Option<String>` - The first active wired `en*` interface, or `None` if no
+///   suitable adapter is found.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::select_active_macos_ethernet_interface;
+///
+/// let ifconfig = concat!(
+///     "en10: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n",
+///     "\tether 11:22:33:44:55:66\n",
+///     "\tmedia: autoselect (1000baseT <full-duplex>)\n",
+///     "\tstatus: active\n",
+/// );
+///
+/// assert_eq!(
+///     select_active_macos_ethernet_interface(ifconfig),
+///     Some("en10".to_string())
+/// );
+/// ```
 #[must_use]
 pub fn select_active_macos_ethernet_interface(ifconfig_text: &str) -> Option<String> {
     #[derive(Default)]
