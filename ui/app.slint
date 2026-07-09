@@ -163,6 +163,7 @@ export component AppWindow inherits Window {
     callback capture_photo();
 
     callback refresh_media();
+    callback open_local_media_folder();
     callback select_media(string, string);
     callback download_selected_media();
     callback open_selected_local_media();
@@ -732,6 +733,11 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             text: "Refresh from ROV";
                             clicked => { root.refresh_media(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Open local folder";
+                            clicked => { root.open_local_media_folder(); }
                         }
                     }
                     Text { text: root.media_status; wrap: word-wrap; }

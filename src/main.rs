@@ -1414,6 +1414,17 @@ fn build_capture_text(meta: &StoredCaptureMetadata) -> String {
     lines.join("\n")
 }
 
+fn app_data_root_dir(store: &AppStore) -> PathBuf {
+    match store.data_path().and_then(|p| p.parent()) {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::temp_dir().join("third-eye-client"),
+    }
+}
+
+fn local_media_root_dir(store: &AppStore) -> PathBuf {
+    app_data_root_dir(store).join("media")
+}
+
 /// Spawns a background download for the given media item.
 ///
 /// Shared by the auto-download on selection and the explicit Download button.
@@ -1424,10 +1435,7 @@ fn start_media_download(
     name: &str,
     status_text: String,
 ) {
-    let data_root = match store.data_path().and_then(|p| p.parent()) {
-        Some(dir) => dir.to_path_buf(),
-        None => std::env::temp_dir().join("third-eye-client"),
-    };
+    let data_root = app_data_root_dir(store);
     let camera = CameraApiClient::new_bound(
         state.config.rov_http_base.clone(),
         state.config.rov_interface(),
@@ -1845,6 +1853,42 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.media.stop_media_stream();
         state.active_screen = Screen::Configuration;
         state.last_screen = Screen::Configuration;
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_open_media_folder = Rc::clone(&state);
+    let store_for_open_media_folder = Rc::clone(&store);
+    ui.on_open_local_media_folder(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_open_media_folder.try_borrow_mut() else {
+            return;
+        };
+        let media_dir = local_media_root_dir(&store_for_open_media_folder);
+        if let Err(err) = std::fs::create_dir_all(&media_dir) {
+            state.media.status_text = format!(
+                "Failed to prepare local media folder {}: {err:#}",
+                media_dir.display()
+            );
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        let open_target = Url::from_directory_path(&media_dir)
+            .map_or_else(|()| media_dir.display().to_string(), |url| url.to_string());
+        match webbrowser::open(&open_target) {
+            Ok(()) => {
+                state.media.status_text =
+                    format!("Opened local media folder: {}", media_dir.display());
+            }
+            Err(err) => {
+                state.media.status_text = format!(
+                    "Failed to open local media folder {}: {err:#}",
+                    media_dir.display()
+                );
+            }
+        }
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2536,10 +2580,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         );
         let media_store = store_for_capture.media().clone();
         let tx = state.media.event_tx.clone();
-        let data_root = match store_for_capture.data_path().and_then(|p| p.parent()) {
-            Some(dir) => dir.to_path_buf(),
-            None => std::env::temp_dir().join("third-eye-client"),
-        };
+        let data_root = app_data_root_dir(&store_for_capture);
         state.media.capture_in_progress = true;
         state.rov_info = "Capturing photo...".to_string();
         if state.active_screen == Screen::Stream {
