@@ -3439,25 +3439,48 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
     let current = parse_version_triplet(current_version).ok_or_else(|| {
         anyhow::anyhow!("invalid current app version '{current_version}' in Cargo metadata")
     })?;
-    let latest_with_asset = releases
+    let latest_stable = releases
         .iter()
         .filter(|release| !release.draft && !release.prerelease)
         .filter_map(|release| {
             let normalized = normalize_release_tag(&release.tag_name)?;
             let version = parse_version_triplet(&normalized)?;
-            let download_url = pick_download_url_for_platform(&release.assets)?;
-            Some((version, normalized, download_url))
+            Some((version, normalized))
         })
         .max_by(|left, right| left.0.cmp(&right.0));
-
-    let Some((latest, latest_version, download_url)) = latest_with_asset else {
-        anyhow::bail!(
-            "No stable release with a downloadable installer was found for this platform"
-        );
+    let Some((latest, latest_version)) = latest_stable else {
+        anyhow::bail!("No stable semantic release was found");
     };
     let update_available = latest > current;
     let download_url = if update_available {
-        download_url
+        // Prefer installer assets attached directly to the latest stable tag.
+        releases
+            .iter()
+            .filter(|release| !release.draft)
+            .filter_map(|release| {
+                let normalized = normalize_release_tag(&release.tag_name)?;
+                let version = parse_version_triplet(&normalized)?;
+                if version != latest {
+                    return None;
+                }
+                pick_download_url_for_platform(&release.assets)
+            })
+            // Fallback: rolling `latest` pre-release mirror carries installers
+            // even when a tagged stable release was accidentally published
+            // without assets.
+            .next()
+            .or_else(|| {
+                releases
+                    .iter()
+                    .filter(|release| !release.draft)
+                    .filter(|release| release.tag_name.trim().eq_ignore_ascii_case("latest"))
+                    .find_map(|release| pick_download_url_for_platform(&release.assets))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Latest stable v{latest_version} was found, but no installer is available for this platform"
+                )
+            })?
     } else {
         String::new()
     };
