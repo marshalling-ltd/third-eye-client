@@ -73,6 +73,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases?per_page=30";
 const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
+const AUTO_UPDATE_CHECK_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 
 slint::include_modules!();
 
@@ -428,6 +429,7 @@ struct UpdateUiState {
     download_url: String,
     update_available: bool,
     check_in_progress: bool,
+    next_auto_check_at_ms: i64,
     event_tx: mpsc::Sender<UpdateEvent>,
     event_rx: mpsc::Receiver<UpdateEvent>,
 }
@@ -443,6 +445,7 @@ impl UpdateUiState {
             download_url: String::new(),
             update_available: false,
             check_in_progress: false,
+            next_auto_check_at_ms: 0,
             event_tx,
             event_rx,
         }
@@ -640,7 +643,9 @@ impl ThirdEyeState {
         if self.update.check_in_progress {
             return;
         }
+        let now_ms = current_unix_ms();
         self.update.check_in_progress = true;
+        self.update.next_auto_check_at_ms = now_ms.saturating_add(AUTO_UPDATE_CHECK_INTERVAL_MS);
         self.update.status_text = if manual {
             "Checking for updates...".to_string()
         } else {
@@ -653,6 +658,18 @@ impl ThirdEyeState {
                 check_for_updates_blocking(&current_version).map_err(|err| format!("{err:#}"));
             let _ = tx.send(UpdateEvent::CheckFinished { result });
         });
+    }
+
+    fn poll_auto_update_check(&mut self) -> bool {
+        if self.update.check_in_progress {
+            return false;
+        }
+        let now_ms = current_unix_ms();
+        if now_ms < self.update.next_auto_check_at_ms {
+            return false;
+        }
+        self.start_update_check(false);
+        true
     }
 
     fn load_map_tile_for_current_location(&mut self, success_status: String) {
@@ -1424,6 +1441,49 @@ fn app_data_root_dir(store: &AppStore) -> PathBuf {
 fn local_media_root_dir(store: &AppStore) -> PathBuf {
     app_data_root_dir(store).join("media")
 }
+#[cfg(target_os = "macos")]
+fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
+    let status = Command::new("open")
+        .arg(path)
+        .status()
+        .with_context(|| format!("launching Finder for {}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("`open` exited with status {status}")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
+    let status = Command::new("explorer")
+        .arg(path)
+        .status()
+        .with_context(|| format!("launching Explorer for {}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("`explorer` exited with status {status}")
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
+    let status = Command::new("xdg-open")
+        .arg(path)
+        .status()
+        .with_context(|| format!("launching file manager for {}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("`xdg-open` exited with status {status}")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+fn open_in_file_manager(_path: &std::path::Path) -> Result<()> {
+    anyhow::bail!("opening folders is not supported on this platform")
+}
 
 /// Spawns a background download for the given media item.
 ///
@@ -1875,9 +1935,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         }
-        let open_target = Url::from_directory_path(&media_dir)
-            .map_or_else(|()| media_dir.display().to_string(), |url| url.to_string());
-        match webbrowser::open(&open_target) {
+        match open_in_file_manager(&media_dir) {
             Ok(()) => {
                 state.media.status_text =
                     format!("Opened local media folder: {}", media_dir.display());
@@ -4715,9 +4773,10 @@ fn main() -> Result<()> {
                 apply_state_to_ui(&ui, &state);
             }
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
+            let auto_update_started = state.poll_auto_update_check();
             let media_changed = poll_media_events(&mut state, &poll_store);
             let update_changed = poll_update_events(&mut state);
-            if media_changed || update_changed {
+            if media_changed || update_changed || auto_update_started {
                 apply_state_to_ui(&ui, &state);
             }
         },
