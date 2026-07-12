@@ -1,4 +1,4 @@
-import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct MapTile {
     x: length,
@@ -47,11 +47,14 @@ export component AppWindow inherits Window {
     in-out property <bool> nmea_gps_running: false;
     in-out property <bool> nmea_has_fix: false;
     in-out property <string> nmea_local_ip;
+    in property <[string]> nmea_serial_port_options;
+    in-out property <int> nmea_serial_port_index: -1;
     in-out property <string> nmea_serial_ports;
     // 0 = Auto (BT / TCP listen), 1 = Connect to Server (TCP client).
     in-out property <int> nmea_gps_mode: 0;
     // 0 = NMEA, 1 = TAIP.
     in-out property <int> nmea_gps_protocol: 0;
+    in-out property <string> nmea_serial_port;
     in-out property <string> nmea_server_host;
     in-out property <string> nmea_server_port;
     in-out property <string> nmea_stale_timeout: "10";
@@ -175,6 +178,7 @@ export component AppWindow inherits Window {
     callback start_nmea_gps();
     callback stop_nmea_gps();
     callback prepare_bluetooth();
+    callback select_nmea_serial_port(string);
     callback set_nmea_gps_mode(int);
     callback set_nmea_gps_protocol(int);
     in-out property <bool> bt_prepared: false;
@@ -622,17 +626,32 @@ export component AppWindow inherits Window {
                     if root.nmea_gps_mode == 2 : VerticalBox {
                         spacing: 8px;
                         Text {
-                            text: "Connects to a paired Bluetooth GPS device via serial port (SPP). The phone must be paired and its virtual COM / serial port must be visible to the OS.";
+                            text: "Connects to a GPS device via serial port (Bluetooth SPP or USB serial). The selected COM/serial port must be visible to the OS.";
                             wrap: word-wrap;
                             color: #8f96a3;
                             font-size: 12px;
                         }
+                        Text { text: "Detected serial ports (Bluetooth/USB):"; }
+                        ComboBox {
+                            model: root.nmea_serial_port_options;
+                            current-index <=> root.nmea_serial_port_index;
+                            enabled: root.nmea_serial_port_options.length > 0;
+                            selected(current-value) => {
+                                root.nmea_serial_port = current-value;
+                                root.select_nmea_serial_port(current-value);
+                            }
+                        }
+                        Text { text: "Manual serial-port override (optional):"; }
+                        LineEdit {
+                            text <=> root.nmea_serial_port;
+                            placeholder-text: "COM7";
+                        }
                         if root.nmea_serial_ports != "" : Text {
-                            text: "Paired Bluetooth ports: " + root.nmea_serial_ports + " (device must be powered on to connect)";
+                            text: "Detected serial ports (Bluetooth/USB): " + root.nmea_serial_ports + " (device must be powered on to connect)";
                             wrap: word-wrap;
                         }
                         if root.nmea_serial_ports == "" : Text {
-                            text: "No paired Bluetooth serial ports found. Pair the device in System Settings \u{2192} Bluetooth first.";
+                            text: "No serial ports detected. Pair Bluetooth first or attach GPS via USB.";
                             wrap: word-wrap;
                             color: #ff6666;
                             font-size: 12px;

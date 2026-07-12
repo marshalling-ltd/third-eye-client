@@ -21,6 +21,7 @@ pub mod keys {
     pub const ROV_NETWORK_INTERFACE: &str = "client.rov_network_interface";
     pub const NMEA_GPS_PORT: &str = "client.nmea_gps_port";
     pub const NMEA_GPS_MODE: &str = "client.nmea_gps_mode";
+    pub const NMEA_SERIAL_PORT: &str = "client.nmea_serial_port";
     pub const NMEA_SERVER_HOST: &str = "client.nmea_server_host";
     pub const NMEA_SERVER_PORT: &str = "client.nmea_server_port";
     pub const NMEA_STALE_TIMEOUT: &str = "client.nmea_stale_timeout";
@@ -94,6 +95,7 @@ impl ConfigStore {
                 .get_or(keys::ROV_NETWORK_INTERFACE, defaults.rov_network_interface)?,
             nmea_gps_port: self.get_or(keys::NMEA_GPS_PORT, defaults.nmea_gps_port)?,
             nmea_gps_mode: self.get_or(keys::NMEA_GPS_MODE, defaults.nmea_gps_mode)?,
+            nmea_serial_port: self.get_or(keys::NMEA_SERIAL_PORT, defaults.nmea_serial_port)?,
             nmea_server_host: self.get_or(keys::NMEA_SERVER_HOST, defaults.nmea_server_host)?,
             nmea_server_port: self.get_or(keys::NMEA_SERVER_PORT, defaults.nmea_server_port)?,
             nmea_stale_timeout: self
@@ -126,6 +128,7 @@ impl ConfigStore {
             ),
             (keys::NMEA_GPS_PORT, config.nmea_gps_port.as_str()),
             (keys::NMEA_GPS_MODE, config.nmea_gps_mode.as_str()),
+            (keys::NMEA_SERIAL_PORT, config.nmea_serial_port.as_str()),
             (keys::NMEA_SERVER_HOST, config.nmea_server_host.as_str()),
             (keys::NMEA_SERVER_PORT, config.nmea_server_port.as_str()),
             (keys::NMEA_STALE_TIMEOUT, config.nmea_stale_timeout.as_str()),
@@ -167,6 +170,8 @@ pub struct ClientConfig {
     pub nmea_gps_port: String,
     /// Phone GPS mode: `"0"` = Auto (BT/TCP listen), `"1"` = Connect to server.
     pub nmea_gps_mode: String,
+    /// Serial port for Bluetooth/USB GPS mode (e.g. `COM7`, `/dev/cu.usbserial-1420`).
+    pub nmea_serial_port: String,
     /// Phone server host (used when mode = 1, TCP client).
     pub nmea_server_host: String,
     /// Phone server port (used when mode = 1, TCP client). Default `"11123"`.
@@ -193,6 +198,7 @@ pub struct ClientConfigDefaults<'a> {
     pub rov_network_interface: &'a str,
     pub nmea_gps_port: &'a str,
     pub nmea_gps_mode: &'a str,
+    pub nmea_serial_port: &'a str,
     pub nmea_server_host: &'a str,
     pub nmea_server_port: &'a str,
     pub nmea_stale_timeout: &'a str,
@@ -216,6 +222,7 @@ mod tests {
         rov_network_interface: "",
         nmea_gps_port: "11123",
         nmea_gps_mode: "0",
+        nmea_serial_port: "",
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
@@ -260,6 +267,7 @@ mod tests {
             rov_network_interface: "en10".into(),
             nmea_gps_port: "11123".into(),
             nmea_gps_mode: "1".into(),
+            nmea_serial_port: "COM7".into(),
             nmea_server_host: "192.168.1.50".into(),
             nmea_server_port: "4352".into(),
             nmea_stale_timeout: "5".into(),

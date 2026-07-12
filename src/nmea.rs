@@ -743,7 +743,8 @@ pub fn bluetooth_pairing_guidance(target_os: &str, port_path: &str) -> String {
         "windows" => "Windows Bluetooth setup: pair the GPS under Settings > \
              Bluetooth & devices, then open 'More Bluetooth settings' > COM \
              Ports and note the 'Outgoing' COM port. Select that COM port \
-             above and click Start GPS."
+             above and click Start GPS. If Bluetooth is unstable, connect the \
+             GPS by USB and select its USB serial COM port instead."
             .to_string(),
         _ => "Automated Bluetooth pairing is only available on macOS. Pair the \
              GPS in your OS Bluetooth settings, then select its serial port \

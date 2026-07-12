@@ -117,6 +117,7 @@ struct AppConfig {
     rov_network_interface: String,
     nmea_gps_port: String,
     nmea_gps_mode: String,
+    nmea_serial_port: String,
     nmea_server_host: String,
     nmea_server_port: String,
     nmea_stale_timeout: String,
@@ -137,6 +138,7 @@ impl Default for AppConfig {
             rov_network_interface: String::new(),
             nmea_gps_port: "11123".to_string(),
             nmea_gps_mode: "0".to_string(),
+            nmea_serial_port: String::new(),
             nmea_server_host: String::new(),
             nmea_server_port: "11123".to_string(),
             nmea_stale_timeout: "10".to_string(),
@@ -170,6 +172,7 @@ impl AppConfig {
             rov_network_interface: self.rov_network_interface.clone(),
             nmea_gps_port: self.nmea_gps_port.clone(),
             nmea_gps_mode: self.nmea_gps_mode.clone(),
+            nmea_serial_port: self.nmea_serial_port.clone(),
             nmea_server_host: self.nmea_server_host.clone(),
             nmea_server_port: self.nmea_server_port.clone(),
             nmea_stale_timeout: self.nmea_stale_timeout.clone(),
@@ -190,6 +193,7 @@ impl AppConfig {
             rov_network_interface: config.rov_network_interface,
             nmea_gps_port: config.nmea_gps_port,
             nmea_gps_mode: config.nmea_gps_mode,
+            nmea_serial_port: config.nmea_serial_port,
             nmea_server_host: config.nmea_server_host,
             nmea_server_port: config.nmea_server_port,
             nmea_stale_timeout: config.nmea_stale_timeout,
@@ -249,6 +253,7 @@ fn client_config_defaults() -> (String, ClientConfigDefaults<'static>) {
         rov_network_interface: "",
         nmea_gps_port: "11123",
         nmea_gps_mode: "0",
+        nmea_serial_port: "",
         nmea_server_host: "",
         nmea_server_port: "11123",
         nmea_stale_timeout: "10",
@@ -499,6 +504,8 @@ struct ThirdEyeState {
     stream: StreamState,
     rov_status: UdpStatusState,
     nmea_gps: NmeaGpsState,
+    nmea_serial_port_options: Vec<String>,
+    nmea_serial_port_index: i32,
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
@@ -548,6 +555,7 @@ impl ThirdEyeState {
                 rov_network_interface: defaults.rov_network_interface.to_owned(),
                 nmea_gps_port: defaults.nmea_gps_port.to_owned(),
                 nmea_gps_mode: defaults.nmea_gps_mode.to_owned(),
+                nmea_serial_port: defaults.nmea_serial_port.to_owned(),
                 nmea_server_host: defaults.nmea_server_host.to_owned(),
                 nmea_server_port: defaults.nmea_server_port.to_owned(),
                 nmea_stale_timeout: defaults.nmea_stale_timeout.to_owned(),
@@ -604,7 +612,7 @@ impl ThirdEyeState {
 
         let (recalibrate_tx, recalibrate_rx) = mpsc::channel();
 
-        Self {
+        let mut state = Self {
             active_screen: Screen::Configuration,
             last_screen: Screen::Configuration,
             suppress_next_map_flick: false,
@@ -621,6 +629,8 @@ impl ThirdEyeState {
             stream: StreamState::default(),
             rov_status: UdpStatusState::default(),
             nmea_gps: NmeaGpsState::default(),
+            nmea_serial_port_options: Vec::new(),
+            nmea_serial_port_index: -1,
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
@@ -636,7 +646,9 @@ impl ThirdEyeState {
             update: UpdateUiState::new(),
             #[cfg(target_os = "windows")]
             startup_location_rx: None,
-        }
+        };
+        let _ = refresh_nmea_serial_candidates(&mut state);
+        state
     }
 
     fn start_update_check(&mut self, manual: bool) {
@@ -880,6 +892,17 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
     ui.set_nmea_gps_protocol(state.config.nmea_gps_protocol.trim().parse().unwrap_or(0));
+    let serial_port_model = VecModel::from(
+        state
+            .nmea_serial_port_options
+            .iter()
+            .map(|port| slint::SharedString::from(port.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    ui.set_nmea_serial_port_options(ModelRc::new(serial_port_model));
+    ui.set_nmea_serial_port_index(state.nmea_serial_port_index);
+    ui.set_nmea_serial_ports(state.nmea_serial_port_options.join(", ").into());
+    ui.set_nmea_serial_port(state.config.nmea_serial_port.clone().into());
     ui.set_nmea_server_host(state.config.nmea_server_host.clone().into());
     ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
     ui.set_nmea_stale_timeout(state.config.nmea_stale_timeout.clone().into());
@@ -1085,6 +1108,7 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
     state.config.nmea_gps_port = ui.get_nmea_gps_port().to_string();
     state.config.nmea_gps_mode = ui.get_nmea_gps_mode().to_string();
     state.config.nmea_gps_protocol = ui.get_nmea_gps_protocol().to_string();
+    state.config.nmea_serial_port = ui.get_nmea_serial_port().to_string();
     state.config.nmea_server_host = ui.get_nmea_server_host().to_string();
     state.config.nmea_server_port = ui.get_nmea_server_port().to_string();
     state.config.nmea_stale_timeout = ui.get_nmea_stale_timeout().to_string();
@@ -1159,6 +1183,84 @@ fn detect_local_ip() -> Option<String> {
             None
         }
     })
+}
+
+fn canonical_serial_port_name(port_name: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return port_name.trim().to_ascii_uppercase();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        port_name.trim().to_owned()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_com_port_number(port_name: &str) -> Option<u32> {
+    let upper = port_name.trim().to_ascii_uppercase();
+    let suffix = upper.strip_prefix("COM")?;
+    suffix.parse::<u32>().ok()
+}
+
+fn pick_default_nmea_serial_port(candidates: &[String]) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows Bluetooth "outgoing" ports are often higher-numbered COM
+        // devices; prefer the highest COM number when available.
+        if let Some((_, port)) = candidates
+            .iter()
+            .filter_map(|port| parse_windows_com_port_number(port).map(|num| (num, port)))
+            .max_by_key(|(num, _)| *num)
+        {
+            return Some(port.clone());
+        }
+    }
+    candidates.first().cloned()
+}
+
+fn collect_nmea_serial_candidates() -> Vec<String> {
+    let mut ordered = Vec::<String>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut add = |port: String| {
+        let canonical = canonical_serial_port_name(&port);
+        if seen.insert(canonical) {
+            ordered.push(port);
+        }
+    };
+
+    for port in third_eye_client::nmea::list_bluetooth_ports() {
+        add(port);
+    }
+    for port in third_eye_client::nmea::list_serial_ports() {
+        add(port);
+    }
+
+    ordered
+}
+
+fn find_nmea_serial_port_index(candidates: &[String], selected_port: &str) -> Option<usize> {
+    let canonical_selected = canonical_serial_port_name(selected_port);
+    candidates
+        .iter()
+        .position(|candidate| canonical_serial_port_name(candidate) == canonical_selected)
+}
+
+fn refresh_nmea_serial_candidates(state: &mut ThirdEyeState) -> bool {
+    let candidates = collect_nmea_serial_candidates();
+    let mut selected = state.config.nmea_serial_port.trim().to_owned();
+    if selected.is_empty() {
+        selected = pick_default_nmea_serial_port(&candidates).unwrap_or_default();
+    }
+    let selected_index = find_nmea_serial_port_index(&candidates, &selected);
+    if let Some(index) = selected_index {
+        selected.clone_from(&candidates[index]);
+    }
+    let changed = state.config.nmea_serial_port != selected;
+    state.config.nmea_serial_port = selected;
+    state.nmea_serial_port_index = selected_index.map_or(-1, |index| index as i32);
+    state.nmea_serial_port_options = candidates;
+    changed
 }
 
 /// Runs the slow parts of ROV network recalibration on a background thread.
@@ -1965,14 +2067,9 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             state.stream_left_at_ms = current_unix_ms();
         }
         state.media.stop_media_stream();
-        // Refresh the BT port list when entering the Phone GPS screen.
-        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
-        let ports_text = if bt_ports.is_empty() {
-            String::new()
-        } else {
-            bt_ports.join(", ")
-        };
-        ui.set_nmea_serial_ports(ports_text.into());
+        if refresh_nmea_serial_candidates(&mut state) {
+            persist_config(&state, &store_for_nmea_nav);
+        }
         state.active_screen = Screen::Nmea;
         state.last_screen = Screen::Nmea;
         apply_state_to_ui(&ui, &state);
@@ -2948,8 +3045,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         state.config.nmea_gps_mode = mode.to_string();
+        if mode == 2 {
+            let _ = refresh_nmea_serial_candidates(&mut state);
+        }
         persist_config(&state, &store_for_set_nmea_mode);
-        ui.set_nmea_gps_mode(mode);
+        apply_state_to_ui(&ui, &state);
     });
 
     let ui_weak = ui.as_weak();
@@ -2968,6 +3068,26 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
+    let state_for_select_nmea_serial_port = Rc::clone(&state);
+    let store_for_select_nmea_serial_port = Rc::clone(&store);
+    ui.on_select_nmea_serial_port(move |port| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_select_nmea_serial_port.try_borrow_mut() else {
+            return;
+        };
+        state.config.nmea_serial_port = port.to_string();
+        state.nmea_serial_port_index = find_nmea_serial_port_index(
+            &state.nmea_serial_port_options,
+            &state.config.nmea_serial_port,
+        )
+        .map_or(-1, |index| index as i32);
+        persist_config(&state, &store_for_select_nmea_serial_port);
+        ui.set_nmea_serial_port_index(state.nmea_serial_port_index);
+    });
+
+    let ui_weak = ui.as_weak();
     let state_for_prepare_bt = Rc::clone(&state);
     let store_for_prepare_bt = Rc::clone(&store);
     ui.on_prepare_bluetooth(move || {
@@ -2978,15 +3098,15 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_prepare_bt);
-        let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
-        let port_path = if bt_ports.is_empty() {
-            String::new()
-        } else {
-            bt_ports[0].clone()
-        };
+        if refresh_nmea_serial_candidates(&mut state) {
+            persist_config(&state, &store_for_prepare_bt);
+        }
+        let port_path = state.config.nmea_serial_port.trim().to_owned();
+        apply_state_to_ui(&ui, &state);
         if port_path.is_empty() {
             ui.set_nmea_gps_status(
-                "No Bluetooth serial ports detected. Pair the device first.".into(),
+                "No serial ports detected. Pair the Bluetooth GPS or connect it via USB first."
+                    .into(),
             );
             return;
         }
@@ -3046,28 +3166,41 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
 
         if mode == 2 {
             // --- Bluetooth mode ---
-            let bt_ports = third_eye_client::nmea::list_bluetooth_ports();
-            if bt_ports.is_empty() {
+            if refresh_nmea_serial_candidates(&mut state) {
+                persist_config(&state, &store_for_start_nmea);
+            }
+            let serial_ports = state.nmea_serial_port_options.clone();
+            let port_path = state.config.nmea_serial_port.trim().to_owned();
+            if port_path.is_empty() {
                 ui.set_nmea_gps_status(
-                    "No Bluetooth serial ports detected. Make sure the device is paired.".into(),
+                    "No serial ports detected. Pair the Bluetooth GPS or connect it via USB first."
+                        .into(),
                 );
                 apply_state_to_ui(&ui, &state);
                 return;
             }
-            let port_path = &bt_ports[0];
-            if bt_ports.len() > 1 {
+            let canonical_selected = canonical_serial_port_name(&port_path);
+            let detected_selected = serial_ports
+                .iter()
+                .any(|p| canonical_serial_port_name(p) == canonical_selected);
+            if !serial_ports.is_empty() {
                 state.nmea_gps.set_status(format!(
-                    "Found {} Bluetooth ports: {}. Using {}.",
-                    bt_ports.len(),
-                    bt_ports.join(", "),
-                    port_path
+                    "Detected serial ports: {}. Using {}{}.",
+                    serial_ports.join(", "),
+                    port_path,
+                    if detected_selected {
+                        ""
+                    } else {
+                        " (manual selection)"
+                    }
                 ));
             }
-            match state.nmea_gps.start_bluetooth(port_path, protocol) {
+            persist_config(&state, &store_for_start_nmea);
+            match state.nmea_gps.start_bluetooth(&port_path, protocol) {
                 Ok(_msg) => {}
                 Err(err) => {
                     ui.set_nmea_gps_status(
-                        format!("Failed to start Bluetooth GPS on {port_path}: {err:#}").into(),
+                        format!("Failed to start GPS on serial port {port_path}: {err:#}").into(),
                     );
                 }
             }
