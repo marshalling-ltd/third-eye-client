@@ -602,9 +602,19 @@ export component AppWindow inherits Window {
                             font-size: 12px;
                         }
                         Text { text: "TCP listen address (auto-detected, editable):"; }
-                        LineEdit { text <=> root.nmea_local_ip; placeholder-text: "e.g. 192.168.43.5"; }
+                        LineEdit {
+                            text <=> root.nmea_local_ip;
+                            placeholder-text: "e.g. 192.168.43.5";
+                            height: 36px;
+                            vertical-stretch: 0;
+                        }
                         Text { text: "TCP listen port:"; }
-                        LineEdit { text <=> root.nmea_gps_port; placeholder-text: "e.g. 11123"; }
+                        LineEdit {
+                            text <=> root.nmea_gps_port;
+                            placeholder-text: "e.g. 11123";
+                            height: 36px;
+                            vertical-stretch: 0;
+                        }
                     }
 
                     // --- Connect to Server mode fields ---
@@ -617,9 +627,19 @@ export component AppWindow inherits Window {
                             font-size: 12px;
                         }
                         Text { text: "Phone server IP address:"; }
-                        LineEdit { text <=> root.nmea_server_host; placeholder-text: "e.g. 192.168.43.1"; }
+                        LineEdit {
+                            text <=> root.nmea_server_host;
+                            placeholder-text: "e.g. 192.168.43.1";
+                            height: 36px;
+                            vertical-stretch: 0;
+                        }
                         Text { text: "Phone server port:"; }
-                        LineEdit { text <=> root.nmea_server_port; placeholder-text: "e.g. 8080"; }
+                        LineEdit {
+                            text <=> root.nmea_server_port;
+                            placeholder-text: "e.g. 8080";
+                            height: 36px;
+                            vertical-stretch: 0;
+                        }
                     }
 
                     // --- Bluetooth mode fields ---
@@ -636,6 +656,8 @@ export component AppWindow inherits Window {
                             model: root.nmea_serial_port_options;
                             current-index <=> root.nmea_serial_port_index;
                             enabled: root.nmea_serial_port_options.length > 0;
+                            height: 36px;
+                            vertical-stretch: 0;
                             selected(current-value) => {
                                 root.nmea_serial_port = current-value;
                                 root.select_nmea_serial_port(current-value);
@@ -645,6 +667,8 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.nmea_serial_port;
                             placeholder-text: "COM7";
+                            height: 36px;
+                            vertical-stretch: 0;
                         }
                         if root.nmea_serial_ports != "" : Text {
                             text: "Detected serial ports (Bluetooth/USB): " + root.nmea_serial_ports + " (device must be powered on to connect)";
@@ -667,6 +691,8 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.nmea_stale_timeout;
                             placeholder-text: "10";
+                            height: 36px;
+                            vertical-stretch: 0;
                         }
                     }
 
@@ -1320,6 +1346,28 @@ export component AppWindow inherits Window {
 
                         flicked => {
                             root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                        }
+
+                        wheel_zoom_area := TouchArea {
+                            x: -map_fli.viewport-x;
+                            y: -map_fli.viewport-y;
+                            width: map_canvas.width;
+                            height: map_canvas.height;
+
+                            scroll-event(event) => {
+                                if (event.delta-y != 0px) {
+                                    root.map_scroll_zoom(
+                                        event.delta-y,
+                                        map_fli.viewport-x,
+                                        map_fli.viewport-y,
+                                        map_canvas.width,
+                                        map_canvas.height
+                                    );
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
                         }
                     }
 
