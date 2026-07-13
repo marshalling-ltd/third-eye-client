@@ -53,11 +53,34 @@ jobs:
           codesign --force --sign - "$APP/Contents/MacOS/bin/ffmpeg"
           codesign --force --sign - "$APP/Contents/MacOS/third-eye-client"
           codesign --force --sign - "$APP"
+      - name: Reclaim disk space before DMG
+        run: |
+          echo "Disk usage before cleanup:"
+          df -h
+          du -sh staging target || true
+
+          # The app is already staged/codesigned; target artifacts are no longer
+          # needed for DMG creation.
+          rm -rf target
+          rm -f ffmpeg-bundled
+
+          # Homebrew package/cache cleanup can recover significant space on
+          # hosted runners.
+          brew cleanup --prune=all || true
+          rm -rf ~/Library/Caches/Homebrew || true
+
+          echo "Disk usage after cleanup:"
+          df -h
+          du -sh staging || true
 
       - name: Create DMG
         run: |
-          ln -s /Applications staging/Applications
+          ln -sfn /Applications staging/Applications
+          STAGING_MB="$(du -sm staging | awk '{print $1}')"
+          SIZE_MB="$((STAGING_MB + 128))"
           hdiutil create \
+            -size "${SIZE_MB}m" \
+            -fs HFS+ \
             -volname "Third Eye Client" \
             -srcfolder staging \
             -ov -format UDZO \
