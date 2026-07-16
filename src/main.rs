@@ -23,7 +23,7 @@ mod map;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1543,6 +1543,32 @@ fn app_data_root_dir(store: &AppStore) -> PathBuf {
 fn local_media_root_dir(store: &AppStore) -> PathBuf {
     app_data_root_dir(store).join("media")
 }
+
+fn remove_local_media_file(local_path: &str, media_root: &Path) {
+    let path = Path::new(local_path);
+    if !path.exists() {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+    // Legacy builds stored files in `<media_root>/<media_id>/<name>`. Prune
+    // empty legacy folders so Finder/Explorer no longer shows stale dirs.
+    if let Some(parent) = path.parent() {
+        prune_empty_media_dirs(parent, media_root);
+    }
+}
+
+fn prune_empty_media_dirs(start: &Path, media_root: &Path) {
+    let mut current = start.to_path_buf();
+    while current.starts_with(media_root) && current != media_root {
+        if std::fs::remove_dir(&current).is_err() {
+            break;
+        }
+        let Some(next) = current.parent() else {
+            break;
+        };
+        current = next.to_path_buf();
+    }
+}
 #[cfg(target_os = "macos")]
 fn open_in_file_manager(path: &std::path::Path) -> Result<()> {
     let status = Command::new("open")
@@ -1617,7 +1643,16 @@ fn start_media_download(
 
 fn refresh_media_rows(state: &mut ThirdEyeState, store: &AppStore) {
     match store.media().list_all() {
-        Ok(rows) => {
+        Ok(mut rows) => {
+            for row in &mut rows {
+                if let Some(path) = row.local_path.as_deref()
+                    && !Path::new(path).is_file()
+                {
+                    let _ = store.media().forget_local(&row.media_id, &row.name);
+                    row.local_path = None;
+                    row.local_sha256 = None;
+                }
+            }
             state.media.rows = rows;
         }
         Err(err) => {
@@ -3488,7 +3523,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         };
         // Immediate local cleanup (fast).
         if !state.media.local_path.is_empty() {
-            let _ = std::fs::remove_file(&state.media.local_path);
+            let media_root = local_media_root_dir(&store_for_delete_media);
+            remove_local_media_file(&state.media.local_path, &media_root);
         }
         let _ = store_for_delete_media.media().remove_by_name(&name);
         state.media.thumbnail_cache.remove(&name);

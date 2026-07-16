@@ -440,8 +440,8 @@ fn map_local_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMediaRecord> 
     })
 }
 
-/// Downloads `name` (original variant) from the ROV camera and stores it at
-/// `<data_root>/media/<media_id>/<name>`. JPEG images are re-encoded at
+/// Downloads `name` (original variant only) from the ROV camera and stores it
+/// at `<data_root>/media/<name>`. JPEG images are re-encoded at
 /// quality 85 to reduce the bloated file sizes the ROV camera produces
 /// (typically 4× smaller with no visible quality loss at the same resolution).
 /// Returns the absolute on-disk path.
@@ -455,37 +455,12 @@ pub fn download_to_local(
     let payload = camera
         .download_media(name, MediaWhich::Original)
         .with_context(|| format!("downloading {name} from camera"))?;
-    let dir = data_root.join("media").join(media_id);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let target = dir.join(name);
-
-    // Re-encode JPEG images at quality 85 to reduce the bloated file sizes
-    // the ROV camera produces. Resolution stays the same.
-    let is_jpeg = std::path::Path::new(name)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"));
-    let saved_bytes = if is_jpeg {
-        if let Ok(img) = image::load_from_memory(&payload.bytes) {
-            let rgb = img.to_rgb8();
-            let mut buf = std::io::Cursor::new(Vec::new());
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
-            rgb.write_with_encoder(encoder)
-                .with_context(|| format!("re-encoding {name} as JPEG"))?;
-            let optimized = buf.into_inner();
-            std::fs::write(&target, &optimized)
-                .with_context(|| format!("writing {}", target.display()))?;
-            optimized
-        } else {
-            // Decode failed — fall back to writing raw bytes.
-            std::fs::write(&target, &payload.bytes)
-                .with_context(|| format!("writing {}", target.display()))?;
-            payload.bytes.clone()
-        }
-    } else {
-        std::fs::write(&target, &payload.bytes)
-            .with_context(|| format!("writing {}", target.display()))?;
-        payload.bytes.clone()
-    };
+    let media_root = data_root.join("media");
+    std::fs::create_dir_all(&media_root)
+        .with_context(|| format!("creating {}", media_root.display()))?;
+    let target_name = local_media_file_name(name);
+    let target = media_root.join(&target_name);
+    let saved_bytes = write_media_bytes_optimized(&target, &target_name, &payload.bytes)?;
 
     let mut hasher = Sha256::new();
     hasher.update(&saved_bytes);
@@ -500,6 +475,40 @@ pub fn download_to_local(
         let _ = store.set_dimensions(media_id, name, dim.0 as i32, dim.1 as i32);
     }
     Ok(target)
+}
+
+fn local_media_file_name(name: &str) -> String {
+    let raw = Path::new(name)
+        .file_name()
+        .map_or_else(|| name.to_owned(), |f| f.to_string_lossy().into_owned());
+    if raw.is_empty() {
+        "unnamed-media".to_string()
+    } else {
+        raw
+    }
+}
+
+fn write_media_bytes_optimized(target: &Path, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    // Re-encode JPEG images at quality 85 to reduce the bloated file sizes
+    // the ROV camera produces. Resolution stays the same.
+    let is_jpeg = Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"));
+    if is_jpeg && let Ok(img) = image::load_from_memory(bytes) {
+        let rgb = img.to_rgb8();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+        rgb.write_with_encoder(encoder)
+            .with_context(|| format!("re-encoding {name} as JPEG"))?;
+        let optimized = buf.into_inner();
+        std::fs::write(target, &optimized)
+            .with_context(|| format!("writing {}", target.display()))?;
+        return Ok(optimized);
+    }
+
+    // Non-JPEG (or decode failure): write the original bytes unchanged.
+    std::fs::write(target, bytes).with_context(|| format!("writing {}", target.display()))?;
+    Ok(bytes.to_vec())
 }
 
 fn guess_mime(name: &str) -> Option<String> {

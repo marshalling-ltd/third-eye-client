@@ -176,7 +176,7 @@ fn download_to_local_writes_file_and_updates_row() {
     // File exists with the exact bytes mockito served.
     assert_eq!(std::fs::read(&local).unwrap(), payload);
     let sep = std::path::MAIN_SEPARATOR;
-    let expected = format!("{sep}media{sep}id-a{sep}a.jpeg");
+    let expected = format!("{sep}media{sep}a.jpeg");
     assert!(local.to_string_lossy().contains(&expected));
 
     // media_sync row was updated with the local path and SHA.
@@ -195,7 +195,6 @@ fn download_to_local_writes_file_and_updates_row() {
 
     // Cleanup.
     let _ = std::fs::remove_file(&local);
-    let _ = std::fs::remove_dir(local.parent().unwrap());
     let _ = std::fs::remove_dir(data_root.join("media"));
     let _ = std::fs::remove_file(&db_path);
 }
