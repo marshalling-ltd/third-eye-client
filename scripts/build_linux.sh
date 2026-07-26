@@ -106,7 +106,7 @@ chmod +x "$APPDIR/AppRun"
 cat > "$APPDIR/$EXECUTABLE_NAME.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
-Name=Third Eye Client
+Name=Third Eye
 Exec=third-eye-client
 Icon=logo
 Categories=Utility;

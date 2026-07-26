@@ -1,0 +1,322 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export struct MediaRow {
+    media_id: string,
+    name: string,
+    size_text: string,
+    seen_text: string,
+    state_text: string,
+    origin_text: string,
+    has_local: bool,
+    deleted_on_rov: bool,
+    selected: bool,
+    thumbnail: image,
+    has_thumbnail: bool,
+    captured_at_text: string,
+}
+
+// Media library screen: scrollable tile list on the left, detail/preview
+// panel on the right. Kept outside a ScrollView (like the original) so the
+// two-column layout can stretch to fill the full panel height.
+//
+// Extracted verbatim from the original monolithic app.slint (Phase 2 of the
+// native desktop UI/UX blueprint). Every property/callback below already
+// existed on `AppWindow`; `../app.slint` forwards them 1:1 into this
+// component, so no Rust-side changes were needed for this move.
+export component MediaPage inherits VerticalBox {
+    in property <[MediaRow]> media_rows;
+    in property <string> media_status;
+    in property <string> media_selected_name;
+    in property <string> media_selected_local_path;
+    in property <bool> media_selected_has_capture_meta: false;
+    in property <bool> media_download_in_progress: false;
+    in property <bool> media_selected_deleted_on_rov: false;
+    in property <image> media_preview_image;
+    in property <bool> has_media_preview: false;
+    in property <bool> media_selected_is_video: false;
+    in property <bool> media_selected_is_image: false;
+    in property <bool> media_stream_active: false;
+    in property <string> media_capture_depth;
+    in property <string> media_capture_temp;
+    in property <string> media_capture_heading;
+    in property <string> media_capture_attitude;
+    in property <string> media_capture_coords;
+    in property <string> media_capture_battery;
+    in property <string> media_info_subtitle;
+    in property <string> media_capture_datetime;
+
+    callback refresh_media();
+    callback open_local_media_folder();
+    callback select_media(string, string);
+    callback download_selected_media();
+    callback open_selected_local_media();
+    callback delete_selected_media_from_rov();
+    callback stream_selected_media();
+    callback stop_media_stream();
+    callback open_with_telemetry();
+
+    padding: 14px;
+    spacing: 10px;
+    Text {
+        text: "Media";
+        font-size: 24px;
+    }
+    HorizontalBox {
+        spacing: 8px;
+        Button {
+            horizontal-stretch: 1;
+            text: "Refresh from ROV";
+            clicked => { root.refresh_media(); }
+        }
+        Button {
+            horizontal-stretch: 1;
+            text: "Open local folder";
+            clicked => { root.open_local_media_folder(); }
+        }
+    }
+    Text { text: root.media_status; wrap: word-wrap; }
+
+    HorizontalBox {
+        spacing: 12px;
+
+        // --- Left column: scrollable tile list of media. ---
+        Rectangle {
+            min-width: 340px;
+            max-width: 480px;
+            horizontal-stretch: 0;
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #1a1c22;
+
+            // Flickable (rather than ScrollView) gives proper
+            // touch-drag scrolling on Windows: a short tap still
+            // fires the TouchArea.clicked inside each row, while
+            // a drag gesture scrolls the list.
+            Flickable {
+                VerticalBox {
+                    padding: 6px;
+                    spacing: 4px;
+                    if root.media_rows.length == 0 : Text {
+                        text: "No media recorded yet. Click \"Refresh from ROV\" to populate the list.";
+                        wrap: word-wrap;
+                        color: #8f96a3;
+                    }
+                    for row in root.media_rows : Rectangle {
+                        height: row.has_thumbnail ? 100px : 52px;
+                        border-radius: 6px;
+                        border-width: row.selected ? 2px : 1px;
+                        border-color: row.selected ? #0a84ff : #2b2d34;
+                        background: row.selected ? #0a84ff22 :
+                            (row.deleted_on_rov ? #30181888 : #262931);
+                        HorizontalBox {
+                            padding: 4px;
+                            spacing: 8px;
+                            if row.has_thumbnail : Rectangle {
+                                width: 88px;
+                                border-radius: 4px;
+                                clip: true;
+                                background: #111318;
+                                Image {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    source: row.thumbnail;
+                                    image-fit: contain;
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text {
+                                    text: row.name;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                                if row.captured_at_text != "" : Text {
+                                    text: row.captured_at_text;
+                                    font-size: 10px;
+                                    color: #8f96a3;
+                                }
+                                if row.captured_at_text == "" : Text {
+                                    text: row.seen_text;
+                                    font-size: 10px;
+                                    color: #666666;
+                                }
+                                Text {
+                                    text: row.size_text + " \u{2022} " + row.state_text;
+                                    font-size: 11px;
+                                    color: #8f96a3;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.select_media(row.media_id, row.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Right column: detail panel. ---
+        Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: #3f4148;
+            background: #111318;
+
+            if root.media_selected_name == "" : Text {
+                text: "Select a media entry on the left to see its metadata.";
+                color: #8f96a3;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if root.media_selected_name != "" : VerticalBox {
+                padding: 0px;
+                spacing: 0px;
+
+                // ---- Preview area ----
+                Rectangle {
+                    vertical-stretch: 1;
+                    clip: true;
+                    background: #000000;
+
+                    if root.has_media_preview : Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.media_preview_image;
+                        image-fit: contain;
+                    }
+                    if !root.has_media_preview : Text {
+                        text: root.media_selected_is_video
+                            ? "Click \"Stream\" to preview"
+                            : "Loading preview...";
+                        color: #555555;
+                        font-size: 15px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // ---- Bottom section: name + telemetry + buttons ----
+                Rectangle {
+                    background: #1a1c22;
+                    vertical-stretch: 0;
+
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 6px;
+
+                        // File name + subtitle
+                        Text {
+                            text: root.media_selected_name;
+                            font-size: 15px;
+                            color: #ffffff;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.media_capture_datetime != "" ? root.media_capture_datetime + " \u{2022} " + root.media_info_subtitle : root.media_info_subtitle;
+                            font-size: 11px;
+                            color: #8f96a3;
+                            overflow: elide;
+                        }
+
+                        // Capture telemetry bar
+                        if root.media_selected_has_capture_meta : Rectangle {
+                            height: 56px;
+                            border-radius: 8px;
+                            background: #0d1a2acc;
+                            border-width: 1px;
+                            border-color: #0a84ff22;
+
+                            HorizontalBox {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 14px;
+
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "DEPTH"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_depth; color: #ffffff; font-size: 15px; }
+                                }
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "TEMP"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_temp; color: #aaccff; font-size: 15px; }
+                                }
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "HDG"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_heading; color: #ffffff; font-size: 15px; }
+                                }
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "ATT"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_attitude; color: #ffffff; font-size: 12px; }
+                                }
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "POS"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_coords; color: #ffffff; font-size: 12px; }
+                                }
+                                VerticalBox { spacing: 1px;
+                                    Text { text: "BAT"; color: #8f96a3; font-size: 9px; }
+                                    Text { text: root.media_capture_battery; color: #ffffff; font-size: 12px; }
+                                }
+                            }
+                        }
+
+                        if !root.media_selected_has_capture_meta : Text {
+                            text: "No capture telemetry attached.";
+                            font-size: 11px;
+                            color: #555555;
+                        }
+
+                        // Action buttons
+                        HorizontalBox {
+                            spacing: 6px;
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.media_download_in_progress
+                                    ? "Downloading..."
+                                    : (root.media_selected_local_path == ""
+                                        ? "Download"
+                                        : "Re-download");
+                                enabled: !root.media_download_in_progress
+                                    && !root.media_selected_deleted_on_rov;
+                                clicked => { root.download_selected_media(); }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: "Open";
+                                enabled: root.media_selected_local_path != "";
+                                clicked => { root.open_selected_local_media(); }
+                            }
+                            if root.media_selected_is_image && root.media_selected_has_capture_meta : Button {
+                                horizontal-stretch: 1;
+                                text: "\u{1f4f7} + Telemetry";
+                                enabled: root.media_selected_local_path != "";
+                                clicked => { root.open_with_telemetry(); }
+                            }
+                            if root.media_selected_is_video && !root.media_stream_active : Button {
+                                horizontal-stretch: 1;
+                                text: "Stream";
+                                enabled: !root.media_download_in_progress;
+                                clicked => { root.stream_selected_media(); }
+                            }
+                            if root.media_selected_is_video && root.media_stream_active : Button {
+                                horizontal-stretch: 1;
+                                text: "Stop";
+                                clicked => { root.stop_media_stream(); }
+                            }
+                            Button {
+                                text: "Delete";
+                                clicked => { root.delete_selected_media_from_rov(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

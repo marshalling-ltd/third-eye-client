@@ -1,13 +1,13 @@
-; Third Eye Client — Windows installer
+; Third Eye — Windows installer
 ; Built by the GitHub Actions release workflow.
 ; Run from the repository root: makensis installer\windows.nsi
 
 Unicode true
 
-!define APP_NAME      "Third Eye Client"
+!define APP_NAME      "Third Eye"
 !define APP_EXE       "third-eye-client.exe"
-!define INSTALL_DIR   "$PROGRAMFILES64\Third Eye Client"
-!define REG_KEY       "Software\Microsoft\Windows\CurrentVersion\Uninstall\Third Eye Client"
+!define INSTALL_DIR   "$PROGRAMFILES64\Third Eye"
+!define REG_KEY       "Software\Microsoft\Windows\CurrentVersion\Uninstall\Third Eye"
 
 Name            "${APP_NAME}"
 OutFile         "${OUT_FILE}"

@@ -1,0 +1,252 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export struct DeviceRow {
+    id: string,
+    name: string,
+    category_text: string,
+    type_text: string,
+    created_at_text: string,
+    selected: bool,
+}
+
+// Column header for the device grid/table below. Column widths here must
+// stay in sync with DeviceGridRow's so cells line up.
+component DeviceGridHeader inherits HorizontalBox {
+    padding: 8px;
+    padding-right: 16px;
+    spacing: 8px;
+    Text {
+        text: "Name";
+        horizontal-stretch: 1;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+    }
+    Text {
+        text: "Category";
+        width: 130px;
+        horizontal-stretch: 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+    }
+    Text {
+        text: "Type";
+        width: 130px;
+        horizontal-stretch: 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+    }
+    Text {
+        text: "Created";
+        width: 150px;
+        horizontal-stretch: 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+    }
+    Text {
+        text: "Status";
+        width: 80px;
+        horizontal-stretch: 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+        horizontal-alignment: center;
+    }
+}
+
+// A single clickable row in the device grid/table. Clicking anywhere on
+// the row navigates to DeviceDetailPage for editing (see device_detail.slint).
+component DeviceGridRow inherits Rectangle {
+    in property <string> row_id;
+    in property <string> row_name;
+    in property <string> row_category;
+    in property <string> row_type;
+    in property <string> row_created;
+    in property <bool> is_active: false;
+    callback activated();
+
+    height: 46px;
+    border-radius: 6px;
+    background: touch.has-hover ? #ffffff12 : transparent;
+    animate background { duration: 100ms; }
+
+    HorizontalBox {
+        padding: 8px;
+        padding-right: 16px;
+        spacing: 8px;
+        Text {
+            text: root.row_name;
+            horizontal-stretch: 1;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.row_category;
+            width: 130px;
+            horizontal-stretch: 0;
+            color: #8f96a3;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.row_type;
+            width: 130px;
+            horizontal-stretch: 0;
+            color: #8f96a3;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.row_created;
+            width: 150px;
+            horizontal-stretch: 0;
+            color: #8f96a3;
+            font-size: 11px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        HorizontalBox {
+            width: 80px;
+            horizontal-stretch: 0;
+            alignment: center;
+            if root.is_active : Rectangle {
+                width: 54px;
+                height: 18px;
+                border-radius: 4px;
+                background: #22cc4422;
+                border-width: 1px;
+                border-color: #22cc4466;
+                Text {
+                    text: "ACTIVE";
+                    color: #22cc44;
+                    font-size: 9px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
+// Devices List page: a grid/table of registered devices (name, category,
+// type, created date, active status) plus a button to add a new one.
+// Selecting a row, or "+ Add Device", navigates to the separate
+// DeviceDetailPage (see device_detail.slint) for creating/editing — this
+// page only ever shows the list, so it never balloons like a combined
+// list+detail layout does when squeezed into one screen.
+export component DeviceListPage inherits VerticalBox {
+    in property <[DeviceRow]> device_rows;
+    in property <string> devices_status;
+    in property <bool> device_action_in_progress: false;
+    // Id of the device the user has picked as their active device (used for
+    // Live Stream / Device Map RTSP settings). Tracked locally so it and the
+    // devices themselves remain usable offshore with no internet access to
+    // the third-eye server — only the ROV's own local network matters for
+    // actually streaming/capturing.
+    in property <string> device_active_id;
+
+    callback refresh_devices();
+    // Navigate to the detail/edit page for an existing device.
+    callback open_device(string);
+    // Navigate to the detail page in "create new device" mode.
+    callback open_new_device();
+
+    padding: 14px;
+    spacing: 10px;
+
+    HorizontalBox {
+        vertical-stretch: 0;
+        spacing: 12px;
+        VerticalBox {
+            horizontal-stretch: 1;
+            padding: 0px;
+            spacing: 2px;
+            Text {
+                text: "Devices";
+                font-size: 24px;
+            }
+            Text {
+                text: "Registered ROVs and other devices on your third-eye account. Refreshing needs internet access, but your active device and its cached settings keep working offshore for Live Stream / capture.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+        }
+        Button {
+            horizontal-stretch: 0;
+            text: "Refresh";
+            enabled: !root.device_action_in_progress;
+            clicked => { root.refresh_devices(); }
+        }
+        Button {
+            horizontal-stretch: 0;
+            primary: true;
+            text: "+ Add Device";
+            enabled: !root.device_action_in_progress;
+            clicked => { root.open_new_device(); }
+        }
+    }
+    Text { text: root.devices_status; wrap: word-wrap; color: #8f96a3; vertical-stretch: 0; }
+
+    Rectangle {
+        vertical-stretch: 1;
+        border-width: 1px;
+        border-color: #3f4148;
+        background: #1a1c22;
+
+        VerticalBox {
+            padding: 0px;
+            spacing: 0px;
+
+            DeviceGridHeader { vertical-stretch: 0; }
+            Rectangle { height: 1px; background: #3f4148; vertical-stretch: 0; }
+
+            // Plain Rectangle (not a layout) wrapping the Flickable: a
+            // Flickable placed directly inside a VerticalBox as a
+            // stretched layout child can end up with its viewport-y
+            // clamped to the *bottom* of the scroll range when the
+            // content is shorter than the available space, pinning rows
+            // to the bottom with blank space above. Matches the working
+            // pattern in media_page.slint (Flickable as a Rectangle's
+            // direct child, sized to 100% of it, sidestepping the
+            // layout-stretch computation entirely).
+            Rectangle {
+                vertical-stretch: 1;
+
+                if root.device_rows.length == 0 : Text {
+                    text: "No devices yet. Sign in and click \"Refresh\", or add one with \"+ Add Device\" above.";
+                    wrap: word-wrap;
+                    color: #8f96a3;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                if root.device_rows.length > 0 : Flickable {
+                    VerticalBox {
+                        padding: 4px;
+                        spacing: 2px;
+                        for row in root.device_rows : DeviceGridRow {
+                            row_id: row.id;
+                            row_name: row.name;
+                            row_category: row.category_text;
+                            row_type: row.type_text;
+                            row_created: row.created_at_text;
+                            is_active: row.id == root.device_active_id;
+                            activated => { root.open_device(row.id); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

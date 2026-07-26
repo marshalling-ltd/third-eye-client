@@ -11,23 +11,29 @@
 //! the background outbox worker thread.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod media;
 pub mod outbox;
+pub mod search;
 pub mod tile_cache;
 
+use crate::storage::api::ApiSession;
 use crate::storage::auth::AuthClient;
 use crate::storage::config::ConfigStore;
 use crate::storage::db::SharedDb;
+use crate::storage::devices::{DeviceCacheStore, DevicesClient};
 use crate::storage::media::MediaStore;
 use crate::storage::outbox::{OutboxStore, OutboxWorker};
+use crate::storage::search::SearchClient;
 use crate::storage::tile_cache::TileCacheStore;
 
 /// Qualifier / organisation / application triple used with `directories`.
@@ -43,10 +49,17 @@ pub const DB_FILE_NAME: &str = "state.db";
 pub struct AppStore {
     db: SharedDb,
     config: ConfigStore,
-    auth: AuthClient,
+    auth: Arc<AuthClient>,
+    /// Shared authenticated-call facade. Every server call goes through this so
+    /// a signed-in user's session refreshes itself indefinitely (see
+    /// `storage::api`).
+    api: ApiSession,
+    devices: DevicesClient,
+    device_cache: DeviceCacheStore,
     media: MediaStore,
     tile_cache: TileCacheStore,
     outbox: OutboxStore,
+    search: SearchClient,
     worker: Mutex<Option<OutboxWorker>>,
     data_path: Option<PathBuf>,
 }
@@ -77,10 +90,14 @@ impl AppStore {
 
     fn from_db(db: SharedDb, data_path: Option<PathBuf>, start_worker: bool) -> Result<Self> {
         let config = ConfigStore::new(db.clone());
-        let auth = AuthClient::new(db.clone())?;
+        let auth = Arc::new(AuthClient::new(db.clone())?);
+        let api = ApiSession::new(Arc::clone(&auth));
+        let devices = DevicesClient::new(api.clone());
+        let device_cache = DeviceCacheStore::new(db.clone());
         let media = MediaStore::new(db.clone());
         let tile_cache = TileCacheStore::new(db.clone());
         let outbox = OutboxStore::new(db.clone());
+        let search = SearchClient::new(api.clone());
         let worker = if start_worker {
             Some(OutboxWorker::spawn(outbox.clone()))
         } else {
@@ -90,9 +107,13 @@ impl AppStore {
             db,
             config,
             auth,
+            api,
+            devices,
+            device_cache,
             media,
             tile_cache,
             outbox,
+            search,
             worker: Mutex::new(worker),
             data_path,
         })
@@ -106,6 +127,20 @@ impl AppStore {
         &self.auth
     }
 
+    /// Shared authenticated-call facade. Use this (rather than raw access
+    /// tokens) for anything that talks to the third-eye server.
+    pub fn api(&self) -> &ApiSession {
+        &self.api
+    }
+
+    pub fn devices(&self) -> &DevicesClient {
+        &self.devices
+    }
+
+    pub fn device_cache(&self) -> &DeviceCacheStore {
+        &self.device_cache
+    }
+
     pub fn media(&self) -> &MediaStore {
         &self.media
     }
@@ -116,6 +151,10 @@ impl AppStore {
 
     pub fn outbox(&self) -> &OutboxStore {
         &self.outbox
+    }
+
+    pub fn search(&self) -> &SearchClient {
+        &self.search
     }
 
     /// Absolute path of the DB file on disk, if this is a persistent store.

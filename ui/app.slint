@@ -1,29 +1,16 @@
 import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
-
-export struct MapTile {
-    x: length,
-    y: length,
-    size: length,
-    tile: image,
-}
-
-export struct MediaRow {
-    media_id: string,
-    name: string,
-    size_text: string,
-    seen_text: string,
-    state_text: string,
-    origin_text: string,
-    has_local: bool,
-    deleted_on_rov: bool,
-    selected: bool,
-    thumbnail: image,
-    has_thumbnail: bool,
-    captured_at_text: string,
-}
+import { MapTile, MapPage, NearbyPin } from "pages/map_page.slint";
+import { StreamPage } from "pages/stream_page.slint";
+import { MediaRow, MediaPage } from "pages/media_page.slint";
+import { DeviceRow } from "pages/devices/device_list.slint";
+import { ProfilePage } from "pages/profile/profile_page.slint";
+import { TopBar } from "shell/top_bar.slint";
 
 export component AppWindow inherits Window {
-    title: "Third Eye Client";
+    // Left empty: on macOS the menu bar's app name is derived from the
+    // bundle info (independent of this property), so setting a title here
+    // just duplicates "Third Eye Client" a second time in the title bar.
+    title: "";
     icon: @image-url("../assets/logo.png");
     preferred-width: 1520px;
     preferred-height: 960px;
@@ -31,6 +18,13 @@ export component AppWindow inherits Window {
     min-height: 400px;
 
     in-out property <int> active_screen: 0;
+    // Read-only mirror of content_panel's actual laid-out size, polled from
+    // Rust at startup to kick off an initial navigate_map() call when
+    // Device Map is the default screen (see fn main()'s timer). A `changed`
+    // callback on content_panel's width doesn't work for this: it only
+    // fires on subsequent changes, not for the first layout pass's value.
+    out property <length> content_panel_width: content_panel.width;
+    out property <length> content_panel_height: content_panel.height;
 
     in-out property <string> rtsp_url;
     in-out property <string> rov_http_base;
@@ -70,6 +64,9 @@ export component AppWindow inherits Window {
     in-out property <string> auth_status_text;
     in-out property <string> auth_signed_in_as;
     in-out property <bool> auth_is_signed_in: false;
+    // Precomputed on the Rust side (e.g. first letter of the signed-in
+    // email); used by the Profile nav item's and Profile page's avatar.
+    in-out property <string> auth_avatar_text: "?";
     in-out property <string> app_version;
     in-out property <string> running_build_info;
     in-out property <string> update_status_text;
@@ -79,6 +76,46 @@ export component AppWindow inherits Window {
 
     // Per-capture ROV telemetry summary surfaced after a successful capture.
     in-out property <string> attached_metadata_text;
+
+    // Devices bindings (List+Detail over device_handler_api), surfaced
+    // under the Profile page rather than as a top-level workspace screen.
+    in property <[DeviceRow]> device_rows;
+    in-out property <string> devices_status;
+    in-out property <bool> device_action_in_progress: false;
+    // Id of the locally-persisted active device (see storage::devices::DeviceCacheStore).
+    // Drives Device Map / Live Stream RTSP settings and keeps working offshore
+    // with no internet access to the third-eye server.
+    in-out property <string> device_active_id;
+    // Display name of the active device (empty when none is set). Shown as
+    // a badge on the Live Stream page.
+    in-out property <string> active_device_name;
+    in-out property <string> device_selected_id;
+    in-out property <string> device_selected_category;
+    in-out property <string> device_selected_type;
+    in-out property <string> device_selected_created_text;
+    in-out property <string> device_selected_updated_text;
+    in-out property <string> device_name_draft;
+    in-out property <string> new_device_name;
+    // Editable draft of the selected (or new) device's ChasingM2SConfiguration,
+    // flattened into individual string fields (see storage/DeviceConfigDraft
+    // in main.rs). Applies in both create and edit modes, since a new
+    // device's configuration is seeded from these same fields.
+    in-out property <string> device_cfg_host;
+    in-out property <string> device_cfg_rtsp_username;
+    in-out property <string> device_cfg_rtsp_password;
+    in-out property <string> device_cfg_rtsp_transport;
+    in-out property <string> device_cfg_rtsp_reconnect_backoff_ms;
+    in-out property <string> device_cfg_rtsp_port;
+    in-out property <string> device_cfg_rtsp_channel;
+    in-out property <string> device_cfg_rtsp_profile;
+    in-out property <string> device_cfg_udp_port;
+    in-out property <string> device_cfg_udp_expected_id;
+    in-out property <string> device_cfg_udp_expected_type;
+    in-out property <string> device_cfg_http_connect_timeout_ms;
+    in-out property <string> device_cfg_http_request_timeout_ms;
+    in-out property <string> device_cfg_http_port;
+    in-out property <string> device_cfg_capture_burst;
+    in-out property <string> device_cfg_capture_format;
 
     // Media screen bindings.
     in property <[MediaRow]> media_rows;
@@ -115,6 +152,9 @@ export component AppWindow inherits Window {
     in-out property <string> lat_lon_text;
     in-out property <string> zoom_text;
     in property <[MapTile]> map_tiles;
+    // Live "what's around you" overlay for Device Map (AOI/POI/Intermagnet
+    // analysis pins pulled from `/api/v1/search`).
+    in property <[NearbyPin]> nearby_pins;
     in-out property <length> map_pin_world_x: 0px;
     in-out property <length> map_pin_world_y: 0px;
     in-out property <bool> map_has_pin: false;
@@ -148,11 +188,19 @@ export component AppWindow inherits Window {
     in-out property <string> rov_coords_short;
     in-out property <string> rov_battery_short;
 
-    callback navigate_configuration();
+    callback navigate_profile();
     callback navigate_map(length, length);
     callback navigate_stream();
     callback navigate_media();
     callback navigate_nmea();
+
+    callback refresh_devices();
+    callback select_device(string);
+    callback create_device(string);
+    callback save_device_name(string, string);
+    callback delete_device(string);
+    callback set_active_device(string);
+    callback go_live_with_device(string);
 
     callback use_default_test_rtsp();
     callback use_default_rov_rtsp();
@@ -218,267 +266,33 @@ export component AppWindow inherits Window {
         root.map_viewport_width = width;
         root.map_viewport_height = height;
     }
-    HorizontalBox {
-        padding: 10px;
-        spacing: 10px;
 
-        Rectangle {
-            min-width: 240px;
-            max-width: 240px;
-            border-width: 1px;
-            border-color: #3f4148;
-            background: #1f2127;
-
-            VerticalBox {
-                padding: 12px;
-                spacing: 8px;
-                HorizontalBox {
-                    alignment: center;
-                    Image {
-                        width: 90px;
-                        height: 70px;
-                        source: @image-url("../assets/logo.png");
-                        image-fit: contain;
-                    }
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: #3f4148;
-                }
-
-                Button {
-                    text: "Configuration";
-                    clicked => { root.navigate_configuration(); }
-                }
-                Button {
-                    text: "Device Map";
-                    clicked => { root.navigate_map(content_panel.width, content_panel.height); }
-                }
-                Button {
-                    text: "Live Stream";
-                    clicked => { root.navigate_stream(); }
-                }
-                Button {
-                    text: "Media";
-                    clicked => { root.navigate_media(); }
-                }
-                Button {
-                    text: "Phone GPS";
-                    clicked => { root.navigate_nmea(); }
-                }
-                Rectangle {
-                    vertical-stretch: 1;
-                }
-            }
-        }
-
+    // Absolute positioning rather than a VerticalBox so the full-bleed Device
+    // Map can run edge to edge with the top bar floating over it; every other
+    // screen starts below the bar as before. content_panel is declared first so
+    // the bar paints on top of it.
+    //
+    // No permanent sidebar (grid-menu popup instead) and no native OS menu bar
+    // (previously File/View/Help): every action either menu exposed is reachable
+    // from this shell instead — navigation via the grid-menu popup, RTSP/ROV/app
+    // settings under Profile's Settings tab, and the rest via in-page buttons.
+    Rectangle {
         content_panel := Rectangle {
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
-            border-width: 1px;
-            border-color: #3f4148;
+            x: 0;
+            y: root.active_screen == 0 ? 0px : top_bar.height;
+            width: parent.width;
+            height: parent.height - self.y;
             background: #202328;
 
-            if root.active_screen == 0 : ScrollView {
-                viewport-width: self.visible-width;
-
-                VerticalBox {
-                    padding: 14px;
-                    spacing: 10px;
-
-                if root.active_screen == 0 : VerticalBox {
-                    spacing: 8px;
-                    Text {
-                        text: "RTSP + ROV Configuration";
-                        font-size: 24px;
-                    }
-                    Text {
-                        text: "Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.";
-                        wrap: word-wrap;
-                    }
-
-                    Text { text: "RTSP URL:"; }
-                    LineEdit { text <=> root.rtsp_url; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default test RTSP URL";
-                            clicked => { root.use_default_test_rtsp(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV RTSP URL";
-                            clicked => { root.use_default_rov_rtsp(); }
-                        }
-                    }
-
-                    Text { text: "ROV HTTP API Base URL:"; }
-                    LineEdit { text <=> root.rov_http_base; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use default ROV HTTP API URL";
-                            clicked => { root.use_default_rov_http_base(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Use host from ROV HTTP API URL for telemetry UDP bind";
-                            clicked => { root.use_host_from_rov_http_base(); }
-                        }
-                    }
-
-                    Text { text: "ROV telemetry UDP port:"; }
-                    LineEdit { text <=> root.rov_status_udp_port; }
-                    Button {
-                        text: "Use default ROV telemetry UDP port (8500)";
-                        clicked => { root.use_default_rov_status_udp_port(); }
-                    }
-
-                    Text { text: "OpenStreetMap tile User-Agent:"; }
-                    LineEdit { text <=> root.osm_tile_user_agent; }
-                    Button {
-                        text: "Use default OSM tile User-Agent";
-                        clicked => { root.use_default_osm_tile_user_agent(); }
-                    }
-                    Text {
-                        text: "Include an app identifier and contact URL/email for OSM tile policy compliance.";
-                        wrap: word-wrap;
-                    }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Offline map tiles"; font-size: 18px; }
-                    Text {
-                        text: "Cache map tiles to disk for offline use. When enabled, tiles are saved as you browse and served from local storage when no Internet is available.";
-                        wrap: word-wrap;
-                    }
-                    CheckBox {
-                        text: "Save map tiles for offline use";
-                        checked <=> root.use_saved_map_tiles;
-                    }
-                    Text {
-                        text: "Max tile cache size (MB):";
-                        color: root.use_saved_map_tiles ? #ffffff : #555555;
-                    }
-                    LineEdit {
-                        text <=> root.max_tile_storage_mb;
-                        enabled: root.use_saved_map_tiles;
-                    }
-                    Text {
-                        text: "Least recently used tiles are deleted first when the cache exceeds this limit. Default 1024 MB (1 GB).";
-                        wrap: word-wrap;
-                        color: #8f96a3;
-                        font-size: 12px;
-                    }
-                    if root.tile_cache_size_text != "" : Text {
-                        text: "Current tile cache size on disk: " + root.tile_cache_size_text + ".";
-                        color: #8f96a3;
-                        font-size: 12px;
-                    }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Application updates"; font-size: 18px; }
-                    Text {
-                        text: "Installed version: v" + root.app_version;
-                        color: #8f96a3;
-                    }
-                    Text {
-                        text: "Running build: " + root.running_build_info;
-                        wrap: word-wrap;
-                        color: #8f96a3;
-                        font-size: 12px;
-                    }
-                    if root.update_available : Text {
-                        text: "Latest available: v" + root.update_latest_version;
-                        color: #22cc44;
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: root.update_check_in_progress ? "Checking..." : "Check for updates";
-                            enabled: !root.update_check_in_progress;
-                            clicked => { root.check_for_updates(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Download update";
-                            enabled: root.update_available;
-                            clicked => { root.download_update(); }
-                        }
-                    }
-                    Text {
-                        text: root.update_status_text;
-                        wrap: word-wrap;
-                        color: #8f96a3;
-                    }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Button {
-                        text: "Recalibrate ROV network";
-                        clicked => { root.recalibrate_rov_network(); }
-                    }
-                    Text {
-                        text: "Auto-detects the wired USB-ethernet interface for the ROV (192.168.1.88) and sets up the OS route for ffmpeg. If no cable is connected, falls back to OS routing (ROV WiFi). May prompt for admin password.";
-                        wrap: word-wrap;
-                    }
-
-                    Text { text: root.rov_info; wrap: word-wrap; }
-
-                    Rectangle { height: 1px; background: #3f4148; }
-                    Text { text: "Server account"; font-size: 18px; }
-                    Text {
-                        text: "Sign in to https://third-eye.marshalling.eu for media syncing and status uploads.";
-                        wrap: word-wrap;
-                    }
-                    Text { text: "Server base URL:"; }
-                    LineEdit { text <=> root.server_base_url; }
-                    Button {
-                        text: "Use default server URL";
-                        clicked => { root.use_default_server_base_url(); }
-                    }
-                    Text { text: "Email:"; }
-                    LineEdit { text <=> root.auth_email; }
-                    Text { text: "Password:"; }
-                    LineEdit {
-                        text <=> root.auth_password;
-                        input-type: password;
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Sign in";
-                            enabled: !root.auth_is_signed_in;
-                            clicked => { root.sign_in(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Sign out";
-                            enabled: root.auth_is_signed_in;
-                            clicked => { root.sign_out(); }
-                        }
-                    }
-                    if root.auth_is_signed_in : Text {
-                        text: "Signed in as " + root.auth_signed_in_as;
-                    }
-                    Text { text: root.auth_status_text; wrap: word-wrap; }
-                }
-
-            }
-            }
-
             // Phone GPS screen
-            if root.active_screen == 4 : ScrollView {
+            if root.active_screen == 3 : ScrollView {
                 viewport-width: self.visible-width;
 
                 VerticalBox {
                     padding: 14px;
                     spacing: 10px;
 
-                if root.active_screen == 4 : VerticalBox {
+                if root.active_screen == 3 : VerticalBox {
                     spacing: 8px;
                     vertical-stretch: 0;
                     Text {
@@ -763,891 +577,182 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Media screen — outside ScrollView so the two-column layout
-            // can stretch to fill the full panel height.
-            if root.active_screen == 3 : VerticalBox {
-                padding: 14px;
-                spacing: 10px;
-                Text {
-                    text: "Media";
-                    font-size: 24px;
-                }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Refresh from ROV";
-                            clicked => { root.refresh_media(); }
-                        }
-                        Button {
-                            horizontal-stretch: 1;
-                            text: "Open local folder";
-                            clicked => { root.open_local_media_folder(); }
-                        }
-                    }
-                    Text { text: root.media_status; wrap: word-wrap; }
-
-                    HorizontalBox {
-                        spacing: 12px;
-
-                        // --- Left column: scrollable tile list of media. ---
-                        Rectangle {
-                            min-width: 340px;
-                            max-width: 480px;
-                            horizontal-stretch: 0;
-                            vertical-stretch: 1;
-                            border-width: 1px;
-                            border-color: #3f4148;
-                            background: #1a1c22;
-
-                            // Flickable (rather than ScrollView) gives proper
-                            // touch-drag scrolling on Windows: a short tap still
-                            // fires the TouchArea.clicked inside each row, while
-                            // a drag gesture scrolls the list.
-                            Flickable {
-                                VerticalBox {
-                                    padding: 6px;
-                                    spacing: 4px;
-                                    if root.media_rows.length == 0 : Text {
-                                        text: "No media recorded yet. Click \"Refresh from ROV\" to populate the list.";
-                                        wrap: word-wrap;
-                                        color: #8f96a3;
-                                    }
-                                    for row in root.media_rows : Rectangle {
-                                        height: row.has_thumbnail ? 100px : 52px;
-                                        border-radius: 6px;
-                                        border-width: row.selected ? 2px : 1px;
-                                        border-color: row.selected ? #0a84ff : #2b2d34;
-                                        background: row.selected ? #0a84ff22 :
-                                            (row.deleted_on_rov ? #30181888 : #262931);
-                                        HorizontalBox {
-                                            padding: 4px;
-                                            spacing: 8px;
-                                            if row.has_thumbnail : Rectangle {
-                                                width: 88px;
-                                                border-radius: 4px;
-                                                clip: true;
-                                                background: #111318;
-                                                Image {
-                                                    width: parent.width;
-                                                    height: parent.height;
-                                                    source: row.thumbnail;
-                                                    image-fit: contain;
-                                                }
-                                            }
-                                            VerticalBox {
-                                                spacing: 2px;
-                                                Text {
-                                                    text: row.name;
-                                                    font-size: 13px;
-                                                    overflow: elide;
-                                                }
-                                                if row.captured_at_text != "" : Text {
-                                                    text: row.captured_at_text;
-                                                    font-size: 10px;
-                                                    color: #8f96a3;
-                                                }
-                                                if row.captured_at_text == "" : Text {
-                                                    text: row.seen_text;
-                                                    font-size: 10px;
-                                                    color: #666666;
-                                                }
-                                                Text {
-                                                    text: row.size_text + " \u{2022} " + row.state_text;
-                                                    font-size: 11px;
-                                                    color: #8f96a3;
-                                                    overflow: elide;
-                                                }
-                                            }
-                                        }
-                                        TouchArea {
-                                            clicked => {
-                                                root.select_media(row.media_id, row.name);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // --- Right column: detail panel. ---
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            vertical-stretch: 1;
-                            border-width: 1px;
-                            border-color: #3f4148;
-                            background: #111318;
-
-                            if root.media_selected_name == "" : Text {
-                                text: "Select a media entry on the left to see its metadata.";
-                                color: #8f96a3;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-
-                            if root.media_selected_name != "" : VerticalBox {
-                                padding: 0px;
-                                spacing: 0px;
-
-                                // ---- Preview area ----
-                                Rectangle {
-                                    vertical-stretch: 1;
-                                    clip: true;
-                                    background: #000000;
-
-                                    if root.has_media_preview : Image {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        source: root.media_preview_image;
-                                        image-fit: contain;
-                                    }
-                                    if !root.has_media_preview : Text {
-                                        text: root.media_selected_is_video
-                                            ? "Click \"Stream\" to preview"
-                                            : "Loading preview...";
-                                        color: #555555;
-                                        font-size: 15px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-
-                                // ---- Bottom section: name + telemetry + buttons ----
-                                Rectangle {
-                                    background: #1a1c22;
-                                    vertical-stretch: 0;
-
-                                    VerticalBox {
-                                        padding: 10px;
-                                        spacing: 6px;
-
-                                        // File name + subtitle
-                                        Text {
-                                            text: root.media_selected_name;
-                                            font-size: 15px;
-                                            color: #ffffff;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: root.media_capture_datetime != "" ? root.media_capture_datetime + " \u{2022} " + root.media_info_subtitle : root.media_info_subtitle;
-                                            font-size: 11px;
-                                            color: #8f96a3;
-                                            overflow: elide;
-                                        }
-
-                                        // Capture telemetry bar
-                                        if root.media_selected_has_capture_meta : Rectangle {
-                                            height: 56px;
-                                            border-radius: 8px;
-                                            background: #0d1a2acc;
-                                            border-width: 1px;
-                                            border-color: #0a84ff22;
-
-                                            HorizontalBox {
-                                                padding-left: 10px;
-                                                padding-right: 10px;
-                                                padding-top: 6px;
-                                                padding-bottom: 6px;
-                                                spacing: 14px;
-
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "DEPTH"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_depth; color: #ffffff; font-size: 15px; }
-                                                }
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "TEMP"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_temp; color: #aaccff; font-size: 15px; }
-                                                }
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "HDG"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_heading; color: #ffffff; font-size: 15px; }
-                                                }
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "ATT"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_attitude; color: #ffffff; font-size: 12px; }
-                                                }
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "POS"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_coords; color: #ffffff; font-size: 12px; }
-                                                }
-                                                VerticalBox { spacing: 1px;
-                                                    Text { text: "BAT"; color: #8f96a3; font-size: 9px; }
-                                                    Text { text: root.media_capture_battery; color: #ffffff; font-size: 12px; }
-                                                }
-                                            }
-                                        }
-
-                                        if !root.media_selected_has_capture_meta : Text {
-                                            text: "No capture telemetry attached.";
-                                            font-size: 11px;
-                                            color: #555555;
-                                        }
-
-                                        // Action buttons
-                                        HorizontalBox {
-                                            spacing: 6px;
-                                            Button {
-                                                horizontal-stretch: 1;
-                                                text: root.media_download_in_progress
-                                                    ? "Downloading..."
-                                                    : (root.media_selected_local_path == ""
-                                                        ? "Download"
-                                                        : "Re-download");
-                                                enabled: !root.media_download_in_progress
-                                                    && !root.media_selected_deleted_on_rov;
-                                                clicked => { root.download_selected_media(); }
-                                            }
-                                            Button {
-                                                horizontal-stretch: 1;
-                                                text: "Open";
-                                                enabled: root.media_selected_local_path != "";
-                                                clicked => { root.open_selected_local_media(); }
-                                            }
-                                            if root.media_selected_is_image && root.media_selected_has_capture_meta : Button {
-                                                horizontal-stretch: 1;
-                                                text: "\u{1f4f7} + Telemetry";
-                                                enabled: root.media_selected_local_path != "";
-                                                clicked => { root.open_with_telemetry(); }
-                                            }
-                                            if root.media_selected_is_video && !root.media_stream_active : Button {
-                                                horizontal-stretch: 1;
-                                                text: "Stream";
-                                                enabled: !root.media_download_in_progress;
-                                                clicked => { root.stream_selected_media(); }
-                                            }
-                                            if root.media_selected_is_video && root.media_stream_active : Button {
-                                                horizontal-stretch: 1;
-                                                text: "Stop";
-                                                clicked => { root.stop_media_stream(); }
-                                            }
-                                            Button {
-                                                text: "Delete";
-                                                clicked => { root.delete_selected_media_from_rov(); }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            // Profile screen: account, Devices List+Detail, and (folded in
+            // now that there's no native menu bar) the Settings tab that
+            // used to be its own top-level Configuration screen.
+            if root.active_screen == 4 : ProfilePage {
+                auth_is_signed_in: root.auth_is_signed_in;
+                auth_signed_in_as: root.auth_signed_in_as;
+                auth_status_text: root.auth_status_text;
+                auth_avatar_text: root.auth_avatar_text;
+                auth_email <=> root.auth_email;
+                auth_password <=> root.auth_password;
+                sign_in => { root.sign_in(); }
+                sign_out => { root.sign_out(); }
+                rtsp_url <=> root.rtsp_url;
+                rov_http_base <=> root.rov_http_base;
+                rov_status_udp_port <=> root.rov_status_udp_port;
+                osm_tile_user_agent <=> root.osm_tile_user_agent;
+                use_saved_map_tiles <=> root.use_saved_map_tiles;
+                max_tile_storage_mb <=> root.max_tile_storage_mb;
+                tile_cache_size_text: root.tile_cache_size_text;
+                rov_info: root.rov_info;
+                server_base_url <=> root.server_base_url;
+                app_version: root.app_version;
+                running_build_info: root.running_build_info;
+                update_status_text: root.update_status_text;
+                update_latest_version: root.update_latest_version;
+                update_available: root.update_available;
+                update_check_in_progress: root.update_check_in_progress;
+                use_default_test_rtsp => { root.use_default_test_rtsp(); }
+                use_default_rov_rtsp => { root.use_default_rov_rtsp(); }
+                use_default_rov_http_base => { root.use_default_rov_http_base(); }
+                use_host_from_rov_http_base => { root.use_host_from_rov_http_base(); }
+                use_default_rov_status_udp_port => { root.use_default_rov_status_udp_port(); }
+                use_default_osm_tile_user_agent => { root.use_default_osm_tile_user_agent(); }
+                use_default_server_base_url => { root.use_default_server_base_url(); }
+                check_for_updates => { root.check_for_updates(); }
+                download_update => { root.download_update(); }
+                recalibrate_rov_network => { root.recalibrate_rov_network(); }
+                device_rows: root.device_rows;
+                devices_status: root.devices_status;
+                device_action_in_progress: root.device_action_in_progress;
+                device_active_id: root.device_active_id;
+                device_selected_id: root.device_selected_id;
+                device_selected_category: root.device_selected_category;
+                device_selected_type: root.device_selected_type;
+                device_selected_created_text: root.device_selected_created_text;
+                device_selected_updated_text: root.device_selected_updated_text;
+                device_name_draft <=> root.device_name_draft;
+                new_device_name <=> root.new_device_name;
+                device_cfg_host <=> root.device_cfg_host;
+                device_cfg_rtsp_username <=> root.device_cfg_rtsp_username;
+                device_cfg_rtsp_password <=> root.device_cfg_rtsp_password;
+                device_cfg_rtsp_transport <=> root.device_cfg_rtsp_transport;
+                device_cfg_rtsp_reconnect_backoff_ms <=> root.device_cfg_rtsp_reconnect_backoff_ms;
+                device_cfg_rtsp_port <=> root.device_cfg_rtsp_port;
+                device_cfg_rtsp_channel <=> root.device_cfg_rtsp_channel;
+                device_cfg_rtsp_profile <=> root.device_cfg_rtsp_profile;
+                device_cfg_udp_port <=> root.device_cfg_udp_port;
+                device_cfg_udp_expected_id <=> root.device_cfg_udp_expected_id;
+                device_cfg_udp_expected_type <=> root.device_cfg_udp_expected_type;
+                device_cfg_http_connect_timeout_ms <=> root.device_cfg_http_connect_timeout_ms;
+                device_cfg_http_request_timeout_ms <=> root.device_cfg_http_request_timeout_ms;
+                device_cfg_http_port <=> root.device_cfg_http_port;
+                device_cfg_capture_burst <=> root.device_cfg_capture_burst;
+                device_cfg_capture_format <=> root.device_cfg_capture_format;
+                refresh_devices => { root.refresh_devices(); }
+                select_device(id) => { root.select_device(id); }
+                create_device(name) => { root.create_device(name); }
+                save_device_name(id, name) => { root.save_device_name(id, name); }
+                delete_device(id) => { root.delete_device(id); }
+                set_active_device(id) => { root.set_active_device(id); }
+                go_live_with_device(id) => { root.go_live_with_device(id); }
             }
 
-            // Full-bleed live stream screen
-            if root.active_screen == 2 : Rectangle {
+            // Media screen — extracted to pages/media_page.slint (Phase 2).
+            if root.active_screen == 2 : MediaPage {
+                media_rows: root.media_rows;
+                media_status: root.media_status;
+                media_selected_name: root.media_selected_name;
+                media_selected_local_path: root.media_selected_local_path;
+                media_selected_has_capture_meta: root.media_selected_has_capture_meta;
+                media_download_in_progress: root.media_download_in_progress;
+                media_selected_deleted_on_rov: root.media_selected_deleted_on_rov;
+                media_preview_image: root.media_preview_image;
+                has_media_preview: root.has_media_preview;
+                media_selected_is_video: root.media_selected_is_video;
+                media_selected_is_image: root.media_selected_is_image;
+                media_stream_active: root.media_stream_active;
+                media_capture_depth: root.media_capture_depth;
+                media_capture_temp: root.media_capture_temp;
+                media_capture_heading: root.media_capture_heading;
+                media_capture_attitude: root.media_capture_attitude;
+                media_capture_coords: root.media_capture_coords;
+                media_capture_battery: root.media_capture_battery;
+                media_info_subtitle: root.media_info_subtitle;
+                media_capture_datetime: root.media_capture_datetime;
+                refresh_media => { root.refresh_media(); }
+                open_local_media_folder => { root.open_local_media_folder(); }
+                select_media(id, name) => { root.select_media(id, name); }
+                download_selected_media => { root.download_selected_media(); }
+                open_selected_local_media => { root.open_selected_local_media(); }
+                delete_selected_media_from_rov => { root.delete_selected_media_from_rov(); }
+                stream_selected_media => { root.stream_selected_media(); }
+                stop_media_stream => { root.stop_media_stream(); }
+                open_with_telemetry => { root.open_with_telemetry(); }
+            }
+
+            // Full-bleed live stream screen — extracted to pages/stream_page.slint (Phase 2).
+            if root.active_screen == 1 : StreamPage {
                 width: parent.width;
                 height: parent.height;
-                background: #000000;
-                clip: true;
-
-                // Full-bleed video
-                if root.has_stream_image : Image {
-                    width: parent.width;
-                    height: parent.height;
-                    source: root.stream_image;
-                    image-fit: contain;
-                }
-                if !root.has_stream_image : Text {
-                    text: "No stream active. Press \u{25b6} Start to begin.";
-                    color: #555555;
-                    font-size: 18px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-
-                // Top-right: compact status indicators
-                Rectangle {
-                    width: 130px;
-                    height: 60px;
-                    x: parent.width - self.width - 10px;
-                    y: 10px;
-                    border-radius: 12px;
-                    background: #0d1a2acc;
-                    border-width: 1px;
-                    border-color: #0a84ff44;
-
-                    VerticalBox {
-                        padding: 8px;
-                        spacing: 3px;
-                        Text {
-                            text: "STREAM";
-                            color: root.stream_is_active
-                                ? (root.has_stream_image ? #22cc44 : #ffaa00)
-                                : #ff4444;
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "DATA";
-                            color: root.has_rov_status
-                                ? #22cc44
-                                : (root.rov_listener_running ? #ffaa00 : #ff4444);
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "GPS";
-                            color: root.nmea_gps_running
-                                ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
-                                : #ff4444;
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                    }
-                }
-
-                // Right: capture photo button (camera icon)
-                Rectangle {
-                    width: 56px;
-                    height: 48px;
-                    x: parent.width - self.width - 16px;
-                    y: (parent.height - self.height) / 2;
-                    border-radius: 10px;
-                    background: btn-capture-ta.pressed ? #0a84ffcc : btn-capture-ta.has-hover ? #0a84ff88 : #0d1a2acc;
-                    border-width: 1px;
-                    border-color: #0a84ff44;
-                    animate background { duration: 120ms; }
-
-                    // Camera body
-                    Rectangle {
-                        width: 36px;
-                        height: 26px;
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2 + 2px;
-                        border-radius: 4px;
-                        border-width: 2px;
-                        border-color: #ffffffcc;
-                        background: #00000000;
-                    }
-                    // Lens circle
-                    Rectangle {
-                        width: 14px;
-                        height: 14px;
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2 + 2px;
-                        border-radius: 7px;
-                        border-width: 2px;
-                        border-color: #ffffffcc;
-                        background: #00000000;
-                    }
-                    // Viewfinder bump
-                    Rectangle {
-                        width: 14px;
-                        height: 6px;
-                        x: (parent.width - self.width) / 2 + 2px;
-                        y: (parent.height - self.height) / 2 - 4px;
-                        border-radius: 2px;
-                        background: #ffffffcc;
-                    }
-                    // Flash dot
-                    Rectangle {
-                        width: 4px;
-                        height: 4px;
-                        x: (parent.width - self.width) / 2 + 26px;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 2px;
-                        background: #ffffffaa;
-                    }
-                    btn-capture-ta := TouchArea {
-                        clicked => {
-                            root.capture_photo();
-                        }
-                    }
-                }
-
-                // Bottom: ROV telemetry overlay bar
-                if root.has_rov_status : Rectangle {
-                    width: parent.width;
-                    height: 80px;
-                    y: parent.height - self.height;
-                    background: #0d1a2add;
-
-                    HorizontalBox {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-top: 8px;
-                        padding-bottom: 8px;
-                        spacing: 24px;
-
-                        // Depth
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "DEPTH";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_depth_short;
-                                color: #ffffff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Temperature
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "TEMP";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_temp_short;
-                                color: #aaccff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Heading
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "HDG";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_heading_short;
-                                color: #ffffff;
-                                font-size: 22px;
-                            }
-                        }
-
-                        // Attitude
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "ATT";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_attitude_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-
-                        // Coordinates
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "POS";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_coords_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-
-                        // Battery
-                        VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: "BAT";
-                                color: #8f96a3;
-                                font-size: 10px;
-                            }
-                            Text {
-                                text: root.rov_battery_short;
-                                color: #ffffff;
-                                font-size: 16px;
-                            }
-                        }
-                    }
-                }
+                stream_image: root.stream_image;
+                has_stream_image: root.has_stream_image;
+                stream_is_active: root.stream_is_active;
+                has_rov_status: root.has_rov_status;
+                rov_listener_running: root.rov_listener_running;
+                nmea_gps_running: root.nmea_gps_running;
+                nmea_has_fix: root.nmea_has_fix;
+                rov_depth_short: root.rov_depth_short;
+                rov_temp_short: root.rov_temp_short;
+                rov_heading_short: root.rov_heading_short;
+                rov_attitude_short: root.rov_attitude_short;
+                rov_coords_short: root.rov_coords_short;
+                rov_battery_short: root.rov_battery_short;
+                active_device_name: root.active_device_name;
+                capture_photo => { root.capture_photo(); }
+                navigate_profile => { root.navigate_profile(); }
+                recalibrate_rov_network => { root.recalibrate_rov_network(); }
             }
 
-            // Full-bleed map screen
-            if root.active_screen == 1 : Rectangle {
+            // Full-bleed map screen — extracted to pages/map_page.slint (Phase 2).
+            if root.active_screen == 0 : MapPage {
                 width: parent.width;
                 height: parent.height;
-
-                map_canvas := Rectangle {
-                    width: parent.width;
-                    height: parent.height;
-                    clip: true;
-                    background: #ffffff;
-
-                    map_fli := Flickable {
-                        viewport-x <=> root.map_viewport_x;
-                        viewport-y <=> root.map_viewport_y;
-                        viewport-width: root.map_viewport_width;
-                        viewport-height: root.map_viewport_height;
-
-                        for tile in root.map_tiles : Image {
-                            x: tile.x;
-                            y: tile.y;
-                            width: tile.size;
-                            height: tile.size;
-                            source: tile.tile;
-                            image-fit: fill;
-                        }
-
-                        if root.map_has_pin : Rectangle {
-                            width: 52px;
-                            height: 52px;
-                            x: root.map_pin_world_x - self.width / 2;
-                            y: root.map_pin_world_y - self.height / 2;
-                            background: #00000000;
-
-                            Rectangle {
-                                width: 52px;
-                                height: 52px;
-                                border-radius: 26px;
-                                background: #0a84ff15;
-                            }
-                            Rectangle {
-                                width: 42px;
-                                height: 42px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 21px;
-                                background: #0a84ff28;
-                            }
-                            Rectangle {
-                                width: 34px;
-                                height: 34px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 17px;
-                                background: #0a84ff40;
-                            }
-                            Image {
-                                width: 26px;
-                                height: 26px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                source: @image-url("../assets/macbook_pin.png");
-                                image-fit: contain;
-                            }
-                        }
-
-                        // Coordinate label below pin
-                        if root.map_has_pin : Rectangle {
-                            width: 140px;
-                            height: 20px;
-                            x: root.map_pin_world_x - self.width / 2;
-                            y: root.map_pin_world_y + 30px;
-                            border-radius: 4px;
-                            background: #000000aa;
-
-                            Text {
-                                text: root.pin_lat_lon_short;
-                                font-size: 11px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        flicked => {
-                            root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
-                        }
-
-                        wheel_zoom_area := TouchArea {
-                            x: -map_fli.viewport-x;
-                            y: -map_fli.viewport-y;
-                            width: map_canvas.width;
-                            height: map_canvas.height;
-
-                            scroll-event(event) => {
-                                if (event.delta-y != 0px) {
-                                    root.map_scroll_zoom(
-                                        event.delta-y,
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                    accept
-                                } else {
-                                    reject
-                                }
-                            }
-                        }
-                    }
-
-                    // Pinch-to-zoom overlay: lets the user zoom with touchpad
-                    // pinch or touchscreen pinch gestures while preserving
-                    // normal two-finger panning in Flickable.
-                    ScaleRotateGestureHandler {
-                        x: 0px;
-                        y: 0px;
-                        width: map_canvas.width;
-                        height: map_canvas.height;
-                        started => {
-                            root.map_pinch_zoom_start();
-                        }
-                        updated => {
-                            root.map_pinch_zoom_update(
-                                self.scale,
-                                self.center.x,
-                                self.center.y,
-                                map_fli.viewport-x,
-                                map_fli.viewport-y,
-                                map_canvas.width,
-                                map_canvas.height
-                            );
-                        }
-                        ended => {
-                            root.map_pinch_zoom_end();
-                        }
-                        cancelled => {
-                            root.map_pinch_zoom_end();
-                        }
-                    }
-
-                    if root.map_tiles.length == 0 : Text {
-                        text: "Loading map tiles...";
-                        color: #888888;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    // Map control button group – top-right
-                    Rectangle {
-                        width: 46px;
-                        height: 132px;
-                        x: parent.width - self.width - 10px;
-                        y: 10px;
-                        border-radius: 12px;
-                        background: #0d1a2acc;
-                        border-width: 1px;
-                        border-color: #0a84ff44;
-
-                        // Zoom-in button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 3px;
-                            border-radius: 10px;
-                            background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-                            Text {
-                                text: "+";
-                                font-size: 26px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            btn-plus-ta := TouchArea {
-                                clicked => {
-                                    root.map_zoom_in(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-
-                        // Separator
-                        Rectangle {
-                            width: 28px;
-                            height: 1px;
-                            x: (parent.width - self.width) / 2;
-                            y: 44px;
-                            background: #0a84ff33;
-                        }
-
-                        // Zoom-out button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 46px;
-                            border-radius: 10px;
-                            background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-                            Text {
-                                text: "\u{2212}";
-                                font-size: 26px;
-                                color: #ffffff;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            btn-minus-ta := TouchArea {
-                                clicked => {
-                                    root.map_zoom_out(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-
-                        // Separator
-                        Rectangle {
-                            width: 28px;
-                            height: 1px;
-                            x: (parent.width - self.width) / 2;
-                            y: 87px;
-                            background: #0a84ff33;
-                        }
-
-                        // Center / locate button
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            x: 3px;
-                            y: 89px;
-                            border-radius: 10px;
-                            background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
-                            animate background { duration: 120ms; }
-
-                            // Crosshair ring
-                            Rectangle {
-                                width: 16px;
-                                height: 16px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-width: 2px;
-                                border-color: #ffffff;
-                                border-radius: 8px;
-                                background: #00000000;
-                            }
-                            // Center dot
-                            Rectangle {
-                                width: 4px;
-                                height: 4px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 2px;
-                                background: #ffffff;
-                            }
-                            // Crosshair top
-                            Rectangle {
-                                width: 2px;
-                                height: 5px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - 16px) / 2 - self.height;
-                                background: #ffffff;
-                            }
-                            // Crosshair bottom
-                            Rectangle {
-                                width: 2px;
-                                height: 5px;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height + 16px) / 2;
-                                background: #ffffff;
-                            }
-                            // Crosshair left
-                            Rectangle {
-                                width: 5px;
-                                height: 2px;
-                                x: (parent.width - 16px) / 2 - self.width;
-                                y: (parent.height - self.height) / 2;
-                                background: #ffffff;
-                            }
-                            // Crosshair right
-                            Rectangle {
-                                width: 5px;
-                                height: 2px;
-                                x: (parent.width + 16px) / 2;
-                                y: (parent.height - self.height) / 2;
-                                background: #ffffff;
-                            }
-
-                            btn-center-ta := TouchArea {
-                                clicked => {
-                                    root.center_map_on_pin(
-                                        map_fli.viewport-x,
-                                        map_fli.viewport-y,
-                                        map_canvas.width,
-                                        map_canvas.height
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // NMEA status badge – bottom-left
-                    Rectangle {
-                        width: 68px;
-                        height: 28px;
-                        x: 10px;
-                        y: parent.height - self.height - 10px;
-                        border-radius: 8px;
-                        background: #0d1a2acc;
-                        border-width: 1px;
-                        border-color: root.nmea_has_fix ? #22cc4466 : #ff444466;
-
-                        Text {
-                            text: "NMEA";
-                            color: #8f96a3;
-                            font-size: 9px;
-                            x: 8px;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: root.nmea_gps_running
-                                ? (root.nmea_has_fix ? "OK" : "..")
-                                : "--";
-                            color: root.nmea_gps_running
-                                ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
-                                : #ff4444;
-                            font-size: 11px;
-                            font-weight: 700;
-                            x: 42px;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // Scale legend – bottom-right
-                    Rectangle {
-                        width: 148px;
-                        height: 30px;
-                        x: parent.width - self.width - 10px;
-                        y: parent.height - self.height - 10px;
-                        border-radius: 6px;
-                        background: #0d1a2acc;
-                        border-width: 1px;
-                        border-color: #0a84ff44;
-
-                        // Scale line
-                        Rectangle {
-                            width: root.scale_bar_width;
-                            height: 2px;
-                            x: (parent.width - self.width) / 2;
-                            y: 6px;
-                            background: #ffffff;
-                        }
-                        // Left tick
-                        Rectangle {
-                            width: 2px;
-                            height: 8px;
-                            x: (parent.width - root.scale_bar_width) / 2;
-                            y: 3px;
-                            background: #ffffff;
-                        }
-                        // Right tick
-                        Rectangle {
-                            width: 2px;
-                            height: 8px;
-                            x: (parent.width + root.scale_bar_width) / 2 - 1px;
-                            y: 3px;
-                            background: #ffffff;
-                        }
-                        // Scale label
-                        Text {
-                            text: root.scale_bar_text;
-                            font-size: 11px;
-                            color: #ffffff;
-                            width: parent.width;
-                            y: 12px;
-                            horizontal-alignment: center;
-                        }
-                    }
-                }
+                map_tiles: root.map_tiles;
+                nearby_pins: root.nearby_pins;
+                map_pin_world_x: root.map_pin_world_x;
+                map_pin_world_y: root.map_pin_world_y;
+                map_has_pin: root.map_has_pin;
+                map_viewport_x <=> root.map_viewport_x;
+                map_viewport_y <=> root.map_viewport_y;
+                map_viewport_width <=> root.map_viewport_width;
+                map_viewport_height <=> root.map_viewport_height;
+                pin_lat_lon_short: root.pin_lat_lon_short;
+                scale_bar_width: root.scale_bar_width;
+                scale_bar_text: root.scale_bar_text;
+                nmea_gps_running: root.nmea_gps_running;
+                nmea_has_fix: root.nmea_has_fix;
+                auth_is_signed_in: root.auth_is_signed_in;
+                avatar_text: root.auth_avatar_text;
+                map_flicked(a, b, c, d) => { root.map_flicked(a, b, c, d); }
+                map_zoom_in(a, b, c, d) => { root.map_zoom_in(a, b, c, d); }
+                map_zoom_out(a, b, c, d) => { root.map_zoom_out(a, b, c, d); }
+                map_scroll_zoom(a, b, c, d, e) => { root.map_scroll_zoom(a, b, c, d, e); }
+                map_pinch_zoom_start => { root.map_pinch_zoom_start(); }
+                map_pinch_zoom_update(a, b, c, d, e, f, g) => { root.map_pinch_zoom_update(a, b, c, d, e, f, g); }
+                map_pinch_zoom_end => { root.map_pinch_zoom_end(); }
+                center_map_on_pin(a, b, c, d) => { root.center_map_on_pin(a, b, c, d); }
+                navigate_nmea => { root.navigate_nmea(); }
             }
+        }
+
+        top_bar := TopBar {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            // Transparent and floating over the Device Map; a solid bar
+            // everywhere else.
+            overlay: root.active_screen == 0;
+            auth_is_signed_in: root.auth_is_signed_in;
+            avatar_text: root.auth_avatar_text;
+            active_screen: root.active_screen;
+            navigate_profile => { root.navigate_profile(); }
+            navigate_map => { root.navigate_map(content_panel.width, content_panel.height); }
+            navigate_stream => { root.navigate_stream(); }
+            navigate_media => { root.navigate_media(); }
+            navigate_nmea => { root.navigate_nmea(); }
         }
     }
 }

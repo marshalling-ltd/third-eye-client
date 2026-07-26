@@ -1,0 +1,531 @@
+import { VerticalBox } from "std-widgets.slint";
+
+export struct MapTile {
+    x: length,
+    y: length,
+    size: length,
+    tile: image,
+}
+
+// A single nearby resource pin (AOI/POI/Intermagnet analysis), pulled live
+// from `/api/v1/search` and positioned in the same world-pixel space as the
+// map tiles and own-location pin (see `map::lat_lon_to_world_px`), so it
+// pans/zooms correctly regardless of which tiles happen to be loaded.
+export struct NearbyPin {
+    x: length,
+    y: length,
+    label: string,
+    // 0 = poi, 1 = aoi, 2 = intermagnet_analysis - matches NearbyKind's order.
+    kind: int,
+}
+
+// Full-bleed device map screen (OpenStreetMap tiles + ROV/phone GPS pin).
+//
+// Extracted verbatim from the original monolithic app.slint (Phase 2 of the
+// native desktop UI/UX blueprint). Every property/callback below already
+// existed on `AppWindow`; `../app.slint` forwards them 1:1 into this
+// component, so no Rust-side changes were needed for this move.
+export component MapPage inherits Rectangle {
+    in property <[MapTile]> map_tiles;
+    in-out property <length> map_pin_world_x: 0px;
+    in-out property <length> map_pin_world_y: 0px;
+    in-out property <bool> map_has_pin: false;
+    in-out property <length> map_viewport_x: 0px;
+    in-out property <length> map_viewport_y: 0px;
+    in-out property <length> map_viewport_width: 0px;
+    in-out property <length> map_viewport_height: 0px;
+    in property <string> pin_lat_lon_short;
+    in property <length> scale_bar_width: 100px;
+    in property <string> scale_bar_text;
+    in property <bool> nmea_gps_running: false;
+    in property <bool> nmea_has_fix: false;
+    // Whether the user is signed in to the third-eye server. Drives the
+    // own-location pin's center: signed in shows the account avatar letter
+    // (fun, personal), signed out falls back to the plain laptop icon.
+    in property <bool> auth_is_signed_in: false;
+    // First letter of the signed-in account (or "?"), shown in the middle
+    // of the own-location pin instead of a device icon - see auth_avatar_text.
+    in property <string> avatar_text: "?";
+    // Live "what's around you" overlay: AOI/POI/Intermagnet analysis pins.
+    in property <[NearbyPin]> nearby_pins;
+    // Index into nearby_pins whose detail card is open, or -1 for none.
+    // Purely a UI concern (which pin is expanded), not synced to Rust.
+    property <int> nearby_detail_index: -1;
+
+    callback map_flicked(length, length, length, length);
+    callback map_zoom_in(length, length, length, length);
+    callback map_zoom_out(length, length, length, length);
+    callback map_scroll_zoom(length, length, length, length, length);
+    callback map_pinch_zoom_start();
+    callback map_pinch_zoom_update(float, length, length, length, length, length, length);
+    callback map_pinch_zoom_end();
+    callback center_map_on_pin(length, length, length, length);
+    // Jumps to the Phone GPS screen, fired by tapping the NMEA status badge so
+    // the GPS source can be configured from where its status is shown.
+    callback navigate_nmea();
+
+    map_canvas := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        clip: true;
+        background: #ffffff;
+
+        map_fli := Flickable {
+            viewport-x <=> root.map_viewport_x;
+            viewport-y <=> root.map_viewport_y;
+            viewport-width: root.map_viewport_width;
+            viewport-height: root.map_viewport_height;
+
+            for tile in root.map_tiles : Image {
+                x: tile.x;
+                y: tile.y;
+                width: tile.size;
+                height: tile.size;
+                source: tile.tile;
+                image-fit: fill;
+            }
+
+            // Live nearby-resources overlay (AOI/POI/Intermagnet analysis).
+            // Positioned in the same world-pixel space as the tiles/own pin
+            // above, so every pin stays visible and correctly placed at any
+            // zoom/pan, independent of which tiles happen to be loaded.
+            for pin[i] in root.nearby_pins : Rectangle {
+                width: 14px;
+                height: 14px;
+                x: pin.x - self.width / 2;
+                y: pin.y - self.height / 2;
+                border-radius: 7px;
+                border-width: 1px;
+                border-color: #ffffffaa;
+                background: pin.kind == 1 ? #ff3b30 : (pin.kind == 2 ? #ff9f0a : #0a84ff);
+
+                TouchArea {
+                    clicked => {
+                        root.nearby_detail_index = root.nearby_detail_index == i ? -1 : i;
+                    }
+                }
+            }
+
+            // Detail card for the tapped nearby pin (mirrors tapping a
+            // Device row on Profile to see its details), positioned just
+            // above the pin it belongs to.
+            if root.nearby_detail_index >= 0 && root.nearby_detail_index < root.nearby_pins.length : Rectangle {
+                width: 180px;
+                height: 58px;
+                x: root.nearby_pins[root.nearby_detail_index].x - self.width / 2;
+                y: root.nearby_pins[root.nearby_detail_index].y - self.height - 14px;
+                border-radius: 8px;
+                background: #0d1a2aee;
+                border-width: 1px;
+                border-color: #0a84ff44;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 2px;
+                    Text {
+                        text: root.nearby_pins[root.nearby_detail_index].label;
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        wrap: word-wrap;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.nearby_pins[root.nearby_detail_index].kind == 1
+                            ? "Area of Interest"
+                            : (root.nearby_pins[root.nearby_detail_index].kind == 2 ? "Magnetograph" : "Point of Interest");
+                        font-size: 10px;
+                        color: #8f96a3;
+                    }
+                }
+            }
+
+            if root.map_has_pin : Rectangle {
+                width: 52px;
+                height: 52px;
+                x: root.map_pin_world_x - self.width / 2;
+                y: root.map_pin_world_y - self.height / 2;
+                background: #00000000;
+
+                Rectangle {
+                    width: 52px;
+                    height: 52px;
+                    border-radius: 26px;
+                    background: #0a84ff15;
+                }
+                Rectangle {
+                    width: 42px;
+                    height: 42px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 21px;
+                    background: #0a84ff28;
+                }
+                Rectangle {
+                    width: 34px;
+                    height: 34px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 17px;
+                    background: #0a84ff40;
+                }
+                if root.auth_is_signed_in : Rectangle {
+                    width: 26px;
+                    height: 26px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 13px;
+                    background: #0a84ff;
+
+                    Text {
+                        text: root.avatar_text;
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if !root.auth_is_signed_in : Image {
+                    width: 26px;
+                    height: 26px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    source: @image-url("../../assets/macbook_pin.png");
+                    image-fit: contain;
+                }
+            }
+
+            // Coordinate label below pin
+            if root.map_has_pin : Rectangle {
+                width: 140px;
+                height: 20px;
+                x: root.map_pin_world_x - self.width / 2;
+                y: root.map_pin_world_y + 30px;
+                border-radius: 4px;
+                background: #000000aa;
+
+                Text {
+                    text: root.pin_lat_lon_short;
+                    font-size: 11px;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            flicked => {
+                root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+            }
+
+            wheel_zoom_area := TouchArea {
+                x: -map_fli.viewport-x;
+                y: -map_fli.viewport-y;
+                width: map_canvas.width;
+                height: map_canvas.height;
+
+                scroll-event(event) => {
+                    if (event.delta-y != 0px) {
+                        root.map_scroll_zoom(
+                            event.delta-y,
+                            map_fli.viewport-x,
+                            map_fli.viewport-y,
+                            map_canvas.width,
+                            map_canvas.height
+                        );
+                        accept
+                    } else {
+                        reject
+                    }
+                }
+            }
+        }
+
+        // Pinch-to-zoom overlay: lets the user zoom with touchpad
+        // pinch or touchscreen pinch gestures while preserving
+        // normal two-finger panning in Flickable.
+        ScaleRotateGestureHandler {
+            x: 0px;
+            y: 0px;
+            width: map_canvas.width;
+            height: map_canvas.height;
+            started => {
+                root.map_pinch_zoom_start();
+            }
+            updated => {
+                root.map_pinch_zoom_update(
+                    self.scale,
+                    self.center.x,
+                    self.center.y,
+                    map_fli.viewport-x,
+                    map_fli.viewport-y,
+                    map_canvas.width,
+                    map_canvas.height
+                );
+            }
+            ended => {
+                root.map_pinch_zoom_end();
+            }
+            cancelled => {
+                root.map_pinch_zoom_end();
+            }
+        }
+
+        if root.map_tiles.length == 0 : Text {
+            text: "Loading map tiles...";
+            color: #888888;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // Map control button group – top-right, dropped below the floating top
+        // bar (52px) so it clears the grid-menu and avatar buttons, leaving the
+        // same 10px gap used everywhere else.
+        Rectangle {
+            width: 46px;
+            height: 132px;
+            x: parent.width - self.width - 10px;
+            y: 52px;
+            border-radius: 12px;
+            background: #0d1a2acc;
+            border-width: 1px;
+            border-color: #0a84ff44;
+
+            // Zoom-in button
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                x: 3px;
+                y: 3px;
+                border-radius: 10px;
+                background: btn-plus-ta.pressed ? #0a84ff77 : btn-plus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "+";
+                    font-size: 26px;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                btn-plus-ta := TouchArea {
+                    clicked => {
+                        root.map_zoom_in(
+                            map_fli.viewport-x,
+                            map_fli.viewport-y,
+                            map_canvas.width,
+                            map_canvas.height
+                        );
+                    }
+                }
+            }
+
+            // Separator
+            Rectangle {
+                width: 28px;
+                height: 1px;
+                x: (parent.width - self.width) / 2;
+                y: 44px;
+                background: #0a84ff33;
+            }
+
+            // Zoom-out button
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                x: 3px;
+                y: 46px;
+                border-radius: 10px;
+                background: btn-minus-ta.pressed ? #0a84ff77 : btn-minus-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "\u{2212}";
+                    font-size: 26px;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                btn-minus-ta := TouchArea {
+                    clicked => {
+                        root.map_zoom_out(
+                            map_fli.viewport-x,
+                            map_fli.viewport-y,
+                            map_canvas.width,
+                            map_canvas.height
+                        );
+                    }
+                }
+            }
+
+            // Separator
+            Rectangle {
+                width: 28px;
+                height: 1px;
+                x: (parent.width - self.width) / 2;
+                y: 87px;
+                background: #0a84ff33;
+            }
+
+            // Center / locate button
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                x: 3px;
+                y: 89px;
+                border-radius: 10px;
+                background: btn-center-ta.pressed ? #0a84ff77 : btn-center-ta.has-hover ? #0a84ff44 : #0a84ff18;
+                animate background { duration: 120ms; }
+
+                // Crosshair ring
+                Rectangle {
+                    width: 16px;
+                    height: 16px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                    border-radius: 8px;
+                    background: #00000000;
+                }
+                // Center dot
+                Rectangle {
+                    width: 4px;
+                    height: 4px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 2px;
+                    background: #ffffff;
+                }
+                // Crosshair top
+                Rectangle {
+                    width: 2px;
+                    height: 5px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - 16px) / 2 - self.height;
+                    background: #ffffff;
+                }
+                // Crosshair bottom
+                Rectangle {
+                    width: 2px;
+                    height: 5px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height + 16px) / 2;
+                    background: #ffffff;
+                }
+                // Crosshair left
+                Rectangle {
+                    width: 5px;
+                    height: 2px;
+                    x: (parent.width - 16px) / 2 - self.width;
+                    y: (parent.height - self.height) / 2;
+                    background: #ffffff;
+                }
+                // Crosshair right
+                Rectangle {
+                    width: 5px;
+                    height: 2px;
+                    x: (parent.width + 16px) / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: #ffffff;
+                }
+
+                btn-center-ta := TouchArea {
+                    clicked => {
+                        root.center_map_on_pin(
+                            map_fli.viewport-x,
+                            map_fli.viewport-y,
+                            map_canvas.width,
+                            map_canvas.height
+                        );
+                    }
+                }
+            }
+        }
+
+        // NMEA status badge – bottom-left. Tappable: it's the place the user
+        // looks to see whether GPS is working, so it's also the most useful
+        // place to start fixing it from.
+        Rectangle {
+            width: 68px;
+            height: 28px;
+            x: 10px;
+            y: parent.height - self.height - 10px;
+            border-radius: 8px;
+            background: nmea_ta.pressed
+                ? #0a84ff55
+                : (nmea_ta.has-hover ? #0a84ff33 : #0d1a2acc);
+            border-width: 1px;
+            border-color: root.nmea_has_fix ? #22cc4466 : #ff444466;
+            animate background { duration: 120ms; }
+
+            Text {
+                text: "NMEA";
+                color: #8f96a3;
+                font-size: 9px;
+                x: 8px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.nmea_gps_running
+                    ? (root.nmea_has_fix ? "OK" : "..")
+                    : "--";
+                color: root.nmea_gps_running
+                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                    : #ff4444;
+                font-size: 11px;
+                font-weight: 700;
+                x: 42px;
+                vertical-alignment: center;
+            }
+
+            nmea_ta := TouchArea {
+                clicked => { root.navigate_nmea(); }
+            }
+        }
+
+        // Scale legend – bottom-right
+        Rectangle {
+            width: 148px;
+            height: 30px;
+            x: parent.width - self.width - 10px;
+            y: parent.height - self.height - 10px;
+            border-radius: 6px;
+            background: #0d1a2acc;
+            border-width: 1px;
+            border-color: #0a84ff44;
+
+            // Scale line
+            Rectangle {
+                width: root.scale_bar_width;
+                height: 2px;
+                x: (parent.width - self.width) / 2;
+                y: 6px;
+                background: #ffffff;
+            }
+            // Left tick
+            Rectangle {
+                width: 2px;
+                height: 8px;
+                x: (parent.width - root.scale_bar_width) / 2;
+                y: 3px;
+                background: #ffffff;
+            }
+            // Right tick
+            Rectangle {
+                width: 2px;
+                height: 8px;
+                x: (parent.width + root.scale_bar_width) / 2 - 1px;
+                y: 3px;
+                background: #ffffff;
+            }
+            // Scale label
+            Text {
+                text: root.scale_bar_text;
+                font-size: 11px;
+                color: #ffffff;
+                width: parent.width;
+                y: 12px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}

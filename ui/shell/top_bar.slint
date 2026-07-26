@@ -1,0 +1,219 @@
+import { HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+// A single row in the grid-menu popup opened from the top bar's grid icon.
+// Mirrors the destinations the old NavSidebar exposed, now reached via a
+// compact popup instead of a permanent rail: a slim top bar + full-bleed
+// content, closer to a simple web app than a native desktop shell.
+component NavMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback activated();
+
+    height: 36px;
+    border-radius: 6px;
+    background: root.active ? #0a84ff22 : (touch.has-hover ? #ffffff0d : transparent);
+    animate background { duration: 100ms; }
+
+    Text {
+        text: root.label;
+        x: 12px;
+        width: parent.width - 24px;
+        color: root.active ? #ffffff : #c7ccd6;
+        font-size: 13px;
+        font-weight: root.active ? 700 : 400;
+        vertical-alignment: center;
+        height: 100%;
+        overflow: elide;
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
+// Small 3x3 dot grid ("app launcher") icon. Slint has no built-in icon
+// font/library, so this is drawn directly out of small Rectangles.
+component GridIcon inherits VerticalBox {
+    padding: 0px;
+    spacing: 3px;
+    for row in 3 : HorizontalBox {
+        padding: 0px;
+        spacing: 3px;
+        for col in 3 : Rectangle {
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: #c7ccd6;
+        }
+    }
+}
+
+// Slim bar rendered directly below the native OS title bar / menu bar.
+//
+// Layout mirrors the reference web app's header: the branding (logo +
+// wordmark) is pinned left, and every action is grouped at the right edge —
+// the grid-menu button that opens a popup with every destination (replacing
+// the old permanent sidebar), then the account avatar.
+export component TopBar inherits Rectangle {
+    in property <bool> auth_is_signed_in: false;
+    in property <string> avatar_text: "?";
+    in property <int> active_screen: 0;
+
+    callback navigate_profile();
+    callback navigate_map();
+    callback navigate_stream();
+    callback navigate_media();
+    callback navigate_nmea();
+
+    // Draws the bar directly over the page content instead of above it, used by
+    // the full-bleed Device Map so the map runs edge to edge and the logo sits
+    // on the tiles. Drops the bar's own background and separator; the icon
+    // buttons gain their own backdrops so they stay legible over light tiles.
+    in property <bool> overlay: false;
+
+    // Inset applied on all four sides, shared with nav_popup so the popup lines
+    // up with the right edge of the action group instead of hardcoding a
+    // matching constant in two places. 10px matches the inset the map's own
+    // overlays use (NMEA badge, zoom/locate group, scale bar), so the floating
+    // bar sits on the same margin as everything else on the map.
+    property <length> content_inset: 10px;
+
+    // content_inset + 32px button + content_inset, so the buttons land exactly
+    // `content_inset` from the top edge.
+    height: 52px;
+    background: root.overlay ? transparent : #1f2127;
+
+    // Bottom hairline separator (solid bar only — over the map there is no
+    // edge to delineate).
+    if !root.overlay : Rectangle {
+        y: parent.height - 1px;
+        width: 100%;
+        height: 1px;
+        background: #3f4148;
+    }
+
+    HorizontalBox {
+        padding-left: root.content_inset;
+        padding-right: root.content_inset;
+        padding-top: root.content_inset;
+        padding-bottom: root.content_inset;
+        spacing: 0px;
+
+        // --- Branding (left): logo mark only, no wordmark. The app name is
+        // already shown by the OS (macOS derives the menu-bar title from the
+        // bundle info), so repeating it here is redundant chrome. ---
+        Image {
+            horizontal-stretch: 0;
+            // Same box as the action buttons so the logo's top edge lines up
+            // with theirs rather than being centred a few px lower.
+            width: 32px;
+            height: 32px;
+            source: @image-url("../../assets/logo.png");
+            image-fit: contain;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        // --- Actions (right), in the same order as the web header. ---
+        HorizontalBox {
+            horizontal-stretch: 0;
+            padding: 0px;
+            spacing: 4px;
+
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 6px;
+                // Over the map, match the translucent panel styling the map's
+                // own zoom/locate controls use.
+                background: root.overlay
+                    ? (menu_touch.has-hover ? #0a84ff33 : #0d1a2acc)
+                    : (menu_touch.has-hover ? #ffffff0d : transparent);
+                border-width: root.overlay ? 1px : 0px;
+                border-color: #0a84ff44;
+                animate background { duration: 100ms; }
+
+                GridIcon {
+                    width: 18px;
+                    height: 18px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+
+                menu_touch := TouchArea {
+                    clicked => { nav_popup.show(); }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                background: root.auth_is_signed_in ? #0a84ff33 : #3f4148;
+                border-width: 1px;
+                border-color: root.auth_is_signed_in ? #0a84ff : #55585f;
+
+                Text {
+                    text: root.avatar_text;
+                    font-size: 13px;
+                    font-weight: 700;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => { root.navigate_profile(); }
+                }
+            }
+        }
+    }
+
+    nav_popup := PopupWindow {
+        // Right-aligned with the action group and dropped just below the bar.
+        x: root.width - root.content_inset - self.width;
+        y: root.height;
+        width: 200px;
+
+        Rectangle {
+            background: #262931;
+            border-width: 1px;
+            border-color: #3f4148;
+            border-radius: 8px;
+
+            VerticalBox {
+                padding: 8px;
+                spacing: 2px;
+
+                NavMenuItem {
+                    label: "Device Map";
+                    active: root.active_screen == 0;
+                    activated => { root.navigate_map(); nav_popup.close(); }
+                }
+                NavMenuItem {
+                    label: "Live Stream";
+                    active: root.active_screen == 1;
+                    activated => { root.navigate_stream(); nav_popup.close(); }
+                }
+                NavMenuItem {
+                    label: "Media";
+                    active: root.active_screen == 2;
+                    activated => { root.navigate_media(); nav_popup.close(); }
+                }
+                NavMenuItem {
+                    label: "Phone GPS";
+                    active: root.active_screen == 3;
+                    activated => { root.navigate_nmea(); nav_popup.close(); }
+                }
+
+                Rectangle { height: 1px; background: #3f4148; }
+
+                NavMenuItem {
+                    label: "Profile";
+                    active: root.active_screen == 4;
+                    activated => { root.navigate_profile(); nav_popup.close(); }
+                }
+            }
+        }
+    }
+}

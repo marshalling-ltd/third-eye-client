@@ -6,6 +6,7 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **capture_defaults** | Option<[**models::CaptureDefaults**](CaptureDefaults.md)> |  | [optional]
 **connect_timeout_ms** | Option<**i32**> |  | [optional]
+**port** | Option<**i32**> | Optional override for the ROV's HTTP camera API port, when it isn't served on the default port 80. `None` means \"use the default\". | [optional]
 **request_timeout_ms** | Option<**i32**> |  | [optional]
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

@@ -11,8 +11,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 /// The UDP port the ROV broadcasts status packets on.
 pub const ROV_STATUS_UDP_PORT: u16 = 8500;
-const ROV_STATUS_PACKET_ID: u8 = 0x03;
-const ROV_STATUS_PACKET_TYPE: u8 = 0x01;
+/// Expected packet id in the status UDP header. Also used as the default
+/// `udp_status.packet_filter.expected_id` when building a device's
+/// configuration (see `main.rs::build_device_configuration`).
+pub const ROV_STATUS_PACKET_ID: u8 = 0x03;
+/// Expected packet type in the status UDP header. Also used as the default
+/// `udp_status.packet_filter.expected_type` when building a device's
+/// configuration (see `main.rs::build_device_configuration`).
+pub const ROV_STATUS_PACKET_TYPE: u8 = 0x01;
 const ROV_STATUS_PACKET_HEADER_SIZE: usize = 12;
 
 /// A single ROV status reading, decoded from a status UDP packet's JSON payload.

@@ -197,6 +197,20 @@ impl AuthClient {
         result
     }
 
+    /// Clears the locally-persisted session and cookie jar *without* contacting
+    /// the server. Used when the refresh token has already been rejected (see
+    /// `storage::api::ApiSession::refresh`), where a `logout` round-trip would
+    /// be pointless: the server has told us the cookie is no good, we just need
+    /// to stop pretending we're signed in.
+    pub fn clear_local_session(&self) {
+        if let Err(err) = clear_session(&self.db) {
+            eprintln!("third-eye-client: failed to clear local auth session: {err:#}");
+        }
+        if let Err(err) = self.jar.clear_all() {
+            eprintln!("third-eye-client: failed to clear persisted auth cookies: {err:#}");
+        }
+    }
+
     fn generated_configuration(
         &self,
         server_base: &str,

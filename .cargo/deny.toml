@@ -19,5 +19,16 @@ allow = [
     "Zlib"
 ]
 
+# `generated/` (crate name `openapi`) is our own OpenAPI-generated client for
+# third-eye-platform (not a third-party dependency); the generator always
+# emits an empty `license` field in its Cargo.toml, and that file is
+# overwritten on every `make open-api` run, so the license can't just be
+# hand-edited there. Clarify it here instead, matching the workspace's own
+# license, so cargo-deny doesn't flag it as unlicensed.
+[[licenses.clarify]]
+name = "openapi"
+expression = "GPL-3.0-only"
+license-files = []
+
 [advisories]
 ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0192", "RUSTSEC-2026-0195", "RUSTSEC-2026-0206"]

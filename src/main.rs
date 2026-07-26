@@ -53,11 +53,21 @@ use third_eye_client::network::{
     RecalibrateResult, detect_rov_interface, parse_host_from_http_base,
 };
 use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
-use third_eye_client::rov_status::{ROV_STATUS_UDP_PORT, Status as RovUdpStatus, UdpStatusState};
+use third_eye_client::rov_status::{
+    ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
+    UdpStatusState,
+};
 use third_eye_client::storage::AppStore;
+use third_eye_client::storage::api::ApiError;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
+use third_eye_client::storage::devices::DeviceSummary;
 use third_eye_client::storage::media::{
     CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, download_to_local,
+};
+use third_eye_client::storage::search::{DEFAULT_SEARCH_RADIUS_M, NearbyKind, NearbyResource};
+use third_eye_openapi::models::{
+    CaptureDefaults, ChasingM2SConfiguration, HttpConfig, NetworkConfig, PacketFilter, RtspConfig,
+    RtspCredentials, UdpStatusConfig,
 };
 
 const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
@@ -74,6 +84,14 @@ const GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases?per_page=30";
 const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
 const AUTO_UPDATE_CHECK_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+// How often the Device Map screen re-fetches nearby AOI/POI/Intermagnet
+// resources from the server while it stays open (see `maybe_start_nearby_fetch`).
+const NEARBY_REFRESH_INTERVAL_MS: i64 = 60_000;
+// How often a signed-in but idle app exercises its refresh cookie to keep the
+// session alive (see `maybe_keep_session_alive`). Well under any plausible
+// refresh-token lifetime, and cheap: it only performs a network round-trip when
+// the access token is actually due for renewal.
+const SESSION_KEEPALIVE_INTERVAL_MS: i64 = 15 * 60 * 1000;
 
 slint::include_modules!();
 
@@ -87,21 +105,25 @@ fn detect_running_build_info() -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
-    Configuration,
     Map,
     Stream,
     Media,
     Nmea,
+    /// Account + Devices + Settings (see `ui/pages/profile/profile_page.slint`).
+    /// RTSP/ROV/app configuration (formerly its own top-level screen) now
+    /// lives inside Profile's Settings tab, since it's no longer reachable
+    /// via a native menu bar.
+    Profile,
 }
 
 impl Screen {
     const fn index(self) -> i32 {
         match self {
-            Self::Configuration => 0,
-            Self::Map => 1,
-            Self::Stream => 2,
-            Self::Media => 3,
-            Self::Nmea => 4,
+            Self::Map => 0,
+            Self::Stream => 1,
+            Self::Media => 2,
+            Self::Nmea => 3,
+            Self::Profile => 4,
         }
     }
 }
@@ -406,6 +428,68 @@ impl MediaUiState {
     }
 }
 
+/// View-model backing the Devices screen (Phase 3 List+Detail page). Lives
+/// in `ThirdEyeState`.
+///
+/// Unlike `MediaUiState`/`UpdateUiState`, devices calls run synchronously on
+/// the UI thread inside their callback handlers (matching the existing
+/// `sign_in`/`sign_out` precedent in this file, which also block on the
+/// generated API's own internal Tokio runtime) rather than via a background
+/// thread + event channel, since they are short REST round-trips.
+struct DevicesUiState {
+    rows: Vec<DeviceSummary>,
+    status_text: String,
+    /// Which row is focused/shown in the detail pane (a UI-only concept).
+    selected_id: Option<String>,
+    /// Which device the user has picked as their *active* device: this is
+    /// what Device Map / Live Stream use, persisted in `devices_cache` (see
+    /// `storage::devices::DeviceCacheStore`) so it and the ROV connection
+    /// itself keep working offshore even with no internet access to the
+    /// third-eye server.
+    active_device_id: Option<String>,
+}
+
+impl DevicesUiState {
+    /// Hydrates from the local cache (not the network) so the Profile >
+    /// Devices screen and the active-device choice are available
+    /// immediately at startup, before (or without) any server refresh.
+    fn new(store: &AppStore) -> Self {
+        let rows = store.device_cache().list_cached().unwrap_or_else(|err| {
+            eprintln!("failed to load cached devices, starting empty: {err:#}");
+            Vec::new()
+        });
+        let active_device_id = store
+            .device_cache()
+            .selected()
+            .ok()
+            .flatten()
+            .map(|device| device.id);
+        let status_text = if rows.is_empty() {
+            "No devices loaded yet. Sign in and click \"Refresh\".".to_string()
+        } else {
+            format!("{} device(s) (cached locally).", rows.len())
+        };
+        Self {
+            rows,
+            status_text,
+            selected_id: None,
+            active_device_id,
+        }
+    }
+
+    fn selected(&self) -> Option<&DeviceSummary> {
+        let id = self.selected_id.as_deref()?;
+        self.rows.iter().find(|row| row.id == id)
+    }
+
+    /// The device currently marked active (used to label the Live Stream /
+    /// Device Map connection).
+    fn active(&self) -> Option<&DeviceSummary> {
+        let id = self.active_device_id.as_deref()?;
+        self.rows.iter().find(|row| row.id == id)
+    }
+}
+
 /// Messages sent from background worker threads back to the UI loop.
 enum MediaEvent {
     Download {
@@ -469,6 +553,84 @@ struct UpdateCheckResult {
     download_url: String,
 }
 
+/// View-model backing the Device Map screen's "nearby resources" overlay
+/// (AOI/POI/Intermagnet analysis pins pulled live from `/api/v1/search`).
+/// Session-only: never persisted to `AppStore`/SQLite, so it naturally
+/// resets whenever the app restarts.
+struct NearbyResourcesState {
+    items: Vec<NearbyResource>,
+    /// True while a background fetch is in flight (avoids piling up
+    /// overlapping requests if the server is slow to respond).
+    fetch_in_progress: bool,
+    /// Unix-ms deadline before which another fetch won't be started, even if
+    /// the user re-enters the Device Map screen (see `NEARBY_REFRESH_INTERVAL_MS`).
+    next_fetch_at_ms: i64,
+    /// Human-readable status shown in a small Device Map badge, so it's
+    /// visible from the running app (not just stderr) whether/why the
+    /// `/api/v1/search` call did or didn't fire (e.g. not signed in yet, no
+    /// location fix yet, in flight, last result, or last error).
+    status_text: String,
+    event_tx: mpsc::Sender<NearbyEvent>,
+    event_rx: mpsc::Receiver<NearbyEvent>,
+}
+
+impl NearbyResourcesState {
+    fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        Self {
+            items: Vec::new(),
+            fetch_in_progress: false,
+            next_fetch_at_ms: 0,
+            status_text: "Nearby: sign in to see AOI/POI/Magnetograph resources.".to_string(),
+            event_tx,
+            event_rx,
+        }
+    }
+}
+
+enum NearbyEvent {
+    Fetched {
+        /// Carries the real `ApiError` (rather than a pre-formatted string) so
+        /// the UI thread can tell a session-ending failure apart from a
+        /// transient/offline one - see `note_api_error`.
+        result: Result<Vec<NearbyResource>, ApiError>,
+    },
+}
+
+/// Keeps a signed-in session usable indefinitely while the app is simply left
+/// running. `ApiSession` already refreshes lazily on every server call, which
+/// covers an active user; this covers the idle case, where a server that rotates
+/// its refresh cookie would otherwise let the (un-exercised) cookie lapse and
+/// silently sign the user out. Session-only, like `NearbyResourcesState`.
+struct SessionKeepaliveState {
+    /// True while a background refresh is in flight.
+    in_progress: bool,
+    /// Unix-ms deadline before which no further keepalive runs.
+    next_check_at_ms: i64,
+    event_tx: mpsc::Sender<SessionEvent>,
+    event_rx: mpsc::Receiver<SessionEvent>,
+}
+
+impl SessionKeepaliveState {
+    fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        Self {
+            in_progress: false,
+            // Staggered rather than 0 so it doesn't pile onto the startup
+            // device refresh, which already exercises the session.
+            next_check_at_ms: 0,
+            event_tx,
+            event_rx,
+        }
+    }
+}
+
+enum SessionEvent {
+    /// `Ok` carries no payload: the refreshed token is persisted by
+    /// `AuthClient`, so only a failure is interesting to the UI.
+    Refreshed { result: Result<(), ApiError> },
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -486,6 +648,12 @@ struct GithubReleaseAsset {
 struct ThirdEyeState {
     active_screen: Screen,
     last_screen: Screen,
+    // Guards the one-time startup tile load kicked off from the timer loop
+    // in `fn main()`: true once we've invoked `navigate_map()` with
+    // `content_panel`'s real, laid-out size (needed because Device Map is
+    // the default screen and no explicit navigation click supplies that
+    // size at cold start).
+    map_initial_load_done: bool,
     suppress_next_map_flick: bool,
     /// Deadline (unix-ms) until which scroll/gesture (mouse-wheel, trackpad,
     /// touchscreen) zoom is "settling": further scroll/gesture zoom events are
@@ -514,6 +682,7 @@ struct ThirdEyeState {
     /// Human-readable current tile cache size (e.g. "42.3 MB").
     tile_cache_size_text: String,
     media: MediaUiState,
+    devices: DevicesUiState,
     /// Unix-ms timestamp of the last successful location fix.
     location_detected_at_ms: i64,
     /// Unix-ms timestamp when the user left the stream screen.
@@ -533,6 +702,12 @@ struct ThirdEyeState {
     rov_detected_interface: String,
     /// In-app updater state (GitHub release checks and download CTA).
     update: UpdateUiState,
+    /// Live "what's around you" overlay for Device Map (AOI/POI/Intermagnet
+    /// analysis pins pulled from `/api/v1/search`). Session-only.
+    nearby: NearbyResourcesState,
+    /// Background refresh-cookie keepalive, so an idle-but-signed-in app keeps
+    /// a usable session indefinitely.
+    session_keepalive: SessionKeepaliveState,
     /// Background startup location warmup (Windows only). A background thread
     /// calls the blocking GPS API and sends the result here; the timer loop
     /// picks it up and applies it without blocking the UI.
@@ -613,8 +788,12 @@ impl ThirdEyeState {
         let (recalibrate_tx, recalibrate_rx) = mpsc::channel();
 
         let mut state = Self {
-            active_screen: Screen::Configuration,
-            last_screen: Screen::Configuration,
+            // Device Map is the most useful "what's going on right now" view
+            // for an ROV operator, so it's the default screen on launch
+            // rather than Settings (now a tab inside Profile).
+            active_screen: Screen::Map,
+            last_screen: Screen::Map,
+            map_initial_load_done: false,
             suppress_next_map_flick: false,
             zoom_settle_until_ms: 0,
             pinch_start_zoom: None,
@@ -637,6 +816,7 @@ impl ThirdEyeState {
             running_build_info: detect_running_build_info(),
             tile_cache_size_text: String::new(),
             media,
+            devices: DevicesUiState::new(store),
             location_detected_at_ms: 0,
             stream_left_at_ms: 0,
             recalibrate_tx,
@@ -644,6 +824,8 @@ impl ThirdEyeState {
             recalibrate_in_progress: false,
             rov_detected_interface: String::new(),
             update: UpdateUiState::new(),
+            nearby: NearbyResourcesState::new(),
+            session_keepalive: SessionKeepaliveState::new(),
             #[cfg(target_os = "windows")]
             startup_location_rx: None,
         };
@@ -719,20 +901,24 @@ impl ThirdEyeState {
             .request_visible_tiles(self.map.zoom, &self.config.osm_tile_user_agent);
     }
 
-    fn set_map_visible_size(&mut self, width: f64, height: f64) {
+    /// Returns `true` if the visible size actually changed (and tiles were
+    /// re-requested / re-centered as a result); `false` if this was a no-op
+    /// (e.g. called repeatedly with the same size).
+    fn set_map_visible_size(&mut self, width: f64, height: f64) -> bool {
         let center_before_resize = self
             .map_tiles
             .center_lat_lon(self.map.zoom)
             .or(self.map.lat.zip(self.map.lon));
-        if self
+        let changed = self
             .map_tiles
-            .update_visible_size(width, height, self.map.zoom)
-        {
+            .update_visible_size(width, height, self.map.zoom);
+        if changed {
             if let Some((lat, lon)) = center_before_resize {
                 self.map_tiles.center_on_location(lat, lon, self.map.zoom);
             }
             self.request_visible_map_tiles();
         }
+        changed
     }
 
     fn set_map_viewport(&mut self, viewport_x: f64, viewport_y: f64) {
@@ -919,6 +1105,7 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_auth_status_text(state.auth.status_text.clone().into());
     ui.set_auth_signed_in_as(state.auth.signed_in_as.clone().into());
     ui.set_auth_is_signed_in(state.auth.is_signed_in);
+    ui.set_auth_avatar_text(auth_avatar_text(&state.auth).into());
     ui.set_attached_metadata_text(state.attached_metadata_text.clone().into());
     ui.set_running_build_info(state.running_build_info.clone().into());
     ui.set_use_saved_map_tiles(state.config.use_saved_map_tiles());
@@ -932,6 +1119,667 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     apply_map_runtime_to_ui(ui, state);
     apply_stream_and_rov_runtime_to_ui(ui, state);
     apply_media_runtime_to_ui(ui, state);
+    apply_devices_to_ui(ui, state);
+}
+
+/// Builds the `[DeviceRow]` model consumed by `ui/pages/devices/device_list.slint`.
+fn devices_row_model(state: &ThirdEyeState) -> ModelRc<DeviceRow> {
+    let selected_id = state.devices.selected_id.as_deref();
+    let rows: Vec<DeviceRow> = state
+        .devices
+        .rows
+        .iter()
+        .map(|device| DeviceRow {
+            id: device.id.clone().into(),
+            name: device.name.clone().into(),
+            category_text: device.category.clone().into(),
+            type_text: device.device_type.clone().into(),
+            created_at_text: device.created_at.clone().into(),
+            selected: selected_id == Some(device.id.as_str()),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn apply_devices_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
+    ui.set_device_rows(devices_row_model(state));
+    ui.set_devices_status(state.devices.status_text.clone().into());
+    ui.set_device_active_id(
+        state
+            .devices
+            .active_device_id
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    // Surfaced on the Live Stream page so the user can see (and, if unset,
+    // jump to Profile > Devices to pick) which device's configuration is
+    // driving the current connection.
+    ui.set_active_device_name(
+        state
+            .devices
+            .active()
+            .map(|device| device.name.clone())
+            .unwrap_or_default()
+            .into(),
+    );
+    if let Some(device) = state.devices.selected() {
+        let previously_selected_id = ui.get_device_selected_id().to_string();
+        ui.set_device_selected_id(device.id.clone().into());
+        ui.set_device_selected_category(device.category.clone().into());
+        ui.set_device_selected_type(device.device_type.clone().into());
+        ui.set_device_selected_created_text(device.created_at.clone().into());
+        ui.set_device_selected_updated_text(device.updated_at.clone().into());
+        // Only reset the editable name/configuration drafts when the
+        // selection actually changed, so an in-flight refresh doesn't
+        // clobber unsaved typing.
+        if previously_selected_id != device.id {
+            ui.set_device_name_draft(device.name.clone().into());
+            apply_device_config_draft_to_ui(
+                ui,
+                &DeviceConfigDraft::from_json(device.configuration.as_deref()),
+            );
+        }
+    } else {
+        ui.set_device_selected_id("".into());
+        ui.set_device_selected_category("".into());
+        ui.set_device_selected_type("".into());
+        ui.set_device_selected_created_text("".into());
+        ui.set_device_selected_updated_text("".into());
+        ui.set_device_name_draft("".into());
+        apply_device_config_draft_to_ui(ui, &DeviceConfigDraft::default());
+    }
+}
+
+/// Reflects an [`ApiError`] from any server call back into the auth UI state.
+/// Returns `true` if the session is genuinely over, so the caller can tailor
+/// its own status message.
+///
+/// Token acquisition and refresh now live entirely in `storage::api`
+/// ([`third_eye_client::storage::api::ApiSession`]), which every server call
+/// goes through: it proactively refreshes an access token at/near expiry and
+/// transparently refreshes + retries once when the server rejects one. So the
+/// only thing left for the UI to do is react to the two outcomes that mean the
+/// user is no longer signed in.
+///
+/// Crucially, a network/transport error (offline/offshore, or the server briefly
+/// unreachable) is *not* one of them: it leaves the session intact so the user's
+/// cached devices and active-device selection keep working with no internet.
+/// Only a rejected *refresh cookie* ends the session.
+fn note_api_error(state: &mut ThirdEyeState, error: &ApiError) -> bool {
+    if !error.ends_session() {
+        return false;
+    }
+    state.auth.is_signed_in = false;
+    state.auth.signed_in_as.clear();
+    state.auth.password.clear();
+    state.auth.status_text = match error {
+        ApiError::SessionExpired => "Your session has expired. Please sign in again.".to_string(),
+        _ => "Not signed in. Enter credentials to authenticate.".to_string(),
+    };
+    true
+}
+
+/// First letter of the signed-in email, uppercased, for the Profile avatar
+/// (Slint string expressions don't support case conversion/slicing, so this
+/// is precomputed here). Falls back to "?" when signed out or the email is
+/// empty.
+fn auth_avatar_text(auth: &AuthUiState) -> String {
+    auth.signed_in_as
+        .trim()
+        .chars()
+        .next()
+        .map_or_else(|| "?".to_string(), |c| c.to_uppercase().to_string())
+}
+
+/// `GET /api/v1/devices`, run synchronously (see `DevicesUiState` doc comment).
+/// Refreshes the local `devices_cache` on success so the device list and the
+/// active-device choice remain available offline/offshore afterwards.
+fn refresh_devices_blocking(state: &mut ThirdEyeState, store: &AppStore) {
+    if !store.api().has_session() {
+        state.devices.status_text = "Sign in first to load devices.".to_string();
+        return;
+    }
+    let server_base = state.config.server_base_url.trim().to_owned();
+    state.devices.status_text = "Loading devices...".to_string();
+    match store.devices().list(&server_base) {
+        Ok(rows) => {
+            if let Err(err) = store.device_cache().replace_all(&rows) {
+                eprintln!("failed to update local devices cache: {err:#}");
+            }
+            state.devices.status_text = format!("{} device(s) loaded.", rows.len());
+            // Re-read from the cache rather than trusting `rows` directly, so
+            // the locally-tracked active-device flag (preserved by
+            // `replace_all`) is reflected in `state.devices.rows`.
+            state.devices.rows = store.device_cache().list_cached().unwrap_or(rows);
+            state.devices.active_device_id = store
+                .device_cache()
+                .selected()
+                .ok()
+                .flatten()
+                .map(|device| device.id);
+            if let Some(selected) = state.devices.selected_id.clone()
+                && !state
+                    .devices
+                    .rows
+                    .iter()
+                    .any(|device| device.id == selected)
+            {
+                state.devices.selected_id = None;
+            }
+        }
+        Err(err) => {
+            state.devices.status_text = if note_api_error(state, &err) {
+                "Your session has expired. Sign in again to reload devices. Showing the last \
+                 cached list in the meantime."
+                    .to_string()
+            } else {
+                format!(
+                    "Failed to load devices from the server: {err}. Showing the last cached list \
+                     (offshore/offline-safe) instead."
+                )
+            };
+        }
+    }
+}
+
+/// Kicks off a background fetch of nearby AOI/POI/Intermagnet-analysis
+/// resources (for the Device Map screen's "what's around you" overlay) if
+/// none is already in flight, the user is signed in, and a current location
+/// is known. A no-op otherwise (e.g. signed out, or no GPS fix yet). Called
+/// once when entering Device Map and then polled every timer tick
+/// thereafter, so it naturally re-fires every `NEARBY_REFRESH_INTERVAL_MS`
+/// while the screen stays open (see `poll_nearby_events`).
+fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
+    if state.nearby.fetch_in_progress {
+        return;
+    }
+    let now_ms = current_unix_ms();
+    if now_ms < state.nearby.next_fetch_at_ms {
+        return;
+    }
+    let Some((lat, lon)) = state.map.lat.zip(state.map.lon) else {
+        state.nearby.status_text =
+            "Nearby: waiting for a location fix before searching.".to_string();
+        return;
+    };
+    // Deliberately the in-memory mirror rather than `store.api().has_session()`:
+    // this runs on every 16 ms timer tick, and `has_session` queries SQLite.
+    if !state.auth.is_signed_in {
+        state.nearby.status_text =
+            "Nearby: sign in to see AOI/POI/Magnetograph resources.".to_string();
+        return;
+    }
+    state.nearby.fetch_in_progress = true;
+    state.nearby.next_fetch_at_ms = now_ms.saturating_add(NEARBY_REFRESH_INTERVAL_MS);
+    state.nearby.status_text = "Nearby: searching...".to_string();
+    let server_base = state.config.server_base_url.trim().to_owned();
+    // The cloned `SearchClient` carries the shared `ApiSession`, so the
+    // background thread authenticates (and refreshes) itself - no token needs
+    // to be captured here.
+    let search_client = store.search().clone();
+    let tx = state.nearby.event_tx.clone();
+    thread::spawn(move || {
+        let result = search_client.nearby(&server_base, lat, lon, DEFAULT_SEARCH_RADIUS_M);
+        let _ = tx.send(NearbyEvent::Fetched { result });
+    });
+}
+
+/// Polls background nearby-resources fetch results and updates `state.nearby`
+/// accordingly. Returns `true` if the UI needs a refresh.
+fn poll_nearby_events(state: &mut ThirdEyeState) -> bool {
+    let mut changed = false;
+    while let Ok(NearbyEvent::Fetched { result }) = state.nearby.event_rx.try_recv() {
+        state.nearby.fetch_in_progress = false;
+        changed = true;
+        match result {
+            Ok(items) => {
+                state.nearby.status_text = format!("Nearby: {} resource(s).", items.len());
+                state.nearby.items = items;
+            }
+            Err(err) => {
+                eprintln!("failed to fetch nearby resources: {err}");
+                state.nearby.status_text = if note_api_error(state, &err) {
+                    "Nearby: session expired, sign in again.".to_string()
+                } else {
+                    format!("Nearby: search failed ({err}).")
+                };
+            }
+        }
+    }
+    changed
+}
+
+/// Kicks off a background refresh-cookie exercise if the user is signed in and
+/// the interval has elapsed. Runs on a worker thread (the refresh is a blocking
+/// HTTP round-trip) with only the `ApiSession` moved across, since `AppStore`
+/// itself is `Rc` and can't cross threads.
+///
+/// `ApiSession::access_token` is deliberately reused rather than forcing a
+/// refresh: it is already a no-op when the current token is comfortably fresh,
+/// so this costs nothing until a refresh is actually due.
+fn maybe_keep_session_alive(state: &mut ThirdEyeState, store: &AppStore) {
+    if state.session_keepalive.in_progress || !state.auth.is_signed_in {
+        return;
+    }
+    let now_ms = current_unix_ms();
+    if now_ms < state.session_keepalive.next_check_at_ms {
+        return;
+    }
+    state.session_keepalive.in_progress = true;
+    state.session_keepalive.next_check_at_ms = now_ms.saturating_add(SESSION_KEEPALIVE_INTERVAL_MS);
+    let server_base = state.config.server_base_url.trim().to_owned();
+    let api = store.api().clone();
+    let tx = state.session_keepalive.event_tx.clone();
+    thread::spawn(move || {
+        let result = api.access_token(&server_base).map(|_| ());
+        let _ = tx.send(SessionEvent::Refreshed { result });
+    });
+}
+
+/// Drains background keepalive results. Returns `true` if the UI needs a
+/// refresh, which only happens when the session actually ended - a failed
+/// keepalive due to being offline is expected and silently ignored, so the app
+/// keeps working offshore.
+fn poll_session_events(state: &mut ThirdEyeState) -> bool {
+    let mut changed = false;
+    while let Ok(SessionEvent::Refreshed { result }) = state.session_keepalive.event_rx.try_recv() {
+        state.session_keepalive.in_progress = false;
+        if let Err(err) = result
+            && note_api_error(state, &err)
+        {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Editable draft of a `ChasingM2SConfiguration` (the one device type this
+/// client creates), backing the Device Detail page's `device_cfg_*`
+/// properties. Kept as plain `String`s, matching every other LineEdit-backed
+/// field in this file; numeric fields are parsed on save/create (blank or
+/// invalid values are simply omitted, matching the server schema's
+/// all-optional fields).
+#[derive(Clone, Default)]
+struct DeviceConfigDraft {
+    host: String,
+    rtsp_username: String,
+    rtsp_password: String,
+    rtsp_transport: String,
+    rtsp_reconnect_backoff_ms: String,
+    // RTSP server port, e.g. 8554.
+    rtsp_port: String,
+    // Camera channel index (e.g. 0 = front camera).
+    rtsp_channel: String,
+    // Stream quality profile index (e.g. 0 = main, 1 = sub).
+    rtsp_profile: String,
+    udp_port: String,
+    udp_expected_id: String,
+    udp_expected_type: String,
+    http_connect_timeout_ms: String,
+    http_request_timeout_ms: String,
+    // Optional override for the ROV's HTTP camera API port. Blank means
+    // "use the default" (server-side `http.port: None`).
+    http_port: String,
+    capture_burst: String,
+    capture_format: String,
+}
+
+impl DeviceConfigDraft {
+    /// Seeds a new device's configuration draft from whatever is currently
+    /// set on the Configuration page, so it starts out pointing at the same
+    /// ROV the user is already talking to.
+    fn default_from_config(config: &AppConfig) -> Self {
+        let rtsp_url = Url::parse(config.rtsp_url.trim()).ok();
+        let (username, password) = rtsp_url
+            .as_ref()
+            .map(|url| {
+                let username = (!url.username().is_empty()).then(|| url.username().to_owned());
+                let password = url.password().map(str::to_owned);
+                (username, password)
+            })
+            .unwrap_or_default();
+        let rtsp_port = rtsp_url
+            .as_ref()
+            .and_then(reqwest::Url::port)
+            .map_or_else(|| "8554".to_string(), |port| port.to_string());
+        // Both are optional. Only populated when the current URL's path
+        // actually follows "/stream/{channel}/{profile}"; otherwise left blank
+        // so they're omitted from the payload rather than fabricated, since a
+        // stream need not have a channel/profile concept at all.
+        let (rtsp_channel, rtsp_profile) = rtsp_url
+            .as_ref()
+            .and_then(|url| {
+                let mut segments = url.path_segments()?;
+                if segments.next()? != "stream" {
+                    return None;
+                }
+                Some((segments.next()?.to_string(), segments.next()?.to_string()))
+            })
+            .unwrap_or_default();
+        let http_port = Url::parse(config.rov_http_base.trim())
+            .ok()
+            .and_then(|url| url.port())
+            .map_or_else(String::new, |port| port.to_string());
+        Self {
+            host: parse_host_from_http_base(&config.rov_http_base).unwrap_or_default(),
+            rtsp_username: username.unwrap_or_default(),
+            rtsp_password: password.unwrap_or_default(),
+            rtsp_transport: "tcp".to_string(),
+            rtsp_reconnect_backoff_ms: "1000".to_string(),
+            rtsp_port,
+            rtsp_channel,
+            rtsp_profile,
+            udp_port: config.rov_status_udp_port.trim().to_string(),
+            udp_expected_id: i32::from(ROV_STATUS_PACKET_ID).to_string(),
+            udp_expected_type: i32::from(ROV_STATUS_PACKET_TYPE).to_string(),
+            http_connect_timeout_ms: "5000".to_string(),
+            http_request_timeout_ms: "15000".to_string(),
+            http_port,
+            capture_burst: "1".to_string(),
+            capture_format: "JPEG".to_string(),
+        }
+    }
+
+    /// Parses an existing device's `configuration` JSON into an editable
+    /// draft. Falls back to blank/default fields for anything missing or
+    /// unparsable, so a partially-populated (or legacy) device is still
+    /// editable.
+    fn from_json(json: Option<&str>) -> Self {
+        let Some(configuration) =
+            json.and_then(|text| serde_json::from_str::<ChasingM2SConfiguration>(text).ok())
+        else {
+            return Self::default();
+        };
+        let host = configuration
+            .network
+            .as_deref()
+            .and_then(|n| n.host.clone())
+            .unwrap_or_default();
+        let (rtsp_username, rtsp_password) = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.credentials.as_deref())
+            .map(|c| {
+                (
+                    c.username.clone().unwrap_or_default(),
+                    c.password.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let rtsp_transport = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.transport.clone())
+            .unwrap_or_default();
+        let rtsp_reconnect_backoff_ms = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.reconnect_backoff_ms)
+            .map_or_else(String::new, |v| v.to_string());
+        let rtsp_port = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.port)
+            .map_or_else(String::new, |v| v.to_string());
+        let rtsp_channel = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.channel)
+            .map_or_else(String::new, |v| v.to_string());
+        let rtsp_profile = configuration
+            .rtsp
+            .as_deref()
+            .and_then(|r| r.profile)
+            .map_or_else(String::new, |v| v.to_string());
+        let udp_port = configuration
+            .udp_status
+            .as_deref()
+            .and_then(|u| u.port)
+            .map_or_else(String::new, |v| v.to_string());
+        let packet_filter = configuration
+            .udp_status
+            .as_deref()
+            .and_then(|u| u.packet_filter.as_deref());
+        let udp_expected_id = packet_filter
+            .and_then(|p| p.expected_id)
+            .map_or_else(String::new, |v| v.to_string());
+        let udp_expected_type = packet_filter
+            .and_then(|p| p.expected_type)
+            .map_or_else(String::new, |v| v.to_string());
+        let http_connect_timeout_ms = configuration
+            .http
+            .as_deref()
+            .and_then(|h| h.connect_timeout_ms)
+            .map_or_else(String::new, |v| v.to_string());
+        let http_request_timeout_ms = configuration
+            .http
+            .as_deref()
+            .and_then(|h| h.request_timeout_ms)
+            .map_or_else(String::new, |v| v.to_string());
+        let http_port = configuration
+            .http
+            .as_deref()
+            .and_then(|h| h.port)
+            .flatten()
+            .map_or_else(String::new, |v| v.to_string());
+        let capture_defaults = configuration
+            .http
+            .as_deref()
+            .and_then(|h| h.capture_defaults.as_deref());
+        let capture_burst = capture_defaults
+            .and_then(|c| c.burst)
+            .map_or_else(String::new, |v| v.to_string());
+        let capture_format = capture_defaults
+            .and_then(|c| c.format.clone())
+            .unwrap_or_default();
+        Self {
+            host,
+            rtsp_username,
+            rtsp_password,
+            rtsp_transport,
+            rtsp_reconnect_backoff_ms,
+            rtsp_port,
+            rtsp_channel,
+            rtsp_profile,
+            udp_port,
+            udp_expected_id,
+            udp_expected_type,
+            http_connect_timeout_ms,
+            http_request_timeout_ms,
+            http_port,
+            capture_burst,
+            capture_format,
+        }
+    }
+
+    /// Builds a `ChasingM2SConfiguration` JSON value from the draft's
+    /// string fields for sending to the server (device create/save).
+    fn to_value(&self) -> Option<serde_json::Value> {
+        let configuration = ChasingM2SConfiguration {
+            http: Some(Box::new(HttpConfig {
+                capture_defaults: Some(Box::new(CaptureDefaults {
+                    burst: self.capture_burst.trim().parse().ok(),
+                    format: (!self.capture_format.trim().is_empty())
+                        .then(|| self.capture_format.trim().to_string()),
+                })),
+                connect_timeout_ms: self.http_connect_timeout_ms.trim().parse().ok(),
+                request_timeout_ms: self.http_request_timeout_ms.trim().parse().ok(),
+                port: Some(self.http_port.trim().parse().ok()),
+            })),
+            network: Some(Box::new(NetworkConfig {
+                host: (!self.host.trim().is_empty()).then(|| self.host.trim().to_string()),
+            })),
+            rtsp: Some(Box::new(RtspConfig {
+                credentials: Some(Box::new(RtspCredentials {
+                    username: (!self.rtsp_username.trim().is_empty())
+                        .then(|| self.rtsp_username.trim().to_string()),
+                    password: (!self.rtsp_password.is_empty()).then(|| self.rtsp_password.clone()),
+                })),
+                reconnect_backoff_ms: self.rtsp_reconnect_backoff_ms.trim().parse().ok(),
+                transport: (!self.rtsp_transport.trim().is_empty())
+                    .then(|| self.rtsp_transport.trim().to_string()),
+                port: self.rtsp_port.trim().parse().ok(),
+                channel: self.rtsp_channel.trim().parse().ok(),
+                profile: self.rtsp_profile.trim().parse().ok(),
+            })),
+            schema_version: Some(1),
+            udp_status: Some(Box::new(UdpStatusConfig {
+                packet_filter: Some(Box::new(PacketFilter {
+                    expected_id: self.udp_expected_id.trim().parse().ok(),
+                    expected_type: self.udp_expected_type.trim().parse().ok(),
+                })),
+                port: self.udp_port.trim().parse().ok(),
+            })),
+        };
+        serde_json::to_value(configuration).ok()
+    }
+}
+
+/// Pushes a `DeviceConfigDraft`'s fields into the corresponding
+/// `device_cfg_*` properties on `AppWindow`.
+fn apply_device_config_draft_to_ui(ui: &AppWindow, draft: &DeviceConfigDraft) {
+    ui.set_device_cfg_host(draft.host.clone().into());
+    ui.set_device_cfg_rtsp_username(draft.rtsp_username.clone().into());
+    ui.set_device_cfg_rtsp_password(draft.rtsp_password.clone().into());
+    ui.set_device_cfg_rtsp_transport(draft.rtsp_transport.clone().into());
+    ui.set_device_cfg_rtsp_reconnect_backoff_ms(draft.rtsp_reconnect_backoff_ms.clone().into());
+    ui.set_device_cfg_rtsp_port(draft.rtsp_port.clone().into());
+    ui.set_device_cfg_rtsp_channel(draft.rtsp_channel.clone().into());
+    ui.set_device_cfg_rtsp_profile(draft.rtsp_profile.clone().into());
+    ui.set_device_cfg_udp_port(draft.udp_port.clone().into());
+    ui.set_device_cfg_udp_expected_id(draft.udp_expected_id.clone().into());
+    ui.set_device_cfg_udp_expected_type(draft.udp_expected_type.clone().into());
+    ui.set_device_cfg_http_connect_timeout_ms(draft.http_connect_timeout_ms.clone().into());
+    ui.set_device_cfg_http_request_timeout_ms(draft.http_request_timeout_ms.clone().into());
+    ui.set_device_cfg_http_port(draft.http_port.clone().into());
+    ui.set_device_cfg_capture_burst(draft.capture_burst.clone().into());
+    ui.set_device_cfg_capture_format(draft.capture_format.clone().into());
+}
+
+/// Reads the `device_cfg_*` properties back off `AppWindow` into a
+/// `DeviceConfigDraft`, for sending to the server on create/save.
+fn read_device_config_draft_from_ui(ui: &AppWindow) -> DeviceConfigDraft {
+    DeviceConfigDraft {
+        host: ui.get_device_cfg_host().to_string(),
+        rtsp_username: ui.get_device_cfg_rtsp_username().to_string(),
+        rtsp_password: ui.get_device_cfg_rtsp_password().to_string(),
+        rtsp_transport: ui.get_device_cfg_rtsp_transport().to_string(),
+        rtsp_reconnect_backoff_ms: ui.get_device_cfg_rtsp_reconnect_backoff_ms().to_string(),
+        rtsp_port: ui.get_device_cfg_rtsp_port().to_string(),
+        rtsp_channel: ui.get_device_cfg_rtsp_channel().to_string(),
+        rtsp_profile: ui.get_device_cfg_rtsp_profile().to_string(),
+        udp_port: ui.get_device_cfg_udp_port().to_string(),
+        udp_expected_id: ui.get_device_cfg_udp_expected_id().to_string(),
+        udp_expected_type: ui.get_device_cfg_udp_expected_type().to_string(),
+        http_connect_timeout_ms: ui.get_device_cfg_http_connect_timeout_ms().to_string(),
+        http_request_timeout_ms: ui.get_device_cfg_http_request_timeout_ms().to_string(),
+        http_port: ui.get_device_cfg_http_port().to_string(),
+        capture_burst: ui.get_device_cfg_capture_burst().to_string(),
+        capture_format: ui.get_device_cfg_capture_format().to_string(),
+    }
+}
+
+/// Best-effort: parses the active device's `configuration` JSON (a
+/// `ChasingM2SConfiguration`) and applies its `network.host`,
+/// `rtsp.credentials`/`port`/`channel`/`profile`, `http.port`, and
+/// `udp_status.port` to the client configuration (persisting the change),
+/// so Device Map / Live Stream connect using that device's own settings.
+/// Missing/malformed configuration is not an error — most devices won't
+/// have this populated yet.
+fn apply_device_configuration_to_client_config(
+    state: &mut ThirdEyeState,
+    store: &AppStore,
+    configuration_json: Option<&str>,
+) {
+    let Some(json) = configuration_json else {
+        return;
+    };
+    let Ok(configuration) = serde_json::from_str::<ChasingM2SConfiguration>(json) else {
+        return;
+    };
+    let mut changed = false;
+
+    let host = configuration
+        .network
+        .as_deref()
+        .and_then(|n| n.host.clone());
+    let (username, password) = configuration
+        .rtsp
+        .as_deref()
+        .and_then(|r| r.credentials.as_deref())
+        .map(|c| (c.username.clone(), c.password.clone()))
+        .unwrap_or_default();
+    let rtsp_port = configuration.rtsp.as_deref().and_then(|r| r.port);
+    let rtsp_channel = configuration.rtsp.as_deref().and_then(|r| r.channel);
+    let rtsp_profile = configuration.rtsp.as_deref().and_then(|r| r.profile);
+    let http_port = configuration.http.as_deref().and_then(|h| h.port).flatten();
+
+    if let Some(host) = host.as_deref() {
+        state.config.rov_http_base = match http_port {
+            Some(port) => format!("http://{host}:{port}"),
+            None => format!("http://{host}"),
+        };
+        changed = true;
+    } else if let Some(port) = http_port
+        && let Ok(mut url) = Url::parse(state.config.rov_http_base.trim())
+        && url.set_port(Some(port as u16)).is_ok()
+    {
+        state.config.rov_http_base = url.to_string();
+        changed = true;
+    }
+    if (host.is_some()
+        || username.is_some()
+        || password.is_some()
+        || rtsp_port.is_some()
+        || rtsp_channel.is_some()
+        || rtsp_profile.is_some())
+        && let Ok(mut url) = Url::parse(state.config.rtsp_url.trim())
+    {
+        let mut url_changed = false;
+        if let Some(host) = host.as_deref() {
+            url_changed |= url.set_host(Some(host)).is_ok();
+        }
+        if let Some(username) = username.as_deref() {
+            url_changed |= url.set_username(username).is_ok();
+        }
+        if password.is_some() {
+            url_changed |= url.set_password(password.as_deref()).is_ok();
+        }
+        if let Some(port) = rtsp_port {
+            url_changed |= url.set_port(Some(port as u16)).is_ok();
+        }
+        // Both optional: the path is only rebuilt when at least one is set.
+        // When neither is, the RTSP URL's own path is left untouched.
+        if rtsp_channel.is_some() || rtsp_profile.is_some() {
+            // Keep whichever of channel/profile isn't overridden at its
+            // current value (defaulting to 0 if the path didn't already
+            // follow this convention).
+            let mut segments = url.path_segments().into_iter().flatten();
+            let existing_channel = {
+                let _ = segments.next(); // "stream"
+                segments.next().and_then(|s| s.parse::<i32>().ok())
+            };
+            let existing_profile = segments.next().and_then(|s| s.parse::<i32>().ok());
+            let channel = rtsp_channel.or(existing_channel).unwrap_or(0);
+            let profile = rtsp_profile.or(existing_profile).unwrap_or(0);
+            url.set_path(&format!("/stream/{channel}/{profile}"));
+            url_changed = true;
+        }
+        if url_changed {
+            state.config.rtsp_url = url.to_string();
+            changed = true;
+        }
+    }
+
+    if let Some(port) = configuration.udp_status.as_deref().and_then(|u| u.port) {
+        state.config.rov_status_udp_port = port.to_string();
+        changed = true;
+    }
+
+    if changed {
+        persist_config(state, store);
+    }
 }
 
 fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
@@ -987,6 +1835,27 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
             .collect::<Vec<_>>(),
     );
     ui.set_map_tiles(ModelRc::new(tile_model));
+    let nearby_pin_model = VecModel::from(
+        state
+            .nearby
+            .items
+            .iter()
+            .map(|item| {
+                let (x, y) = lat_lon_to_world_px(item.lat, item.lon, state.map.zoom);
+                NearbyPin {
+                    x,
+                    y,
+                    label: item.name.clone().into(),
+                    kind: match item.kind {
+                        NearbyKind::Poi => 0,
+                        NearbyKind::Aoi => 1,
+                        NearbyKind::IntermagnetAnalysis => 2,
+                    },
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    ui.set_nearby_pins(ModelRc::new(nearby_pin_model));
     let scale_lat = state.map.lat.unwrap_or(45.0);
     let (bar_px, bar_text) = compute_scale_bar(state.map.zoom, scale_lat);
     ui.set_scale_bar_width(bar_px);
@@ -1335,6 +2204,102 @@ fn interface_has_rov_subnet_ipv4(interface: &str, rov_host: &str) -> bool {
                 (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask)
             })
     })
+}
+
+/// Starts (or restarts) the RTSP stream + telemetry listener using whatever
+/// is currently in `state.config`, and switches to the Live Stream screen.
+/// Shared by `navigate_stream` (Ctrl+2 / sidebar) and `go_live_with_device`
+/// (Profile > Devices "Go Live" action), which first points `state.config`
+/// at a specific device before calling this.
+fn navigate_to_stream(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppStore) {
+    // Note: location is NOT refreshed here via detect_location() because
+    // that call blocks the main thread (CoreLocation polling on macOS,
+    // Windows GPS warmup) from inside an ObjC/winit event handler, which
+    // causes panic_cannot_unwind. Location is kept up-to-date by:
+    //   • the background warmup timer (macOS CoreLocation / Windows GPS)
+    //   • NMEA GPS polling
+    //   • explicit "Detect Location" button clicks
+    // Use whatever location is already in state; the POS overlay will
+    // show "stale" or "—" if the fix is missing or outdated.
+
+    // Auto-detect ROV interface before starting stream.
+    refresh_rov_network(state, false);
+    persist_config(state, store);
+
+    // Always restart stream+telemetry: the underlying network may have
+    // changed (WiFi ↔ hotspot ↔ cable) even if the interface name didn't.
+    state.stream_left_at_ms = 0;
+    state.stream.stop();
+    state.rov_status.stop();
+    {
+        // Set up external route for ffmpeg now that we know the interface.
+        // Use the bindable interface if available; otherwise fall back to
+        // the raw detected interface (which may not have an IPv4 yet —
+        // ensure_rov_external_route will assign one via osascript).
+        let iface_for_route = state.config.rov_interface().map(str::to_owned).or_else(|| {
+            let d = state.rov_detected_interface.trim();
+            if d.is_empty() {
+                None
+            } else {
+                Some(d.to_owned())
+            }
+        });
+        if let Some(iface) = iface_for_route {
+            match ensure_rov_external_route(&state.config.rov_http_base, &iface) {
+                Ok(()) => {
+                    // IP was assigned by osascript; re-check binding eligibility.
+                    if let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base)
+                        && interface_has_rov_subnet_ipv4(&iface, &rov_host)
+                    {
+                        state.config.rov_network_interface.clone_from(&iface);
+                    }
+                }
+                Err(err) => {
+                    state.rov_info = format!(
+                        "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
+                    );
+                }
+            }
+        }
+        state.stream.stop();
+        let rtsp_url = state.config.rtsp_url.clone();
+        let rov_http_base = state.config.rov_http_base.clone();
+        let rov_interface = state.config.rov_interface().map(str::to_owned);
+        state.stream.status =
+            match state
+                .stream
+                .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
+            {
+                Ok(msg) => msg,
+                Err(err) => format!("Failed to start stream: {err:#}"),
+            };
+        ui.set_has_stream_image(false);
+    }
+
+    // Auto-start telemetry listener on 0.0.0.0.
+    if !state.rov_status.is_running() {
+        let port = state.config.parse_rov_status_udp_port();
+        match port {
+            Ok(port) => {
+                let bind_host = DEFAULT_ROV_UDP_BIND_HOST.to_owned();
+                let iface = state.config.rov_interface().map(str::to_owned);
+                if let Err(err) = state.rov_status.start(&bind_host, port, iface.as_deref()) {
+                    state
+                        .rov_status
+                        .set_status_text(format!("Failed to start UDP listener: {err:#}"));
+                }
+            }
+            Err(err) => {
+                state
+                    .rov_status
+                    .set_status_text(format!("Invalid telemetry UDP port: {err:#}"));
+            }
+        }
+    }
+
+    state.media.stop_media_stream();
+    state.active_screen = Screen::Stream;
+    state.last_screen = Screen::Stream;
 }
 
 fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
@@ -2034,22 +2999,265 @@ fn attach_capture_metadata_to_latest(
 
 fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: Rc<AppStore>) {
     let ui_weak = ui.as_weak();
-    let state_for_configuration = Rc::clone(&state);
-    let store_for_configuration = Rc::clone(&store);
-    ui.on_navigate_configuration(move || {
+    let state_for_navigate_profile = Rc::clone(&state);
+    let store_for_navigate_profile = Rc::clone(&store);
+    ui.on_navigate_profile(move || {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let Ok(mut state) = state_for_configuration.try_borrow_mut() else {
+        let Ok(mut state) = state_for_navigate_profile.try_borrow_mut() else {
             return;
         };
-        pull_configuration_from_ui(&ui, &mut state, &store_for_configuration);
+        pull_configuration_from_ui(&ui, &mut state, &store_for_navigate_profile);
         if state.last_screen == Screen::Stream {
             state.stream_left_at_ms = current_unix_ms();
         }
         state.media.stop_media_stream();
-        state.active_screen = Screen::Configuration;
-        state.last_screen = Screen::Configuration;
+        state.active_screen = Screen::Profile;
+        state.last_screen = Screen::Profile;
+        // Best-effort background-less refresh on first visit only; avoids a
+        // surprise network call (and error toast when offline/offshore)
+        // every time the user just wants to see the cached list.
+        if state.devices.rows.is_empty() {
+            refresh_devices_blocking(&mut state, &store_for_navigate_profile);
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_refresh_devices = Rc::clone(&state);
+    let store_for_refresh_devices = Rc::clone(&store);
+    ui.on_refresh_devices(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_refresh_devices.try_borrow_mut() else {
+            return;
+        };
+        refresh_devices_blocking(&mut state, &store_for_refresh_devices);
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_select_device = Rc::clone(&state);
+    ui.on_select_device(move |id| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_select_device.try_borrow_mut() else {
+            return;
+        };
+        let id = id.to_string();
+        let entering_new_device = id.is_empty();
+        state.devices.selected_id = Some(id);
+        apply_state_to_ui(&ui, &state);
+        if entering_new_device {
+            // Freshly entering "create new device" mode: seed the
+            // configuration fields from whatever's currently set on the
+            // Configuration page (apply_devices_to_ui above just blanked
+            // them via the "no selection" branch).
+            apply_device_config_draft_to_ui(
+                &ui,
+                &DeviceConfigDraft::default_from_config(&state.config),
+            );
+        }
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_create_device = Rc::clone(&state);
+    let store_for_create_device = Rc::clone(&store);
+    ui.on_create_device(move |name| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_create_device.try_borrow_mut() else {
+            return;
+        };
+        let name = name.to_string();
+        if name.trim().is_empty() {
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        pull_configuration_from_ui(&ui, &mut state, &store_for_create_device);
+        if !store_for_create_device.api().has_session() {
+            state.devices.status_text =
+                "Sign in first to create a device (requires internet access).".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        let server_base = state.config.server_base_url.trim().to_owned();
+        // Uses whatever the user has (possibly edited) in the Configuration
+        // section of the New Device form.
+        let device_configuration = read_device_config_draft_from_ui(&ui).to_value();
+        match store_for_create_device
+            .devices()
+            .create(&server_base, name, device_configuration)
+        {
+            Ok(created) => {
+                state.devices.status_text = format!("Created device \"{}\".", created.name);
+                if let Err(err) = store_for_create_device.device_cache().upsert(&created) {
+                    eprintln!("failed to cache newly created device: {err:#}");
+                }
+                state.devices.selected_id = Some(created.id.clone());
+                state.devices.rows.push(created);
+            }
+            Err(err) => {
+                let expired = note_api_error(&mut state, &err);
+                state.devices.status_text = if expired {
+                    "Your session has expired. Sign in again to create a device.".to_string()
+                } else {
+                    format!("Failed to create device: {err}")
+                };
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_save_device_name = Rc::clone(&state);
+    let store_for_save_device_name = Rc::clone(&store);
+    ui.on_save_device_name(move |id, name| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_save_device_name.try_borrow_mut() else {
+            return;
+        };
+        let id = id.to_string();
+        let name = name.to_string();
+        let Some(concurrency) = state
+            .devices
+            .rows
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| device.concurrency)
+        else {
+            apply_state_to_ui(&ui, &state);
+            return;
+        };
+        if !store_for_save_device_name.api().has_session() {
+            state.devices.status_text =
+                "Sign in first to rename a device (requires internet access).".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        let server_base = state.config.server_base_url.trim().to_owned();
+        let device_configuration = read_device_config_draft_from_ui(&ui).to_value();
+        match store_for_save_device_name.devices().update(
+            &server_base,
+            &id,
+            concurrency,
+            name,
+            device_configuration,
+        ) {
+            Ok(updated) => {
+                state.devices.status_text = format!("Saved device \"{}\".", updated.name);
+                if let Err(err) = store_for_save_device_name.device_cache().upsert(&updated) {
+                    eprintln!("failed to cache updated device: {err:#}");
+                }
+                if let Some(row) = state.devices.rows.iter_mut().find(|device| device.id == id) {
+                    *row = updated;
+                }
+            }
+            Err(err) => {
+                let expired = note_api_error(&mut state, &err);
+                state.devices.status_text = if expired {
+                    "Your session has expired. Sign in again to save this device.".to_string()
+                } else {
+                    format!("Failed to save device: {err}")
+                };
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_delete_device = Rc::clone(&state);
+    let store_for_delete_device = Rc::clone(&store);
+    ui.on_delete_device(move |id| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_delete_device.try_borrow_mut() else {
+            return;
+        };
+        let id = id.to_string();
+        if !store_for_delete_device.api().has_session() {
+            state.devices.status_text =
+                "Sign in first to delete a device (requires internet access).".to_string();
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        let server_base = state.config.server_base_url.trim().to_owned();
+        match store_for_delete_device.devices().delete(&server_base, &id) {
+            Ok(()) => {
+                state.devices.rows.retain(|device| device.id != id);
+                if let Err(err) = store_for_delete_device.device_cache().remove(&id) {
+                    eprintln!("failed to remove device from local cache: {err:#}");
+                }
+                if state.devices.selected_id.as_deref() == Some(id.as_str()) {
+                    state.devices.selected_id = None;
+                }
+                if state.devices.active_device_id.as_deref() == Some(id.as_str()) {
+                    state.devices.active_device_id = None;
+                }
+                state.devices.status_text = "Device deleted.".to_string();
+            }
+            Err(err) => {
+                let expired = note_api_error(&mut state, &err);
+                state.devices.status_text = if expired {
+                    "Your session has expired. Sign in again to delete this device.".to_string()
+                } else {
+                    format!("Failed to delete device: {err}")
+                };
+            }
+        }
+        apply_state_to_ui(&ui, &state);
+    });
+
+    let ui_weak = ui.as_weak();
+    let state_for_set_active_device = Rc::clone(&state);
+    let store_for_set_active_device = Rc::clone(&store);
+    ui.on_set_active_device(move |id| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_set_active_device.try_borrow_mut() else {
+            return;
+        };
+        let id = id.to_string();
+        // Purely local: works offshore with no internet access to the
+        // third-eye server. Only the (already offline-capable) ROV
+        // connection itself needs the local network.
+        match store_for_set_active_device.device_cache().set_selected(&id) {
+            Ok(()) => {
+                state.devices.active_device_id = Some(id.clone());
+                let configuration_json = state
+                    .devices
+                    .rows
+                    .iter()
+                    .find(|device| device.id == id)
+                    .and_then(|device| device.configuration.clone());
+                apply_device_configuration_to_client_config(
+                    &mut state,
+                    &store_for_set_active_device,
+                    configuration_json.as_deref(),
+                );
+                let device_name = state
+                    .devices
+                    .rows
+                    .iter()
+                    .find(|device| device.id == id)
+                    .map(|device| device.name.clone())
+                    .unwrap_or_default();
+                state.devices.status_text = format!(
+                    "\"{device_name}\" is now your active device for Device Map / Live Stream."
+                );
+            }
+            Err(err) => {
+                state.devices.status_text = format!("Failed to set active device: {err:#}");
+            }
+        }
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2378,6 +3586,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.map_tiles.fallback_zoom = None;
         state.auto_refresh_map_on_tab_enter();
         state.last_screen = Screen::Map;
+        maybe_start_nearby_fetch(&mut state, &store_for_map_navigation);
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2392,95 +3601,45 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_stream_navigation);
+        navigate_to_stream(&mut state, &ui, &store_for_stream_navigation);
+        apply_state_to_ui(&ui, &state);
+    });
 
-        // Note: location is NOT refreshed here via detect_location() because
-        // that call blocks the main thread (CoreLocation polling on macOS,
-        // Windows GPS warmup) from inside an ObjC/winit event handler, which
-        // causes panic_cannot_unwind. Location is kept up-to-date by:
-        //   • the background warmup timer (macOS CoreLocation / Windows GPS)
-        //   • NMEA GPS polling
-        //   • explicit "Detect Location" button clicks
-        // Use whatever location is already in state; the POS overlay will
-        // show "stale" or "—" if the fix is missing or outdated.
-
-        // Auto-detect ROV interface before starting stream.
-        refresh_rov_network(&mut state, false);
-        persist_config(&state, &store_for_stream_navigation);
-
-        // Always restart stream+telemetry: the underlying network may have
-        // changed (WiFi ↔ hotspot ↔ cable) even if the interface name didn't.
-        state.stream_left_at_ms = 0;
-        state.stream.stop();
-        state.rov_status.stop();
-        {
-            // Set up external route for ffmpeg now that we know the interface.
-            // Use the bindable interface if available; otherwise fall back to
-            // the raw detected interface (which may not have an IPv4 yet —
-            // ensure_rov_external_route will assign one via osascript).
-            let iface_for_route = state
-                .config
-                .rov_interface()
-                .map(str::to_owned)
-                .or_else(|| {
-                    let d = state.rov_detected_interface.trim();
-                    if d.is_empty() { None } else { Some(d.to_owned()) }
-                });
-            if let Some(iface) = iface_for_route {
-                match ensure_rov_external_route(&state.config.rov_http_base, &iface) {
-                    Ok(()) => {
-                        // IP was assigned by osascript; re-check binding eligibility.
-                        if let Some(rov_host) =
-                            parse_host_from_http_base(&state.config.rov_http_base)
-                            && interface_has_rov_subnet_ipv4(&iface, &rov_host) {
-                                state.config.rov_network_interface.clone_from(&iface);
-                            }
-                    }
-                    Err(err) => {
-                        state.rov_info = format!(
-                            "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
-                        );
-                    }
-                }
+    let ui_weak = ui.as_weak();
+    let state_for_go_live = Rc::clone(&state);
+    let store_for_go_live = Rc::clone(&store);
+    ui.on_go_live_with_device(move |id| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state_for_go_live.try_borrow_mut() else {
+            return;
+        };
+        let id = id.to_string();
+        pull_configuration_from_ui(&ui, &mut state, &store_for_go_live);
+        // Mark the picked device active (local-only, offshore-safe) and
+        // apply whatever RTSP/ROV HTTP settings its `configuration` blob
+        // carries, so "go live" connects with *this* device's own settings.
+        match store_for_go_live.device_cache().set_selected(&id) {
+            Ok(()) => {
+                state.devices.active_device_id = Some(id.clone());
+                let configuration_json = state
+                    .devices
+                    .rows
+                    .iter()
+                    .find(|device| device.id == id)
+                    .and_then(|device| device.configuration.clone());
+                apply_device_configuration_to_client_config(
+                    &mut state,
+                    &store_for_go_live,
+                    configuration_json.as_deref(),
+                );
             }
-            state.stream.stop();
-            let rtsp_url = state.config.rtsp_url.clone();
-            let rov_http_base = state.config.rov_http_base.clone();
-            let rov_interface = state.config.rov_interface().map(str::to_owned);
-            state.stream.status =
-                match state
-                    .stream
-                    .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
-                {
-                    Ok(msg) => msg,
-                    Err(err) => format!("Failed to start stream: {err:#}"),
-                };
-            ui.set_has_stream_image(false);
-        }
-
-        // Auto-start telemetry listener on 0.0.0.0.
-        if !state.rov_status.is_running() {
-            let port = state.config.parse_rov_status_udp_port();
-            match port {
-                Ok(port) => {
-                    let bind_host = DEFAULT_ROV_UDP_BIND_HOST.to_owned();
-                    let iface = state.config.rov_interface().map(str::to_owned);
-                    if let Err(err) = state.rov_status.start(&bind_host, port, iface.as_deref()) {
-                        state
-                            .rov_status
-                            .set_status_text(format!("Failed to start UDP listener: {err:#}"));
-                    }
-                }
-                Err(err) => {
-                    state
-                        .rov_status
-                        .set_status_text(format!("Invalid telemetry UDP port: {err:#}"));
-                }
+            Err(err) => {
+                eprintln!("failed to set active device before going live: {err:#}");
             }
         }
-
-        state.media.stop_media_stream();
-        state.active_screen = Screen::Stream;
-        state.last_screen = Screen::Stream;
+        navigate_to_stream(&mut state, &ui, &store_for_go_live);
         apply_state_to_ui(&ui, &state);
     });
 
@@ -2854,6 +4013,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 state.auth.status_text = "Signed in successfully.".to_string();
                 // Do NOT keep the plaintext password in the state or UI.
                 state.auth.password.clear();
+                // Immediately sync the device list from the server now that
+                // we have a valid session, and reset the nearby-search timer
+                // so the Device Map fetches fresh pins on the next tick.
+                refresh_devices_blocking(&mut state, &store_for_sign_in);
+                state.nearby.next_fetch_at_ms = 0;
             }
             Err(err) => {
                 state.auth.is_signed_in = false;
@@ -4808,6 +5972,18 @@ fn main() -> Result<()> {
         persist_config(&s, &store);
         s.start_update_check(false);
     }
+    // If a session was restored from a previous launch, proactively sync
+    // the device list from the server now (rather than only from the local
+    // cache) - this both keeps Profile > Devices current without the user
+    // having to click "Refresh" and, since `devices_access_token` refreshes
+    // an expired token first, confirms the restored session is actually
+    // still valid (surfacing an error via `devices.status_text` if not).
+    {
+        let mut s = state.borrow_mut();
+        if s.auth.is_signed_in {
+            refresh_devices_blocking(&mut s, &store);
+        }
+    }
 
     {
         let state = state.borrow();
@@ -4827,6 +6003,43 @@ fn main() -> Result<()> {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // Keep the map's tile-loading viewport size in sync with
+            // content_panel's actual, live-laid-out size whenever Device
+            // Map is showing. This runs on *every* tick rather than as a
+            // one-time kickoff: after `ui.window().set_maximized(true)`,
+            // the window's real size can settle asynchronously (e.g. a
+            // transient pre-maximize frame), so a one-shot snapshot can
+            // catch the wrong size and then never self-correct once the
+            // window reaches its final size (until the user manually
+            // resizes/flicks). `set_map_visible_size` is a cheap no-op
+            // once the size stabilizes (only re-centers/re-fetches tiles
+            // when the size actually changed), so polling it every 16 ms
+            // is safe. The very first time it runs, it also does the same
+            // "center on tab enter" work `on_navigate_map` normally does
+            // from an explicit sidebar/menu click.
+            if let Ok(mut state) = poll_state.try_borrow_mut()
+                && state.active_screen == Screen::Map
+            {
+                let width = f64::from(ui.get_content_panel_width());
+                let height = f64::from(ui.get_content_panel_height());
+                if width > 0.0 && height > 0.0 {
+                    let is_first_load = !state.map_initial_load_done;
+                    let size_changed = state.set_map_visible_size(width, height);
+                    if is_first_load {
+                        state.map_initial_load_done = true;
+                        state.map_tiles.fallback_zoom = None;
+                        state.auto_refresh_map_on_tab_enter();
+                    }
+                    if is_first_load || size_changed {
+                        apply_map_runtime_to_ui(&ui, &state);
+                    }
+                }
+                // Periodically re-fetch nearby AOI/POI/Intermagnet resources
+                // while Device Map stays open (no-op if signed out, no fix
+                // yet, or a fetch is already in flight - see the doc comment
+                // on `maybe_start_nearby_fetch`).
+                maybe_start_nearby_fetch(&mut state, &poll_store);
+            }
             let Ok(mut state) = poll_state.try_borrow_mut() else {
                 return;
             };
@@ -4945,7 +6158,16 @@ fn main() -> Result<()> {
             let auto_update_started = state.poll_auto_update_check();
             let media_changed = poll_media_events(&mut state, &poll_store);
             let update_changed = poll_update_events(&mut state);
-            if media_changed || update_changed || auto_update_started {
+            let nearby_changed = poll_nearby_events(&mut state);
+            // Keeps a signed-in session usable indefinitely even when the app
+            // sits idle; `session_changed` only flips when the session actually
+            // ended and the UI has to fall back to the sign-in form.
+            maybe_keep_session_alive(&mut state, &poll_store);
+            let session_changed = poll_session_events(&mut state);
+            if nearby_changed && state.active_screen == Screen::Map {
+                apply_map_runtime_to_ui(&ui, &state);
+            }
+            if media_changed || update_changed || auto_update_started || session_changed {
                 apply_state_to_ui(&ui, &state);
             }
         },

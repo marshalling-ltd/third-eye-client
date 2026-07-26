@@ -1,0 +1,332 @@
+import { HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+// Full-bleed live stream screen (RTSP video + compact telemetry overlay).
+//
+// Extracted verbatim from the original monolithic app.slint (Phase 2 of the
+// native desktop UI/UX blueprint). Every property/callback below already
+// existed on `AppWindow`; `../app.slint` forwards them 1:1 into this
+// component, so no Rust-side changes were needed for this move.
+export component StreamPage inherits Rectangle {
+    in property <image> stream_image;
+    in property <bool> has_stream_image: false;
+    in property <bool> stream_is_active: false;
+    in property <bool> has_rov_status: false;
+    in property <bool> rov_listener_running: false;
+    in property <bool> nmea_gps_running: false;
+    in property <bool> nmea_has_fix: false;
+    in property <string> rov_depth_short;
+    in property <string> rov_temp_short;
+    in property <string> rov_heading_short;
+    in property <string> rov_attitude_short;
+    in property <string> rov_coords_short;
+    in property <string> rov_battery_short;
+    // Name of the device whose configuration this stream connects with (see
+    // storage::devices::DeviceCacheStore). Empty when no device has been
+    // picked as active yet (Profile > Devices > "Use as Active Device").
+    in property <string> active_device_name;
+
+    callback capture_photo();
+    callback navigate_profile();
+    // Re-runs ROV network auto-detection + OS route setup (same background
+    // flow as Configuration's "Recalibrate ROV network" button). Exposed
+    // here too since a bad route is most visible — and most useful to fix —
+    // right on the stream itself.
+    callback recalibrate_rov_network();
+
+    background: #000000;
+    clip: true;
+
+    // Full-bleed video
+    if root.has_stream_image : Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.stream_image;
+        image-fit: contain;
+    }
+    if !root.has_stream_image : Text {
+        text: "No stream active. Press \u{25b6} Start to begin.";
+        color: #555555;
+        font-size: 18px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // Top-left: active-device indicator. Clicking it when no device is set
+    // jumps to Profile > Devices so the user can pick one.
+    Rectangle {
+        width: 220px;
+        height: 32px;
+        x: 10px;
+        y: 10px;
+        border-radius: 8px;
+        background: #0d1a2acc;
+        border-width: 1px;
+        border-color: root.active_device_name == "" ? #ffaa0066 : #22cc4466;
+
+        HorizontalBox {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 6px;
+            Text {
+                text: "DEVICE";
+                color: #8f96a3;
+                font-size: 9px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                horizontal-stretch: 1;
+                text: root.active_device_name == ""
+                    ? "None selected \u{2014} tap to choose"
+                    : root.active_device_name;
+                color: root.active_device_name == "" ? #ffaa00 : #ffffff;
+                font-size: 12px;
+                font-weight: 700;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        device_badge_ta := TouchArea {
+            clicked => {
+                if (root.active_device_name == "") {
+                    root.navigate_profile();
+                }
+            }
+        }
+    }
+
+    // Recalibrate button: sits just below the device badge so it's within
+    // reach without covering the video. Fire-and-forget, matching the
+    // Configuration page's button (no in-progress state shown there either).
+    Rectangle {
+        width: 220px;
+        height: 26px;
+        x: 10px;
+        y: 46px;
+        border-radius: 8px;
+        background: recalibrate-ta.pressed ? #0a84ff55 : recalibrate-ta.has-hover ? #0a84ff33 : #0d1a2acc;
+        border-width: 1px;
+        border-color: #0a84ff44;
+        animate background { duration: 120ms; }
+
+        Text {
+            text: "\u{21bb} Recalibrate ROV Network";
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        recalibrate-ta := TouchArea {
+            clicked => { root.recalibrate_rov_network(); }
+        }
+    }
+
+    // Top-right: compact status indicators
+    Rectangle {
+        width: 130px;
+        height: 60px;
+        x: parent.width - self.width - 10px;
+        y: 10px;
+        border-radius: 12px;
+        background: #0d1a2acc;
+        border-width: 1px;
+        border-color: #0a84ff44;
+
+        VerticalBox {
+            padding: 8px;
+            spacing: 3px;
+            Text {
+                text: "STREAM";
+                color: root.stream_is_active
+                    ? (root.has_stream_image ? #22cc44 : #ffaa00)
+                    : #ff4444;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            Text {
+                text: "DATA";
+                color: root.has_rov_status
+                    ? #22cc44
+                    : (root.rov_listener_running ? #ffaa00 : #ff4444);
+                font-size: 12px;
+                font-weight: 700;
+            }
+            Text {
+                text: "GPS";
+                color: root.nmea_gps_running
+                    ? (root.nmea_has_fix ? #22cc44 : #ffaa00)
+                    : #ff4444;
+                font-size: 12px;
+                font-weight: 700;
+            }
+        }
+    }
+
+    // Right: capture photo button (camera icon)
+    Rectangle {
+        width: 56px;
+        height: 48px;
+        x: parent.width - self.width - 16px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 10px;
+        background: btn-capture-ta.pressed ? #0a84ffcc : btn-capture-ta.has-hover ? #0a84ff88 : #0d1a2acc;
+        border-width: 1px;
+        border-color: #0a84ff44;
+        animate background { duration: 120ms; }
+
+        // Camera body
+        Rectangle {
+            width: 36px;
+            height: 26px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2 + 2px;
+            border-radius: 4px;
+            border-width: 2px;
+            border-color: #ffffffcc;
+            background: #00000000;
+        }
+        // Lens circle
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2 + 2px;
+            border-radius: 7px;
+            border-width: 2px;
+            border-color: #ffffffcc;
+            background: #00000000;
+        }
+        // Viewfinder bump
+        Rectangle {
+            width: 14px;
+            height: 6px;
+            x: (parent.width - self.width) / 2 + 2px;
+            y: (parent.height - self.height) / 2 - 4px;
+            border-radius: 2px;
+            background: #ffffffcc;
+        }
+        // Flash dot
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            x: (parent.width - self.width) / 2 + 26px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 2px;
+            background: #ffffffaa;
+        }
+        btn-capture-ta := TouchArea {
+            clicked => {
+                root.capture_photo();
+            }
+        }
+    }
+
+    // Bottom: ROV telemetry overlay bar
+    if root.has_rov_status : Rectangle {
+        width: parent.width;
+        height: 80px;
+        y: parent.height - self.height;
+        background: #0d1a2add;
+
+        HorizontalBox {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 24px;
+
+            // Depth
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "DEPTH";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_depth_short;
+                    color: #ffffff;
+                    font-size: 22px;
+                }
+            }
+
+            // Temperature
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "TEMP";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_temp_short;
+                    color: #aaccff;
+                    font-size: 22px;
+                }
+            }
+
+            // Heading
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "HDG";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_heading_short;
+                    color: #ffffff;
+                    font-size: 22px;
+                }
+            }
+
+            // Attitude
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "ATT";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_attitude_short;
+                    color: #ffffff;
+                    font-size: 16px;
+                }
+            }
+
+            // Coordinates
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "POS";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_coords_short;
+                    color: #ffffff;
+                    font-size: 16px;
+                }
+            }
+
+            // Battery
+            VerticalBox {
+                spacing: 2px;
+                Text {
+                    text: "BAT";
+                    color: #8f96a3;
+                    font-size: 10px;
+                }
+                Text {
+                    text: root.rov_battery_short;
+                    color: #ffffff;
+                    font-size: 16px;
+                }
+            }
+        }
+    }
+}

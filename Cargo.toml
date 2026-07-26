@@ -15,7 +15,7 @@ path = "src/bin/test_udp_server.rs"
 required-features = ["test-tools"]
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 base64 = "0.22"
 cookie = "0.18"
 directories = "6"
@@ -26,8 +26,8 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies", "json", "rustls", "query"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11"
 slint = { version = "1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
 serialport = "4"
@@ -36,7 +36,7 @@ third-eye-openapi = { package = "openapi", path = "generated" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 if-addrs = "0.15"
-webbrowser = "1.2.1"
+webbrowser = "1.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }
