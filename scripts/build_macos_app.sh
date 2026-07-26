@@ -7,7 +7,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Third Eye Client"
+APP_NAME="Third Eye"
 BUNDLE_NAME="${APP_NAME}.app"
 EXECUTABLE_NAME="third-eye-client"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"

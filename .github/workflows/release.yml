@@ -41,7 +41,7 @@ jobs:
 
       - name: Assemble .app bundle
         run: |
-          APP="staging/Third Eye Client.app"
+          APP="staging/Third Eye.app"
           mkdir -p "$APP/Contents/MacOS/bin"
           mkdir -p "$APP/Contents/Resources"
           cp target/third-eye-client-universal "$APP/Contents/MacOS/third-eye-client"
@@ -81,7 +81,7 @@ jobs:
           hdiutil create \
             -size "${SIZE_MB}m" \
             -fs HFS+ \
-            -volname "Third Eye Client" \
+            -volname "Third Eye" \
             -srcfolder staging \
             -ov -format UDZO \
             "Third.Eye.Client.macos-universal.dmg"
@@ -199,7 +199,7 @@ jobs:
           cat > appdir/third-eye-client.desktop << 'EOF'
           [Desktop Entry]
           Type=Application
-          Name=Third Eye Client
+          Name=Third Eye
           Exec=third-eye-client
           Icon=logo
           Categories=Utility;

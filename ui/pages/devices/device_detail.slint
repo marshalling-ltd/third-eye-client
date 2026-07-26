@@ -1,0 +1,270 @@
+import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+// Dedicated create/edit page for a single device. Selecting a row, or
+// "+ Add Device", in DeviceListPage navigates here instead of showing an
+// inline side panel — this page gets the full width to itself, mirroring
+// the Configuration page's plain vertical-form layout.
+export component DeviceDetailPage inherits VerticalBox {
+    // True when creating a brand new device; false when editing an
+    // existing one (in which case device_id/category/type/... are set).
+    in property <bool> is_new: false;
+    in property <string> device_id;
+    in property <string> device_category;
+    in property <string> device_type;
+    in property <string> device_created_text;
+    in property <string> device_updated_text;
+    in property <bool> device_active: false;
+    in property <bool> device_action_in_progress: false;
+    // Current value of the name field. Owned by the parent (ProfilePage),
+    // which routes it to either the "new device" draft or the selected
+    // device's draft depending on `is_new`.
+    in property <string> name_draft;
+
+    // Editable ChasingM2SConfiguration draft, flattened into individual
+    // string fields (see storage/DeviceConfigDraft in main.rs). Applies in
+    // both create and edit modes: a new device's configuration is seeded
+    // from these same fields, and "Create Device" / "Save" send them along
+    // with the name.
+    in-out property <string> cfg_host;
+    in-out property <string> cfg_rtsp_username;
+    in-out property <string> cfg_rtsp_password;
+    in-out property <string> cfg_rtsp_transport;
+    in-out property <string> cfg_rtsp_reconnect_backoff_ms;
+    in-out property <string> cfg_rtsp_port;
+    in-out property <string> cfg_rtsp_channel;
+    in-out property <string> cfg_rtsp_profile;
+    in-out property <string> cfg_udp_port;
+    in-out property <string> cfg_udp_expected_id;
+    in-out property <string> cfg_udp_expected_type;
+    in-out property <string> cfg_http_connect_timeout_ms;
+    in-out property <string> cfg_http_request_timeout_ms;
+    in-out property <string> cfg_http_port;
+    in-out property <string> cfg_capture_burst;
+    in-out property <string> cfg_capture_format;
+
+    callback back();
+    callback name_changed(string);
+    callback create(string);
+    callback save(string, string);
+    callback delete(string);
+    callback set_active(string);
+    callback go_live(string);
+
+    padding: 14px;
+    spacing: 10px;
+
+    HorizontalBox {
+        vertical-stretch: 0;
+        Button {
+            horizontal-stretch: 0;
+            text: "\u{2190} Back to Devices";
+            clicked => { root.back(); }
+        }
+    }
+
+    ScrollView {
+        vertical-stretch: 1;
+        viewport-width: self.visible-width;
+
+        VerticalBox {
+            padding: 4px;
+            spacing: 10px;
+
+            Text {
+                text: root.is_new ? "New Device" : "Device Details";
+                font-size: 24px;
+            }
+
+            Text { text: "Name:"; color: #8f96a3; font-size: 12px; }
+            LineEdit {
+                text: root.name_draft;
+                placeholder-text: "e.g. Lumbarda";
+                edited(text) => { root.name_changed(text); }
+            }
+
+            if !root.is_new : Rectangle { height: 1px; background: #3f4148; }
+            if !root.is_new : Text { text: "Category: " + root.device_category; color: #c7ccd6; }
+            if !root.is_new : Text { text: "Type: " + root.device_type; color: #c7ccd6; }
+            if !root.is_new : Text { text: "Created: " + root.device_created_text; color: #8f96a3; font-size: 11px; }
+            if !root.is_new : Text { text: "Updated: " + root.device_updated_text; color: #8f96a3; font-size: 11px; }
+
+            Rectangle { height: 1px; background: #3f4148; }
+            Text { text: "Configuration (ChasingM2S)"; font-size: 18px; }
+            Text {
+                text: "Used for RTSP/ROV HTTP/telemetry when this device is active. Persisted to the server and cached locally so it keeps working offshore.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 2;
+                    spacing: 2px;
+                    Text { text: "ROV host/IP (network.host):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_host; placeholder-text: "e.g. 192.168.1.88"; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "HTTP API port (optional):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_http_port; placeholder-text: "default: 80"; }
+                }
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "RTSP username:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_username; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "RTSP password:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_password; input-type: password; }
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "RTSP port:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_port; placeholder-text: "8554"; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "RTSP transport (tcp/udp):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_transport; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "RTSP reconnect backoff (ms):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_reconnect_backoff_ms; }
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Camera channel (optional):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_channel; placeholder-text: "optional"; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Stream profile (optional, 0=main, 1=sub):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_rtsp_profile; placeholder-text: "optional"; }
+                }
+            }
+            Text {
+                text: "When set, the RTSP path is built as \"/stream/{channel}/{profile}\". Leave blank to use the RTSP URL's path unchanged.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Telemetry UDP port:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_udp_port; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "UDP expected packet id:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_udp_expected_id; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "UDP expected packet type:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_udp_expected_type; }
+                }
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "HTTP connect timeout (ms):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_http_connect_timeout_ms; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "HTTP request timeout (ms):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_http_request_timeout_ms; }
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Capture burst count:"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_capture_burst; }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Capture format (JPEG/PNG):"; color: #8f96a3; font-size: 12px; }
+                    LineEdit { text <=> root.cfg_capture_format; }
+                }
+            }
+
+            Rectangle { height: 1px; background: #3f4148; }
+
+            if root.is_new : Button {
+                text: "Create Device";
+                primary: true;
+                enabled: !root.device_action_in_progress && root.name_draft != "";
+                clicked => { root.create(root.name_draft); }
+            }
+
+            if !root.is_new : Button {
+                text: "Save";
+                enabled: !root.device_action_in_progress && root.name_draft != "";
+                clicked => { root.save(root.device_id, root.name_draft); }
+            }
+
+            if !root.is_new && root.device_active : Text {
+                text: "\u{2713} This is your active device. Its cached RTSP/ROV settings are used by Device Map and Live Stream, including offshore with no internet access.";
+                wrap: word-wrap;
+                color: #22cc44;
+                font-size: 11px;
+            }
+            if !root.is_new && !root.device_active : Button {
+                text: "Use as Active Device";
+                enabled: !root.device_action_in_progress;
+                clicked => { root.set_active(root.device_id); }
+            }
+            if !root.is_new : Button {
+                text: "\u{25b6} Go Live";
+                primary: true;
+                enabled: !root.device_action_in_progress;
+                clicked => { root.go_live(root.device_id); }
+            }
+
+            if !root.is_new : Rectangle { height: 1px; background: #3f4148; }
+            if !root.is_new : Button {
+                text: "Delete Device";
+                enabled: !root.device_action_in_progress;
+                clicked => { root.delete(root.device_id); }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}

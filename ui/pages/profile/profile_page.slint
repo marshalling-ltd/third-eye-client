@@ -1,0 +1,482 @@
+import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { DeviceRow, DeviceListPage } from "../devices/device_list.slint";
+import { DeviceDetailPage } from "../devices/device_detail.slint";
+
+// A single tab in the Devices / Settings segmented control below the
+// account header. Mirrors the pill-style selector already used for the
+// GPS protocol / connection-mode pickers on the Phone GPS page.
+component ProfileTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback activated();
+
+    horizontal-stretch: 1;
+    height: 36px;
+    border-radius: 6px;
+    border-width: root.active ? 2px : 1px;
+    border-color: root.active ? #0a84ff : #3f4148;
+    background: root.active ? #0a84ff18 : (touch.has-hover ? #ffffff0d : #1a1c22);
+    animate background { duration: 100ms; }
+
+    Text {
+        text: root.label;
+        font-size: 13px;
+        font-weight: root.active ? 700 : 400;
+        color: root.active ? #ffffff : #8f96a3;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
+// A labeled input row: small muted label above a LineEdit, matching the
+// style already established in device_detail.slint.
+component SettingsField inherits VerticalBox {
+    in property <string> label;
+    in property <string> placeholder;
+    in-out property <string> value;
+    horizontal-stretch: 1;
+    spacing: 2px;
+    Text { text: root.label; color: #8f96a3; font-size: 12px; }
+    LineEdit {
+        text <=> root.value;
+        placeholder-text: root.placeholder;
+    }
+}
+
+// Section heading used throughout the Settings tab: a divider followed by
+// a title, matching the visual rhythm of device_detail.slint's sections.
+component SettingsSectionHeader inherits VerticalBox {
+    in property <string> title;
+    spacing: 8px;
+    Rectangle { height: 1px; background: #3f4148; }
+    Text { text: root.title; font-size: 16px; font-weight: 700; }
+}
+
+// Profile page: account header (avatar + sign in/out), a Devices / Settings
+// tab toggle, and either the Devices List+Detail flow or the app's
+// RTSP/ROV/update Settings (formerly a standalone top-level Configuration
+// screen, folded in here since there's no native menu bar to reach it from
+// anymore). Devices and Settings intentionally live under Profile rather
+// than as their own top-level workspace sections, since they're per-account
+// / per-install resources rather than workspace views like Map/Stream/Media.
+export component ProfilePage inherits VerticalBox {
+    // --- Account ---
+    in property <bool> auth_is_signed_in: false;
+    in property <string> auth_signed_in_as;
+    in property <string> auth_status_text;
+    // Precomputed on the Rust side (e.g. first letter of the signed-in
+    // email, uppercased, or a generic placeholder) since Slint's string
+    // expressions don't support case conversion / slicing.
+    in property <string> auth_avatar_text: "?";
+    in-out property <string> auth_email;
+    in-out property <string> auth_password;
+
+    callback sign_in();
+    callback sign_out();
+
+    // --- Settings tab (formerly the standalone Configuration screen). ---
+    in-out property <string> rtsp_url;
+    in-out property <string> rov_http_base;
+    in-out property <string> rov_status_udp_port;
+    in-out property <string> osm_tile_user_agent;
+    in-out property <bool> use_saved_map_tiles: false;
+    in-out property <string> max_tile_storage_mb: "1024";
+    in property <string> tile_cache_size_text;
+    in property <string> rov_info;
+    in-out property <string> server_base_url;
+    in property <string> app_version;
+    in property <string> running_build_info;
+    in property <string> update_status_text;
+    in property <string> update_latest_version;
+    in property <bool> update_available: false;
+    in property <bool> update_check_in_progress: false;
+
+    callback use_default_test_rtsp();
+    callback use_default_rov_rtsp();
+    callback use_default_rov_http_base();
+    callback use_host_from_rov_http_base();
+    callback use_default_rov_status_udp_port();
+    callback use_default_osm_tile_user_agent();
+    callback use_default_server_base_url();
+    callback check_for_updates();
+    callback download_update();
+    callback recalibrate_rov_network();
+
+    // --- Devices (forwarded straight through to DeviceListPage) ---
+    in property <[DeviceRow]> device_rows;
+    in property <string> devices_status;
+    in property <bool> device_action_in_progress: false;
+    in property <string> device_active_id;
+    in property <string> device_selected_id;
+    in property <string> device_selected_category;
+    in property <string> device_selected_type;
+    in property <string> device_selected_created_text;
+    in property <string> device_selected_updated_text;
+    in-out property <string> device_name_draft;
+    in-out property <string> new_device_name;
+    in-out property <string> device_cfg_host;
+    in-out property <string> device_cfg_rtsp_username;
+    in-out property <string> device_cfg_rtsp_password;
+    in-out property <string> device_cfg_rtsp_transport;
+    in-out property <string> device_cfg_rtsp_reconnect_backoff_ms;
+    in-out property <string> device_cfg_rtsp_port;
+    in-out property <string> device_cfg_rtsp_channel;
+    in-out property <string> device_cfg_rtsp_profile;
+    in-out property <string> device_cfg_udp_port;
+    in-out property <string> device_cfg_udp_expected_id;
+    in-out property <string> device_cfg_udp_expected_type;
+    in-out property <string> device_cfg_http_connect_timeout_ms;
+    in-out property <string> device_cfg_http_request_timeout_ms;
+    in-out property <string> device_cfg_http_port;
+    in-out property <string> device_cfg_capture_burst;
+    in-out property <string> device_cfg_capture_format;
+
+    callback refresh_devices();
+    callback select_device(string);
+    callback create_device(string);
+    callback save_device_name(string, string);
+    callback delete_device(string);
+    callback set_active_device(string);
+    callback go_live_with_device(string);
+
+    // Local navigation state: which of DeviceListPage / DeviceDetailPage is
+    // showing, and whether the detail page is in "create new" mode. Purely
+    // a UI concern, not synced to Rust.
+    property <bool> device_detail_open: false;
+    property <bool> device_is_new: false;
+    // Which top-level tab is showing: Devices (list/detail, default) or
+    // Settings. Purely a UI concern, not synced to Rust.
+    property <bool> settings_active: false;
+
+    padding: 14px;
+    spacing: 14px;
+
+    // --- Account header ---
+    HorizontalBox {
+        spacing: 12px;
+        vertical-stretch: 0;
+
+        Rectangle {
+            width: 56px;
+            height: 56px;
+            border-radius: 28px;
+            background: root.auth_is_signed_in ? #0a84ff33 : #3f4148;
+            border-width: 1px;
+            border-color: root.auth_is_signed_in ? #0a84ff : #55585f;
+
+            Text {
+                text: root.auth_avatar_text;
+                font-size: 20px;
+                font-weight: 700;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        VerticalBox {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.auth_is_signed_in ? root.auth_signed_in_as : "Not signed in";
+                font-size: 18px;
+            }
+            Text {
+                text: root.auth_status_text;
+                font-size: 11px;
+                color: #8f96a3;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.auth_is_signed_in : Button {
+            horizontal-stretch: 0;
+            text: "Sign Out";
+            clicked => { root.sign_out(); }
+        }
+    }
+
+    if !root.auth_is_signed_in : VerticalBox {
+        spacing: 6px;
+        vertical-stretch: 0;
+        Text { text: "Email:"; font-size: 12px; color: #8f96a3; }
+        LineEdit { text <=> root.auth_email; }
+        Text { text: "Password:"; font-size: 12px; color: #8f96a3; }
+        LineEdit { text <=> root.auth_password; input-type: password; }
+        Button {
+            text: "Sign In";
+            clicked => { root.sign_in(); }
+        }
+    }
+
+    Rectangle { height: 1px; background: #3f4148; vertical-stretch: 0; }
+
+    // --- Devices / Settings tab toggle ---
+    HorizontalBox {
+        spacing: 6px;
+        vertical-stretch: 0;
+        ProfileTab {
+            label: "Devices";
+            active: !root.settings_active;
+            activated => { root.settings_active = false; }
+        }
+        ProfileTab {
+            label: "Settings";
+            active: root.settings_active;
+            activated => { root.settings_active = true; }
+        }
+    }
+
+    // --- Devices: list-only page, or the dedicated create/edit page. ---
+    if !root.settings_active && !root.device_detail_open : DeviceListPage {
+        vertical-stretch: 1;
+        device_rows: root.device_rows;
+        devices_status: root.devices_status;
+        device_action_in_progress: root.device_action_in_progress;
+        device_active_id: root.device_active_id;
+        refresh_devices => { root.refresh_devices(); }
+        open_device(id) => {
+            root.device_is_new = false;
+            root.select_device(id);
+            root.device_detail_open = true;
+        }
+        open_new_device => {
+            root.device_is_new = true;
+            root.new_device_name = "";
+            root.select_device("");
+            root.device_detail_open = true;
+        }
+    }
+
+    if !root.settings_active && root.device_detail_open : DeviceDetailPage {
+        vertical-stretch: 1;
+        is_new: root.device_is_new;
+        device_id: root.device_selected_id;
+        device_category: root.device_selected_category;
+        device_type: root.device_selected_type;
+        device_created_text: root.device_selected_created_text;
+        device_updated_text: root.device_selected_updated_text;
+        device_active: root.device_selected_id != "" && root.device_selected_id == root.device_active_id;
+        device_action_in_progress: root.device_action_in_progress;
+        name_draft: root.device_is_new ? root.new_device_name : root.device_name_draft;
+        cfg_host <=> root.device_cfg_host;
+        cfg_rtsp_username <=> root.device_cfg_rtsp_username;
+        cfg_rtsp_password <=> root.device_cfg_rtsp_password;
+        cfg_rtsp_transport <=> root.device_cfg_rtsp_transport;
+        cfg_rtsp_reconnect_backoff_ms <=> root.device_cfg_rtsp_reconnect_backoff_ms;
+        cfg_rtsp_port <=> root.device_cfg_rtsp_port;
+        cfg_rtsp_channel <=> root.device_cfg_rtsp_channel;
+        cfg_rtsp_profile <=> root.device_cfg_rtsp_profile;
+        cfg_udp_port <=> root.device_cfg_udp_port;
+        cfg_udp_expected_id <=> root.device_cfg_udp_expected_id;
+        cfg_udp_expected_type <=> root.device_cfg_udp_expected_type;
+        cfg_http_connect_timeout_ms <=> root.device_cfg_http_connect_timeout_ms;
+        cfg_http_request_timeout_ms <=> root.device_cfg_http_request_timeout_ms;
+        cfg_http_port <=> root.device_cfg_http_port;
+        cfg_capture_burst <=> root.device_cfg_capture_burst;
+        cfg_capture_format <=> root.device_cfg_capture_format;
+        name_changed(text) => {
+            if (root.device_is_new) {
+                root.new_device_name = text;
+            } else {
+                root.device_name_draft = text;
+            }
+        }
+        back => {
+            root.device_detail_open = false;
+            root.select_device("");
+        }
+        create(name) => {
+            root.create_device(name);
+            root.device_is_new = false;
+        }
+        save(id, name) => { root.save_device_name(id, name); }
+        delete(id) => {
+            root.delete_device(id);
+            root.device_detail_open = false;
+        }
+        set_active(id) => { root.set_active_device(id); }
+        go_live(id) => {
+            root.device_detail_open = false;
+            root.go_live_with_device(id);
+        }
+    }
+
+    // --- Settings: RTSP/ROV/app configuration, moved here from the old
+    // standalone Configuration screen. ---
+    if root.settings_active : ScrollView {
+        vertical-stretch: 1;
+        viewport-width: self.visible-width;
+
+        VerticalBox {
+            padding: 0px;
+            spacing: 10px;
+
+            Text { text: "RTSP + ROV Configuration"; font-size: 18px; font-weight: 700; }
+            Text {
+                text: "Set RTSP URLs and ROV HTTP endpoint. These values are used by the Stream and API actions.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            SettingsField { label: "RTSP URL:"; value <=> root.rtsp_url; }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    horizontal-stretch: 1;
+                    text: "Use default test RTSP URL";
+                    clicked => { root.use_default_test_rtsp(); }
+                }
+                Button {
+                    horizontal-stretch: 1;
+                    text: "Use default ROV RTSP URL";
+                    clicked => { root.use_default_rov_rtsp(); }
+                }
+            }
+
+            SettingsField { label: "ROV HTTP API Base URL:"; value <=> root.rov_http_base; }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    horizontal-stretch: 1;
+                    text: "Use default ROV HTTP API URL";
+                    clicked => { root.use_default_rov_http_base(); }
+                }
+                Button {
+                    horizontal-stretch: 1;
+                    text: "Use host from ROV HTTP API URL for telemetry UDP bind";
+                    clicked => { root.use_host_from_rov_http_base(); }
+                }
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                SettingsField { label: "ROV telemetry UDP port:"; value <=> root.rov_status_udp_port; }
+                Button {
+                    horizontal-stretch: 0;
+                    text: "Use default (8500)";
+                    clicked => { root.use_default_rov_status_udp_port(); }
+                }
+            }
+
+            SettingsField { label: "OpenStreetMap tile User-Agent:"; value <=> root.osm_tile_user_agent; }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    text: "Use default OSM tile User-Agent";
+                    clicked => { root.use_default_osm_tile_user_agent(); }
+                }
+            }
+            Text {
+                text: "Include an app identifier and contact URL/email for OSM tile policy compliance.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            SettingsSectionHeader { title: "Offline map tiles"; }
+            Text {
+                text: "Cache map tiles to disk for offline use. When enabled, tiles are saved as you browse and served from local storage when no Internet is available.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+            CheckBox {
+                text: "Save map tiles for offline use";
+                checked <=> root.use_saved_map_tiles;
+            }
+            VerticalBox {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text {
+                    text: "Max tile cache size (MB):";
+                    color: root.use_saved_map_tiles ? #8f96a3 : #555555;
+                    font-size: 12px;
+                }
+                LineEdit {
+                    text <=> root.max_tile_storage_mb;
+                    enabled: root.use_saved_map_tiles;
+                }
+            }
+            Text {
+                text: "Least recently used tiles are deleted first when the cache exceeds this limit. Default 1024 MB (1 GB).";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+            if root.tile_cache_size_text != "" : Text {
+                text: "Current tile cache size on disk: " + root.tile_cache_size_text + ".";
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            SettingsSectionHeader { title: "Application updates"; }
+            Text { text: "Installed version: v" + root.app_version; color: #8f96a3; font-size: 12px; }
+            Text {
+                text: "Running build: " + root.running_build_info;
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+            if root.update_available : Text {
+                text: "Latest available: v" + root.update_latest_version;
+                color: #22cc44;
+                font-size: 12px;
+            }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    horizontal-stretch: 1;
+                    text: root.update_check_in_progress ? "Checking..." : "Check for updates";
+                    enabled: !root.update_check_in_progress;
+                    clicked => { root.check_for_updates(); }
+                }
+                Button {
+                    horizontal-stretch: 1;
+                    text: "Download update";
+                    enabled: root.update_available;
+                    clicked => { root.download_update(); }
+                }
+            }
+            if root.update_status_text != "" : Text {
+                text: root.update_status_text;
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+
+            SettingsSectionHeader { title: "ROV network"; }
+            Button {
+                text: "Recalibrate ROV network";
+                clicked => { root.recalibrate_rov_network(); }
+            }
+            Text {
+                text: "Auto-detects the wired USB-ethernet interface for the ROV (192.168.1.88) and sets up the OS route for ffmpeg. If no cable is connected, falls back to OS routing (ROV WiFi). May prompt for admin password.";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+            if root.rov_info != "" : Text { text: root.rov_info; wrap: word-wrap; font-size: 11px; }
+
+            SettingsSectionHeader { title: "Server"; }
+            Text {
+                text: "Used to sign in to https://third-eye.marshalling.eu for media syncing and status uploads (see account details above).";
+                wrap: word-wrap;
+                color: #8f96a3;
+                font-size: 11px;
+            }
+            SettingsField { label: "Server base URL:"; value <=> root.server_base_url; }
+            Button {
+                text: "Use default server URL";
+                clicked => { root.use_default_server_base_url(); }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}
