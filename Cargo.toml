@@ -36,7 +36,7 @@ third-eye-openapi = { package = "openapi", path = "generated" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 if-addrs = "0.15"
-webbrowser = "1.2.2"
+webbrowser = "1.2.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }
