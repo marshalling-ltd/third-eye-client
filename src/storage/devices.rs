@@ -402,3 +402,344 @@ fn current_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::AppStore;
+    use base64::Engine;
+
+    /// Builds a minimal unsigned JWT whose payload sets `exp` to `exp_secs`,
+    /// matching the pattern in `tests/auth.rs`.
+    fn make_jwt(exp_secs: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = serde_json::json!({"exp": exp_secs, "sub": "user"});
+        let payload_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        format!("{header}.{payload_b64}.")
+    }
+
+    /// Signs `store` in against `server` via a mocked `/api/v1/account/login`,
+    /// so subsequent `store.devices()` calls have a valid session to work with.
+    fn sign_in(store: &AppStore, server: &mut mockito::Server) {
+        let token = make_jwt(2_000_000_000);
+        let body = serde_json::json!({"access_token": token, "status": "success"}).to_string();
+        server
+            .mock("POST", "/api/v1/account/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        store
+            .auth()
+            .login(&server.url(), "me@example.test", "secret")
+            .expect("login succeeds");
+    }
+
+    fn device_model_json(id: uuid::Uuid, concurrency: uuid::Uuid, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "device_category": "Underwater",
+            "device_type": "ChasingM2S",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "concurrency": concurrency,
+            "configuration": null,
+            "user_id": uuid::Uuid::new_v4(),
+        })
+    }
+
+    // ---- DeviceCacheStore (local cache, no network) ------------------------
+
+    fn sample_summary(id: &str, name: &str) -> DeviceSummary {
+        DeviceSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            category: "Underwater".to_string(),
+            device_type: "ChasingM2S".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            concurrency: uuid::Uuid::new_v4(),
+            configuration: None,
+        }
+    }
+
+    #[test]
+    fn cache_starts_empty() {
+        let store = AppStore::open_in_memory().unwrap();
+        assert!(store.device_cache().list_cached().unwrap().is_empty());
+        assert!(store.device_cache().selected().unwrap().is_none());
+    }
+
+    #[test]
+    fn replace_all_populates_cache_ordered_by_name() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .replace_all(&[
+                sample_summary("id-b", "Bravo"),
+                sample_summary("id-a", "Alpha"),
+            ])
+            .unwrap();
+        let listed = cache.list_cached().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "Alpha");
+        assert_eq!(listed[1].name, "Bravo");
+    }
+
+    #[test]
+    fn replace_all_drops_devices_no_longer_present() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .replace_all(&[sample_summary("id-a", "Alpha")])
+            .unwrap();
+        cache
+            .replace_all(&[sample_summary("id-b", "Bravo")])
+            .unwrap();
+        let listed = cache.list_cached().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "id-b");
+    }
+
+    #[test]
+    fn replace_all_preserves_selection_for_existing_device() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .replace_all(&[sample_summary("id-a", "Alpha")])
+            .unwrap();
+        cache.set_selected("id-a").unwrap();
+        // A refresh that still includes id-a must not clear the selection.
+        cache
+            .replace_all(&[
+                sample_summary("id-a", "Alpha"),
+                sample_summary("id-b", "Bravo"),
+            ])
+            .unwrap();
+        let selected = cache.selected().unwrap().expect("selection preserved");
+        assert_eq!(selected.id, "id-a");
+    }
+
+    #[test]
+    fn upsert_inserts_and_updates() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache.upsert(&sample_summary("id-a", "Alpha")).unwrap();
+        assert_eq!(cache.list_cached().unwrap().len(), 1);
+        let mut renamed = sample_summary("id-a", "Alpha Renamed");
+        renamed.concurrency = uuid::Uuid::new_v4();
+        cache.upsert(&renamed).unwrap();
+        let listed = cache.list_cached().unwrap();
+        assert_eq!(listed.len(), 1, "upsert must not duplicate the row");
+        assert_eq!(listed[0].name, "Alpha Renamed");
+    }
+
+    #[test]
+    fn remove_deletes_the_row() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache.upsert(&sample_summary("id-a", "Alpha")).unwrap();
+        cache.remove("id-a").unwrap();
+        assert!(cache.list_cached().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_selected_switches_the_active_device() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .replace_all(&[
+                sample_summary("id-a", "Alpha"),
+                sample_summary("id-b", "Bravo"),
+            ])
+            .unwrap();
+        cache.set_selected("id-a").unwrap();
+        assert_eq!(cache.selected().unwrap().unwrap().id, "id-a");
+        cache.set_selected("id-b").unwrap();
+        assert_eq!(
+            cache.selected().unwrap().unwrap().id,
+            "id-b",
+            "selecting a new device must clear the previous flag"
+        );
+    }
+
+    #[test]
+    fn set_selected_rejects_unknown_id() {
+        let store = AppStore::open_in_memory().unwrap();
+        let err = store.device_cache().set_selected("missing").unwrap_err();
+        assert!(format!("{err}").contains("not in the local cache"));
+    }
+
+    #[test]
+    fn clear_selection_unsets_the_active_device() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .replace_all(&[sample_summary("id-a", "Alpha")])
+            .unwrap();
+        cache.set_selected("id-a").unwrap();
+        cache.clear_selection().unwrap();
+        assert!(cache.selected().unwrap().is_none());
+    }
+
+    // ---- DevicesClient (remote calls, mocked server) -----------------------
+
+    #[test]
+    fn list_returns_devices_from_server() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+
+        let id = uuid::Uuid::new_v4();
+        let concurrency = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "items": [device_model_json(id, concurrency, "ROV One")],
+            "limit": 200,
+            "page": 1,
+            "total": 1,
+        })
+        .to_string();
+        let list_mock = server
+            .mock("GET", "/api/v1/devices")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+
+        let devices = store.devices().list(&server.url()).expect("list succeeds");
+        list_mock.assert();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, id.to_string());
+        assert_eq!(devices[0].name, "ROV One");
+        assert_eq!(devices[0].concurrency, concurrency);
+    }
+
+    #[test]
+    fn list_surfaces_server_error() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+
+        server
+            .mock("GET", "/api/v1/devices")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body(r#"{"message":"boom"}"#)
+            .create();
+
+        let err = store
+            .devices()
+            .list(&server.url())
+            .expect_err("should fail");
+        match err {
+            ApiError::Server { status, .. } => assert_eq!(status.as_u16(), 500),
+            other => panic!("expected ApiError::Server, got {other}"),
+        }
+    }
+
+    #[test]
+    fn me_id_returns_the_signed_in_user_id() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+
+        let user_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "id": user_id,
+            "email": "me@example.test",
+            "name": "Me",
+            "surname": "Example",
+            "role": "User",
+            "is_active": true,
+            "password": "hashed",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "concurrency": uuid::Uuid::new_v4(),
+        })
+        .to_string();
+        server
+            .mock("GET", "/api/v1/profile/info")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+
+        let returned = store
+            .devices()
+            .me_id(&server.url())
+            .expect("me_id succeeds");
+        assert_eq!(returned, user_id);
+    }
+
+    #[test]
+    fn create_sends_resolved_user_id_and_returns_device() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+
+        let user_id = uuid::Uuid::new_v4();
+        let me_body = serde_json::json!({
+            "id": user_id,
+            "email": "me@example.test",
+            "name": "Me",
+            "surname": "Example",
+            "role": "User",
+            "is_active": true,
+            "password": "hashed",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "concurrency": uuid::Uuid::new_v4(),
+        })
+        .to_string();
+        server
+            .mock("GET", "/api/v1/profile/info")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(me_body)
+            .create();
+
+        let device_id = uuid::Uuid::new_v4();
+        let concurrency = uuid::Uuid::new_v4();
+        let create_body = device_model_json(device_id, concurrency, "New ROV").to_string();
+        let create_mock = server
+            .mock("POST", "/api/v1/devices")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "New ROV",
+                "user_id": user_id,
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(create_body)
+            .create();
+
+        let created = store
+            .devices()
+            .create(&server.url(), "New ROV".to_string(), None)
+            .expect("create succeeds");
+        create_mock.assert();
+        assert_eq!(created.id, device_id.to_string());
+        assert_eq!(created.name, "New ROV");
+    }
+
+    #[test]
+    fn delete_calls_the_delete_endpoint() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+
+        let delete_mock = server
+            .mock("DELETE", "/api/v1/devices/id-a")
+            .with_status(200)
+            .create();
+
+        store
+            .devices()
+            .delete(&server.url(), "id-a")
+            .expect("delete succeeds");
+        delete_mock.assert();
+    }
+}

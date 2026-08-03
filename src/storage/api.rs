@@ -358,4 +358,105 @@ mod tests {
         assert_eq!(configuration.base_path, "https://example.test");
         assert_eq!(configuration.bearer_access_token.as_deref(), Some("tok"));
     }
+
+    // ---- ApiSession::call_with_token retry-on-401 --------------------------
+
+    use base64::Engine;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    fn make_jwt(exp_secs: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = serde_json::json!({"exp": exp_secs, "sub": "user"});
+        let payload_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        format!("{header}.{payload_b64}.")
+    }
+
+    #[test]
+    fn call_with_token_refreshes_and_retries_once_after_401() {
+        let mut server = mockito::Server::new();
+        let store = crate::storage::AppStore::open_in_memory().unwrap();
+
+        // Sign in with a token that's still fresh, so `access_token()` hands
+        // it straight to the operation without a proactive refresh — the
+        // only refresh in this test should be the reactive one after 401.
+        let login_token = make_jwt(2_000_000_000);
+        let login_body =
+            serde_json::json!({"access_token": login_token, "status": "success"}).to_string();
+        server
+            .mock("POST", "/api/v1/account/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(login_body)
+            .create();
+        store
+            .auth()
+            .login(&server.url(), "me@example.test", "pw")
+            .unwrap();
+
+        let fresh_token = make_jwt(2_000_000_000);
+        let refresh_body =
+            serde_json::json!({"access_token": fresh_token, "status": "success"}).to_string();
+        let refresh_mock = server
+            .mock("POST", "/api/v1/account/refresh-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(refresh_body.clone())
+            .create();
+
+        let attempts = AtomicU32::new(0);
+        let result = store.api().call_with_token(&server.url(), |token| {
+            let n = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if n == 0 {
+                // First attempt: simulate the server rejecting this token.
+                Err(ApiError::Server {
+                    status: StatusCode::UNAUTHORIZED,
+                    message: "expired".to_string(),
+                })
+            } else {
+                Ok(token.to_string())
+            }
+        });
+
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(result.unwrap(), fresh_token);
+        refresh_mock.assert();
+    }
+
+    #[test]
+    fn call_with_token_does_not_retry_non_auth_errors() {
+        let mut server = mockito::Server::new();
+        let store = crate::storage::AppStore::open_in_memory().unwrap();
+
+        let token = make_jwt(2_000_000_000);
+        let login_body =
+            serde_json::json!({"access_token": token, "status": "success"}).to_string();
+        server
+            .mock("POST", "/api/v1/account/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(login_body)
+            .create();
+        store
+            .auth()
+            .login(&server.url(), "me@example.test", "pw")
+            .unwrap();
+
+        let attempts = AtomicU32::new(0);
+        let result: Result<(), ApiError> = store.api().call_with_token(&server.url(), |_token| {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(ApiError::Server {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "boom".to_string(),
+            })
+        });
+
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            1,
+            "a non-401/403 error must not trigger a refresh-and-retry"
+        );
+        assert!(result.is_err());
+    }
 }

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use super::db::SharedDb;
 use crate::camera::{CameraApiClient, MediaInfo, MediaScene, MediaWhich};
+use crate::formatting::{format_bytes, format_relative_age};
 use crate::rov_status::Status as RovStatus;
 
 /// Outcome of a single reconciliation pass.
@@ -552,6 +553,184 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+// ---------------------------------------------------------------------------
+// UI display helpers
+// ---------------------------------------------------------------------------
+
+/// UI label for whether a record is an image, video, or something else.
+#[must_use]
+pub fn origin_label(record: &LocalMediaRecord) -> &'static str {
+    match record.mime.as_deref() {
+        Some(mime) if mime.starts_with("image/") => "image",
+        Some(mime) if mime.starts_with("video/") => "video",
+        _ => "other",
+    }
+}
+
+/// UI label for whether a record has been downloaded, or was removed on the ROV.
+#[must_use]
+pub fn state_label(record: &LocalMediaRecord) -> &'static str {
+    if record.deleted_on_rov {
+        "deleted on ROV"
+    } else if record.local_path.is_some() {
+        "local"
+    } else {
+        "remote only"
+    }
+}
+
+/// UI label for the ROV's capture-scene classification code.
+#[must_use]
+pub fn scene_label(scene: Option<i32>) -> &'static str {
+    match scene {
+        Some(0) => "Normal",
+        Some(1) => "Vessel inspection",
+        Some(2) => "Fishing net",
+        Some(_) => "Other",
+        None => "-",
+    }
+}
+
+/// UI label for the ROV's per-file status code.
+#[must_use]
+pub fn rov_stat_label(code: Option<i32>) -> &'static str {
+    match code {
+        Some(0) => "Normal",
+        Some(1) => "Needs repair",
+        Some(2) => "Repairing",
+        Some(3) => "Repair failed",
+        Some(_) => "Other",
+        None => "-",
+    }
+}
+
+/// Multi-line details panel text for a media record.
+#[must_use]
+pub fn build_details_text(now_ms: i64, record: &LocalMediaRecord) -> String {
+    let mut lines = Vec::<String>::new();
+    lines.push(format!("Size: {}", format_bytes(record.size_bytes)));
+    if let (Some(w), Some(h)) = (record.width, record.height)
+        && w > 0
+        && h > 0
+    {
+        lines.push(format!("Dimensions: {w} \u{00d7} {h}"));
+    }
+    if let Some(dur) = record.duration_s
+        && dur > 0
+    {
+        lines.push(format!("Duration: {dur} s"));
+    }
+    if let Some(mime) = &record.mime {
+        lines.push(format!("Type: {mime}"));
+    }
+    lines.push(format!("Scene: {}", scene_label(record.scene)));
+    lines.push(format!(
+        "ROV file status: {}",
+        rov_stat_label(record.rov_stat)
+    ));
+    lines.push(format!(
+        "First seen: {}",
+        format_relative_age(now_ms, record.first_seen_ms)
+    ));
+    lines.push(format!(
+        "Last seen: {}",
+        format_relative_age(now_ms, record.last_seen_ms)
+    ));
+    if record.deleted_on_rov {
+        lines.push("Flagged as deleted on the ROV since last refresh.".to_string());
+    }
+    if let Some(hash) = &record.local_sha256 {
+        lines.push(format!("Local SHA-256: {hash}"));
+    }
+    lines.join("\n")
+}
+
+/// Multi-line capture-telemetry panel text for a media record.
+#[must_use]
+pub fn build_capture_text(now_ms: i64, meta: &CaptureMetadata) -> String {
+    fn opt_num<T: std::fmt::Display>(
+        prefix: &str,
+        value: Option<T>,
+        suffix: &str,
+    ) -> Option<String> {
+        value.map(|v| format!("{prefix}{v}{suffix}"))
+    }
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "Captured at: {} ({})",
+        format_relative_age(now_ms, meta.captured_at_ms),
+        meta.captured_at_ms
+    ));
+    if let (Some(pitch), Some(roll), Some(yaw)) = (meta.pitch, meta.roll, meta.yaw) {
+        lines.push(format!(
+            "Attitude [rad]: pitch={pitch:.3}, roll={roll:.3}, yaw={yaw:.3}"
+        ));
+    }
+    if let Some(depth) = meta.depth_m {
+        lines.push(format!("Depth: {depth:.2} m"));
+    }
+    if let Some(temp) = meta.temperature_c {
+        lines.push(format!("Temperature: {temp:.1} \u{00b0}C"));
+    }
+    if let (Some(lat), Some(lon)) = (meta.lat_e7, meta.lon_e7) {
+        let lat_deg = lat as f64 / 1e7;
+        let lon_deg = lon as f64 / 1e7;
+        lines.push(format!(
+            "Coordinates: {lat_deg:.6}, {lon_deg:.6} (lat_e7={lat}, lon_e7={lon})"
+        ));
+    } else {
+        if let Some(line) = opt_num("lat_e7=", meta.lat_e7, "") {
+            lines.push(line);
+        }
+        if let Some(line) = opt_num("lon_e7=", meta.lon_e7, "") {
+            lines.push(line);
+        }
+    }
+    if let Some(imu) = &meta.imu_json {
+        lines.push(format!("IMU: {imu}"));
+    }
+    if let Some(batts) = &meta.batteries_json
+        && batts != "[]"
+        && !batts.is_empty()
+    {
+        lines.push(format!("Batteries: {batts}"));
+    }
+    if let Some(note) = &meta.note
+        && !note.is_empty()
+    {
+        lines.push(format!("Note: {note}"));
+    }
+    if let Some(tags) = &meta.tags_json
+        && tags != "[]"
+        && !tags.is_empty()
+    {
+        lines.push(format!("Tags: {tags}"));
+    }
+    lines.join("\n")
+}
+
+/// One-line subtitle (size, mime, dimensions, duration) for a media record.
+#[must_use]
+pub fn build_info_subtitle(record: &LocalMediaRecord) -> String {
+    let mut parts = Vec::new();
+    parts.push(format_bytes(record.size_bytes));
+    if let Some(mime) = &record.mime {
+        parts.push(mime.clone());
+    }
+    if let (Some(w), Some(h)) = (record.width, record.height)
+        && w > 0
+        && h > 0
+    {
+        parts.push(format!("{w}\u{00d7}{h}"));
+    }
+    if let Some(dur) = record.duration_s
+        && dur > 0
+    {
+        parts.push(format!("{dur}s"));
+    }
+    parts.join(" \u{2022} ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,4 +1005,159 @@ mod tests {
 
     // Required by `Arc::clone` in the tests above.
     use std::sync::Arc;
+
+    // ---- UI display helpers -----------------------------------------------
+
+    fn sample_local_record(mime: Option<&str>) -> LocalMediaRecord {
+        LocalMediaRecord {
+            media_id: "id-a".into(),
+            name: "a.jpeg".into(),
+            size_bytes: 1_572_864,
+            duration_s: None,
+            width: Some(1920),
+            height: Some(1080),
+            mime: mime.map(str::to_string),
+            scene: Some(0),
+            first_seen_ms: 0,
+            last_seen_ms: 60_000,
+            local_path: None,
+            local_sha256: None,
+            rov_stat: Some(0),
+            deleted_on_rov: false,
+            captured_at_ms: None,
+        }
+    }
+
+    fn sample_capture_metadata() -> CaptureMetadata {
+        CaptureMetadata {
+            media_id: "id-a".into(),
+            name: "a.jpeg".into(),
+            captured_at_ms: 0,
+            pitch: Some(0.1),
+            roll: Some(-0.05),
+            yaw: Some(1.57),
+            depth_m: Some(12.3),
+            temperature_c: Some(23.4),
+            lat_e7: Some(455_012_340),
+            lon_e7: Some(161_234_560),
+            batteries_json: None,
+            imu_json: None,
+            note: None,
+            tags_json: None,
+        }
+    }
+
+    #[test]
+    fn origin_label_classifies_by_mime() {
+        assert_eq!(
+            origin_label(&sample_local_record(Some("image/jpeg"))),
+            "image"
+        );
+        assert_eq!(
+            origin_label(&sample_local_record(Some("video/mp4"))),
+            "video"
+        );
+        assert_eq!(
+            origin_label(&sample_local_record(Some("application/octet-stream"))),
+            "other"
+        );
+        assert_eq!(origin_label(&sample_local_record(None)), "other");
+    }
+
+    #[test]
+    fn state_label_reflects_download_and_deletion() {
+        let mut record = sample_local_record(None);
+        assert_eq!(state_label(&record), "remote only");
+        record.local_path = Some("/tmp/a.jpeg".into());
+        assert_eq!(state_label(&record), "local");
+        record.deleted_on_rov = true;
+        assert_eq!(state_label(&record), "deleted on ROV");
+    }
+
+    #[test]
+    fn scene_label_covers_known_and_unknown_codes() {
+        assert_eq!(scene_label(Some(0)), "Normal");
+        assert_eq!(scene_label(Some(1)), "Vessel inspection");
+        assert_eq!(scene_label(Some(2)), "Fishing net");
+        assert_eq!(scene_label(Some(99)), "Other");
+        assert_eq!(scene_label(None), "-");
+    }
+
+    #[test]
+    fn rov_stat_label_covers_known_and_unknown_codes() {
+        assert_eq!(rov_stat_label(Some(0)), "Normal");
+        assert_eq!(rov_stat_label(Some(1)), "Needs repair");
+        assert_eq!(rov_stat_label(Some(2)), "Repairing");
+        assert_eq!(rov_stat_label(Some(3)), "Repair failed");
+        assert_eq!(rov_stat_label(Some(42)), "Other");
+        assert_eq!(rov_stat_label(None), "-");
+    }
+
+    #[test]
+    fn details_text_includes_core_fields() {
+        let record = sample_local_record(Some("image/jpeg"));
+        let text = build_details_text(120_000, &record);
+        assert!(text.contains("Size: 1.5 MB"));
+        assert!(text.contains("Dimensions: 1920 \u{00d7} 1080"));
+        assert!(text.contains("Type: image/jpeg"));
+        assert!(text.contains("Scene: Normal"));
+        assert!(text.contains("ROV file status: Normal"));
+        assert!(text.contains("First seen: 2m ago"));
+        assert!(text.contains("Last seen: 1m ago"));
+        assert!(!text.contains("Flagged as deleted"));
+    }
+
+    #[test]
+    fn details_text_flags_deleted_on_rov() {
+        let mut record = sample_local_record(None);
+        record.deleted_on_rov = true;
+        let text = build_details_text(0, &record);
+        assert!(text.contains("Flagged as deleted on the ROV"));
+    }
+
+    #[test]
+    fn capture_text_includes_telemetry() {
+        let meta = sample_capture_metadata();
+        let text = build_capture_text(60_000, &meta);
+        assert!(text.contains("Captured at: 1m ago (0)"));
+        assert!(text.contains("Attitude [rad]: pitch=0.100, roll=-0.050, yaw=1.570"));
+        assert!(text.contains("Depth: 12.30 m"));
+        assert!(text.contains("Temperature: 23.4 \u{00b0}C"));
+        assert!(text.contains("Coordinates: 45.501234, 16.123456"));
+    }
+
+    #[test]
+    fn capture_text_omits_missing_optional_fields() {
+        let mut meta = sample_capture_metadata();
+        meta.pitch = None;
+        meta.roll = None;
+        meta.yaw = None;
+        meta.depth_m = None;
+        meta.temperature_c = None;
+        meta.lat_e7 = None;
+        meta.lon_e7 = None;
+        let text = build_capture_text(0, &meta);
+        assert!(!text.contains("Attitude"));
+        assert!(!text.contains("Depth"));
+        assert!(!text.contains("Coordinates"));
+    }
+
+    #[test]
+    fn info_subtitle_joins_present_fields() {
+        let record = sample_local_record(Some("image/jpeg"));
+        let subtitle = build_info_subtitle(&record);
+        assert_eq!(
+            subtitle,
+            "1.5 MB \u{2022} image/jpeg \u{2022} 1920\u{00d7}1080"
+        );
+    }
+
+    #[test]
+    fn info_subtitle_omits_missing_dimensions() {
+        let mut record = sample_local_record(None);
+        record.width = None;
+        record.height = None;
+        let subtitle = build_info_subtitle(&record);
+        assert_eq!(subtitle, "1.5 MB");
+    }
 }

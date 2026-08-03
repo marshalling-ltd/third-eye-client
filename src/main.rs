@@ -47,12 +47,17 @@ use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
 use third_eye_client::formatting::{
-    format_bytes, format_epoch_ms_datetime, parse_stale_timeout_ms,
+    build_media_download_url, format_bytes, format_epoch_ms_datetime, format_relative_age,
+    is_image_name, is_video_name, parse_stale_timeout_ms,
 };
 use third_eye_client::network::{
-    RecalibrateResult, detect_rov_interface, parse_host_from_http_base,
+    RecalibrateResult, detect_rov_interface, interface_has_rov_subnet_ipv4,
+    parse_host_from_http_base,
 };
-use third_eye_client::nmea::{GpsProtocol, NmeaGpsState};
+use third_eye_client::nmea::{
+    GpsProtocol, NmeaGpsState, canonical_serial_port_name, find_nmea_serial_port_index,
+    pick_default_nmea_serial_port,
+};
 use third_eye_client::rov_status::{
     ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
     UdpStatusState,
@@ -62,9 +67,14 @@ use third_eye_client::storage::api::ApiError;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
 use third_eye_client::storage::devices::DeviceSummary;
 use third_eye_client::storage::media::{
-    CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, download_to_local,
+    CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, build_capture_text,
+    build_details_text, build_info_subtitle, download_to_local, origin_label, state_label,
 };
 use third_eye_client::storage::search::{DEFAULT_SEARCH_RADIUS_M, NearbyKind, NearbyResource};
+use third_eye_client::update_check::{
+    GithubReleaseAsset, normalize_release_tag, parse_version_triplet,
+    pick_download_url_for_platform,
+};
 use third_eye_openapi::models::{
     CaptureDefaults, ChasingM2SConfiguration, HttpConfig, NetworkConfig, PacketFilter, RtspConfig,
     RtspCredentials, UdpStatusConfig,
@@ -637,12 +647,6 @@ struct GithubRelease {
     draft: bool,
     prerelease: bool,
     assets: Vec<GithubReleaseAsset>,
-}
-
-#[derive(Deserialize)]
-struct GithubReleaseAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 struct ThirdEyeState {
@@ -2054,40 +2058,6 @@ fn detect_local_ip() -> Option<String> {
     })
 }
 
-fn canonical_serial_port_name(port_name: &str) -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return port_name.trim().to_ascii_uppercase();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        port_name.trim().to_owned()
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn parse_windows_com_port_number(port_name: &str) -> Option<u32> {
-    let upper = port_name.trim().to_ascii_uppercase();
-    let suffix = upper.strip_prefix("COM")?;
-    suffix.parse::<u32>().ok()
-}
-
-fn pick_default_nmea_serial_port(candidates: &[String]) -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows Bluetooth "outgoing" ports are often higher-numbered COM
-        // devices; prefer the highest COM number when available.
-        if let Some((_, port)) = candidates
-            .iter()
-            .filter_map(|port| parse_windows_com_port_number(port).map(|num| (num, port)))
-            .max_by_key(|(num, _)| *num)
-        {
-            return Some(port.clone());
-        }
-    }
-    candidates.first().cloned()
-}
-
 fn collect_nmea_serial_candidates() -> Vec<String> {
     let mut ordered = Vec::<String>::new();
     let mut seen = std::collections::HashSet::<String>::new();
@@ -2106,13 +2076,6 @@ fn collect_nmea_serial_candidates() -> Vec<String> {
     }
 
     ordered
-}
-
-fn find_nmea_serial_port_index(candidates: &[String], selected_port: &str) -> Option<usize> {
-    let canonical_selected = canonical_serial_port_name(selected_port);
-    candidates
-        .iter()
-        .position(|candidate| canonical_serial_port_name(candidate) == canonical_selected)
 }
 
 fn refresh_nmea_serial_candidates(state: &mut ThirdEyeState) -> bool {
@@ -2189,23 +2152,6 @@ fn recalibrate_rov_network_blocking(rov_http_base: &str) -> RecalibrateResult {
 /// Returns `true` when `interface` has an IPv4 address on the same subnet
 /// as `rov_host`.  Used to decide whether the HTTP client should bind to
 /// the interface via `IP_BOUND_IF` (only safe when there is a usable IPv4).
-fn interface_has_rov_subnet_ipv4(interface: &str, rov_host: &str) -> bool {
-    let Ok(rov_ip) = rov_host.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return false;
-    };
-    interfaces.iter().any(|iface| {
-        iface.name == interface
-            && !iface.is_loopback()
-            && matches!(&iface.addr, if_addrs::IfAddr::V4(v4) if {
-                let mask = u32::from(v4.netmask);
-                (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask)
-            })
-    })
-}
-
 /// Starts (or restarts) the RTSP stream + telemetry listener using whatever
 /// is currently in `state.config`, and switches to the Live Stream screen.
 /// Shared by `navigate_stream` (Ctrl+2 / sidebar) and `go_live_with_device`
@@ -2341,162 +2287,6 @@ fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
 // -------------------------------------------------------------------------
 // Media screen helpers
 // -------------------------------------------------------------------------
-
-fn format_relative_age(ts_ms: i64) -> String {
-    let now = current_unix_ms();
-    let diff_secs = ((now - ts_ms).max(0) / 1000) as u64;
-    if diff_secs < 10 {
-        "just now".to_string()
-    } else if diff_secs < 60 {
-        format!("{diff_secs}s ago")
-    } else if diff_secs < 3600 {
-        format!("{}m ago", diff_secs / 60)
-    } else if diff_secs < 86_400 {
-        format!("{}h ago", diff_secs / 3600)
-    } else {
-        format!("{}d ago", diff_secs / 86_400)
-    }
-}
-
-fn origin_label(record: &LocalMediaRecord) -> &'static str {
-    match record.mime.as_deref() {
-        Some(mime) if mime.starts_with("image/") => "image",
-        Some(mime) if mime.starts_with("video/") => "video",
-        _ => "other",
-    }
-}
-
-fn state_label(record: &LocalMediaRecord) -> &'static str {
-    if record.deleted_on_rov {
-        "deleted on ROV"
-    } else if record.local_path.is_some() {
-        "local"
-    } else {
-        "remote only"
-    }
-}
-
-fn scene_label(scene: Option<i32>) -> &'static str {
-    match scene {
-        Some(0) => "Normal",
-        Some(1) => "Vessel inspection",
-        Some(2) => "Fishing net",
-        Some(_) => "Other",
-        None => "-",
-    }
-}
-
-fn rov_stat_label(code: Option<i32>) -> &'static str {
-    match code {
-        Some(0) => "Normal",
-        Some(1) => "Needs repair",
-        Some(2) => "Repairing",
-        Some(3) => "Repair failed",
-        Some(_) => "Other",
-        None => "-",
-    }
-}
-
-fn build_details_text(record: &LocalMediaRecord) -> String {
-    let mut lines = Vec::<String>::new();
-    lines.push(format!("Size: {}", format_bytes(record.size_bytes)));
-    if let (Some(w), Some(h)) = (record.width, record.height)
-        && w > 0
-        && h > 0
-    {
-        lines.push(format!("Dimensions: {w} \u{00d7} {h}"));
-    }
-    if let Some(dur) = record.duration_s
-        && dur > 0
-    {
-        lines.push(format!("Duration: {dur} s"));
-    }
-    if let Some(mime) = &record.mime {
-        lines.push(format!("Type: {mime}"));
-    }
-    lines.push(format!("Scene: {}", scene_label(record.scene)));
-    lines.push(format!(
-        "ROV file status: {}",
-        rov_stat_label(record.rov_stat)
-    ));
-    lines.push(format!(
-        "First seen: {}",
-        format_relative_age(record.first_seen_ms)
-    ));
-    lines.push(format!(
-        "Last seen: {}",
-        format_relative_age(record.last_seen_ms)
-    ));
-    if record.deleted_on_rov {
-        lines.push("Flagged as deleted on the ROV since last refresh.".to_string());
-    }
-    if let Some(hash) = &record.local_sha256 {
-        lines.push(format!("Local SHA-256: {hash}"));
-    }
-    lines.join("\n")
-}
-
-fn build_capture_text(meta: &StoredCaptureMetadata) -> String {
-    fn opt_num<T: std::fmt::Display>(
-        prefix: &str,
-        value: Option<T>,
-        suffix: &str,
-    ) -> Option<String> {
-        value.map(|v| format!("{prefix}{v}{suffix}"))
-    }
-    let mut lines = Vec::<String>::new();
-    lines.push(format!(
-        "Captured at: {} ({})",
-        format_relative_age(meta.captured_at_ms),
-        meta.captured_at_ms
-    ));
-    if let (Some(pitch), Some(roll), Some(yaw)) = (meta.pitch, meta.roll, meta.yaw) {
-        lines.push(format!(
-            "Attitude [rad]: pitch={pitch:.3}, roll={roll:.3}, yaw={yaw:.3}"
-        ));
-    }
-    if let Some(depth) = meta.depth_m {
-        lines.push(format!("Depth: {depth:.2} m"));
-    }
-    if let Some(temp) = meta.temperature_c {
-        lines.push(format!("Temperature: {temp:.1} \u{00b0}C"));
-    }
-    if let (Some(lat), Some(lon)) = (meta.lat_e7, meta.lon_e7) {
-        let lat_deg = lat as f64 / 1e7;
-        let lon_deg = lon as f64 / 1e7;
-        lines.push(format!(
-            "Coordinates: {lat_deg:.6}, {lon_deg:.6} (lat_e7={lat}, lon_e7={lon})"
-        ));
-    } else {
-        if let Some(line) = opt_num("lat_e7=", meta.lat_e7, "") {
-            lines.push(line);
-        }
-        if let Some(line) = opt_num("lon_e7=", meta.lon_e7, "") {
-            lines.push(line);
-        }
-    }
-    if let Some(imu) = &meta.imu_json {
-        lines.push(format!("IMU: {imu}"));
-    }
-    if let Some(batts) = &meta.batteries_json
-        && batts != "[]"
-        && !batts.is_empty()
-    {
-        lines.push(format!("Batteries: {batts}"));
-    }
-    if let Some(note) = &meta.note
-        && !note.is_empty()
-    {
-        lines.push(format!("Note: {note}"));
-    }
-    if let Some(tags) = &meta.tags_json
-        && tags != "[]"
-        && !tags.is_empty()
-    {
-        lines.push(format!("Tags: {tags}"));
-    }
-    lines.join("\n")
-}
 
 fn app_data_root_dir(store: &AppStore) -> PathBuf {
     match store.data_path().and_then(|p| p.parent()) {
@@ -2640,44 +2430,6 @@ fn refresh_media_rows(state: &mut ThirdEyeState, store: &AppStore) {
     recompute_media_selection_details(state, store);
 }
 
-fn is_image_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    std::path::Path::new(&lower)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
-        || std::path::Path::new(&lower)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpeg"))
-        || std::path::Path::new(&lower)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-        || std::path::Path::new(&lower)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
-}
-
-fn is_video_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    std::path::Path::new(&lower)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
-        || std::path::Path::new(&lower)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
-}
-
-fn build_media_download_url(rov_http_base: &str, name: &str) -> Result<String> {
-    let base = rov_http_base.trim_end_matches('/');
-    let mut url = Url::parse(base).with_context(|| format!("invalid ROV HTTP base URL: {base}"))?;
-    {
-        let mut segs = url
-            .path_segments_mut()
-            .map_err(|()| anyhow::anyhow!("URL cannot be a base: {base}"))?;
-        segs.push("v1").push("medias").push(name).push("download");
-    }
-    Ok(url.to_string())
-}
-
 fn load_image_preview(path: &str, max_dim: u32) -> Option<slint::Image> {
     let img = image::open(path).ok()?;
     let img = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
@@ -2689,26 +2441,6 @@ fn load_image_preview(path: &str, max_dim: u32) -> Option<slint::Image> {
         rgba: rgba.into_raw(),
     };
     Some(rgba_frame_to_slint_image(&frame))
-}
-
-fn build_info_subtitle(record: &LocalMediaRecord) -> String {
-    let mut parts = Vec::new();
-    parts.push(format_bytes(record.size_bytes));
-    if let Some(mime) = &record.mime {
-        parts.push(mime.clone());
-    }
-    if let (Some(w), Some(h)) = (record.width, record.height)
-        && w > 0
-        && h > 0
-    {
-        parts.push(format!("{w}\u{00d7}{h}"));
-    }
-    if let Some(dur) = record.duration_s
-        && dur > 0
-    {
-        parts.push(format!("{dur}s"));
-    }
-    parts.join(" \u{2022} ")
 }
 
 fn populate_capture_overlay(state: &mut ThirdEyeState, meta: &StoredCaptureMetadata) {
@@ -2784,7 +2516,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
         .iter()
         .find(|r| r.media_id == media_id && r.name == name);
     if let Some(record) = record {
-        state.media.details_text = build_details_text(record);
+        state.media.details_text = build_details_text(current_unix_ms(), record);
         state.media.info_subtitle = build_info_subtitle(record);
         state.media.local_path = record.local_path.clone().unwrap_or_default();
         state.media.selected_deleted_on_rov = record.deleted_on_rov;
@@ -2805,7 +2537,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
     }
     match store.media().get_capture_metadata(&media_id, &name) {
         Ok(Some(meta)) => {
-            state.media.capture_text = build_capture_text(&meta);
+            state.media.capture_text = build_capture_text(current_unix_ms(), &meta);
             state.media.has_capture_meta = true;
             populate_capture_overlay(state, &meta);
         }
@@ -2825,6 +2557,7 @@ fn recompute_media_selection_details(state: &mut ThirdEyeState, store: &AppStore
 fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     let selected = state.media.selected.clone();
     let empty_img = slint::Image::default();
+    let now_ms = current_unix_ms();
     let rows: Vec<MediaRow> = state
         .media
         .rows
@@ -2835,7 +2568,7 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
                 media_id: r.media_id.clone().into(),
                 name: r.name.clone().into(),
                 size_text: format_bytes(r.size_bytes).into(),
-                seen_text: format!("seen {}", format_relative_age(r.last_seen_ms)).into(),
+                seen_text: format!("seen {}", format_relative_age(now_ms, r.last_seen_ms)).into(),
                 state_text: state_label(r).into(),
                 origin_text: origin_label(r).into(),
                 has_local: r.local_path.is_some(),
@@ -4932,61 +4665,6 @@ fn check_for_updates_blocking(current_version: &str) -> Result<UpdateCheckResult
         update_available,
         download_url,
     })
-}
-
-fn normalize_release_tag(tag: &str) -> Option<String> {
-    let stripped = tag.trim().trim_start_matches(['v', 'V']);
-    if stripped.is_empty() {
-        None
-    } else {
-        Some(stripped.to_owned())
-    }
-}
-
-fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version.split(['-', '+']).next()?;
-    let mut pieces = core.split('.');
-    let major = pieces.next()?.parse::<u64>().ok()?;
-    let minor = pieces.next()?.parse::<u64>().ok()?;
-    let patch = pieces.next()?.parse::<u64>().ok()?;
-    if pieces.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
-}
-
-fn pick_download_url_for_platform(assets: &[GithubReleaseAsset]) -> Option<String> {
-    if let Some(asset) = assets
-        .iter()
-        .find(|asset| is_platform_release_asset(&asset.name))
-    {
-        return Some(asset.browser_download_url.clone());
-    }
-    None
-}
-
-fn is_platform_release_asset(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    #[cfg(target_os = "macos")]
-    {
-        return std::path::Path::new(&lowered)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("dmg"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return std::path::Path::new(&lowered)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return std::path::Path::new(&lowered)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("appimage"));
-    }
-    #[allow(unreachable_code)]
-    false
 }
 
 fn stream_stderr_loop(

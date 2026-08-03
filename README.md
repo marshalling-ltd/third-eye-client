@@ -64,6 +64,17 @@ Cross-platform desktop client for controlling and interacting with Chasing under
 - **macOS** – universal binary (arm64 + x86_64) `.app` bundle with ad-hoc code signing (`scripts/build_macos_app.sh`)
 - **Windows** – cross-compiled from macOS via MinGW, packaged as a zip (`scripts/build_windows.sh`)
 - **Linux** – native build packaged as an AppImage (`scripts/build_linux.sh`, must run on Linux)
+
+### Testing
+- **Local iteration** – use `cargo test`. It runs the whole suite in one process,
+  so the ~2-4s per-process loader overhead of this large, statically-linked
+  binary is paid once instead of once per test.
+- **CI / pre-push gate** – use `make nextest` (`cargo nextest run`). It isolates
+  each test in its own process, which is worth the extra time for a full,
+  authoritative run.
+- **Coverage** – `make coverage` writes `lcov.info`; `make test-cov` / `make
+  nextest-cov` open an HTML report.
+
 ## Release checklist
 
 1. Merge or cherry-pick only release-ready commits into the `release` branch.

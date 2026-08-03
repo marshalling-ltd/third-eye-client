@@ -208,4 +208,19 @@ mod tests {
         assert!(store.media().list_recent(10).unwrap().is_empty());
         assert!(store.auth().current_session().unwrap().is_none());
     }
+
+    #[test]
+    fn in_memory_store_has_no_data_path() {
+        let store = AppStore::open_in_memory().unwrap();
+        assert!(store.data_path().is_none());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let store = AppStore::open_in_memory().unwrap();
+        // No outbox worker was started (open_in_memory), but shutdown must
+        // still be safely callable multiple times, including via `Drop`.
+        store.shutdown();
+        store.shutdown();
+    }
 }
