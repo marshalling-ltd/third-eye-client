@@ -20,3 +20,4 @@ pub mod network;
 pub mod nmea;
 pub mod rov_status;
 pub mod storage;
+pub mod update_check;

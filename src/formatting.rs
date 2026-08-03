@@ -1,6 +1,9 @@
 //! Pure formatting and parsing helpers extracted from the UI layer for
 //! testability.
 
+use anyhow::{Context, Result};
+use reqwest::Url;
+
 /// Parses the stale-timeout config string (minutes) into milliseconds.
 /// Falls back to 10 minutes (600 000 ms) on invalid input.
 pub fn parse_stale_timeout_ms(value: &str) -> i64 {
@@ -80,6 +83,66 @@ pub fn format_epoch_ms_utc(secs: u64) -> String {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let yr = if mo <= 2 { y + 1 } else { y };
     format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+/// Formats how long ago `ts_ms` was relative to `now_ms` (e.g. "5m ago").
+#[must_use]
+pub fn format_relative_age(now_ms: i64, ts_ms: i64) -> String {
+    let diff_secs = ((now_ms - ts_ms).max(0) / 1000) as u64;
+    if diff_secs < 10 {
+        "just now".to_string()
+    } else if diff_secs < 60 {
+        format!("{diff_secs}s ago")
+    } else if diff_secs < 3600 {
+        format!("{}m ago", diff_secs / 60)
+    } else if diff_secs < 86_400 {
+        format!("{}h ago", diff_secs / 3600)
+    } else {
+        format!("{}d ago", diff_secs / 86_400)
+    }
+}
+
+/// True if `name`'s extension is a still-image format the app can preview.
+#[must_use]
+pub fn is_image_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpeg"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
+}
+
+/// True if `name`'s extension is a video format the app can play back.
+#[must_use]
+pub fn is_video_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+}
+
+/// Builds the `GET /v1/medias/{name}/download` URL against `rov_http_base`.
+pub fn build_media_download_url(rov_http_base: &str, name: &str) -> Result<String> {
+    let base = rov_http_base.trim_end_matches('/');
+    let mut url = Url::parse(base).with_context(|| format!("invalid ROV HTTP base URL: {base}"))?;
+    {
+        let mut segs = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("URL cannot be a base: {base}"))?;
+        segs.push("v1").push("medias").push(name).push("download");
+    }
+    Ok(url.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -196,5 +259,86 @@ mod tests {
         assert!(!result.is_empty());
         // Should contain a date-like pattern.
         assert!(result.contains("2024"));
+    }
+
+    // ---- format_relative_age ----------------------------------------------
+
+    #[test]
+    fn relative_age_just_now() {
+        assert_eq!(format_relative_age(10_000, 9_500), "just now");
+    }
+
+    #[test]
+    fn relative_age_seconds() {
+        assert_eq!(format_relative_age(45_000, 10_000), "35s ago");
+    }
+
+    #[test]
+    fn relative_age_minutes() {
+        assert_eq!(format_relative_age(600_000, 0), "10m ago");
+    }
+
+    #[test]
+    fn relative_age_hours() {
+        assert_eq!(format_relative_age(3 * 3_600_000, 0), "3h ago");
+    }
+
+    #[test]
+    fn relative_age_days() {
+        assert_eq!(format_relative_age(2 * 86_400_000, 0), "2d ago");
+    }
+
+    #[test]
+    fn relative_age_future_timestamp_clamps_to_zero() {
+        // ts_ms in the future relative to now_ms should not go negative.
+        assert_eq!(format_relative_age(0, 10_000), "just now");
+    }
+
+    // ---- is_image_name / is_video_name -------------------------------------
+
+    #[test]
+    fn image_name_recognizes_supported_extensions() {
+        for name in ["a.jpg", "a.JPG", "a.jpeg", "a.png", "a.dng"] {
+            assert!(is_image_name(name), "{name} should be an image");
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_other_extensions() {
+        assert!(!is_image_name("a.mp4"));
+        assert!(!is_image_name("a"));
+        assert!(!is_image_name(""));
+    }
+
+    #[test]
+    fn video_name_recognizes_supported_extensions() {
+        for name in ["a.mp4", "a.MOV", "a.mov"] {
+            assert!(is_video_name(name), "{name} should be a video");
+        }
+    }
+
+    #[test]
+    fn video_name_rejects_other_extensions() {
+        assert!(!is_video_name("a.jpg"));
+        assert!(!is_video_name(""));
+    }
+
+    // ---- build_media_download_url ------------------------------------------
+
+    #[test]
+    fn media_download_url_builds_expected_path() {
+        let url = build_media_download_url("http://192.168.1.88", "a.jpeg").unwrap();
+        assert_eq!(url, "http://192.168.1.88/v1/medias/a.jpeg/download");
+    }
+
+    #[test]
+    fn media_download_url_strips_trailing_slash() {
+        let url = build_media_download_url("http://192.168.1.88/", "a.jpeg").unwrap();
+        assert_eq!(url, "http://192.168.1.88/v1/medias/a.jpeg/download");
+    }
+
+    #[test]
+    fn media_download_url_rejects_invalid_base() {
+        assert!(build_media_download_url("not a url", "a.jpeg").is_err());
     }
 }

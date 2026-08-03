@@ -157,6 +157,58 @@ fn is_likely_bluetooth_dev_name(name: &str) -> bool {
         && !name.contains("debug")
 }
 
+/// Normalizes a serial/Bluetooth port name for comparison purposes. On
+/// Windows, `COM` port names are case-insensitive; elsewhere the name (minus
+/// surrounding whitespace) is already canonical.
+#[must_use]
+pub fn canonical_serial_port_name(port_name: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return port_name.trim().to_ascii_uppercase();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        port_name.trim().to_owned()
+    }
+}
+
+/// Extracts the numeric suffix from a Windows `COM<N>` port name.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn parse_windows_com_port_number(port_name: &str) -> Option<u32> {
+    let upper = port_name.trim().to_ascii_uppercase();
+    let suffix = upper.strip_prefix("COM")?;
+    suffix.parse::<u32>().ok()
+}
+
+/// Picks a sensible default serial port from `candidates`. On Windows,
+/// Bluetooth "outgoing" ports tend to be the highest-numbered `COM` device,
+/// so that's preferred when parseable; otherwise the first candidate wins.
+#[must_use]
+pub fn pick_default_nmea_serial_port(candidates: &[String]) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some((_, port)) = candidates
+            .iter()
+            .filter_map(|port| parse_windows_com_port_number(port).map(|num| (num, port)))
+            .max_by_key(|(num, _)| *num)
+        {
+            return Some(port.clone());
+        }
+    }
+    candidates.first().cloned()
+}
+
+/// Finds `selected_port`'s index within `candidates`, comparing canonicalized
+/// names so platform-specific casing differences don't cause a mismatch.
+#[must_use]
+pub fn find_nmea_serial_port_index(candidates: &[String], selected_port: &str) -> Option<usize> {
+    let canonical_selected = canonical_serial_port_name(selected_port);
+    candidates
+        .iter()
+        .position(|candidate| canonical_serial_port_name(candidate) == canonical_selected)
+}
+
 // ---------------------------------------------------------------------------
 // Public state
 // ---------------------------------------------------------------------------
@@ -1949,6 +2001,69 @@ mod tests {
         assert!(!is_likely_bluetooth_dev_name("cu.Bluetooth-Incoming-Port"));
         assert!(!is_likely_bluetooth_dev_name("cu.BLTH"));
         assert!(!is_likely_bluetooth_dev_name("cu."));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn canonical_serial_port_name_trims_but_preserves_case() {
+        assert_eq!(canonical_serial_port_name("  /dev/cu.Foo  "), "/dev/cu.Foo");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn canonical_serial_port_name_uppercases_on_windows() {
+        assert_eq!(canonical_serial_port_name("  com3  "), "COM3");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_com_port_number_parses_suffix() {
+        assert_eq!(parse_windows_com_port_number("COM3"), Some(3));
+        assert_eq!(parse_windows_com_port_number("com12"), Some(12));
+        assert_eq!(parse_windows_com_port_number("USB0"), None);
+        assert_eq!(parse_windows_com_port_number("COM"), None);
+    }
+
+    #[test]
+    fn pick_default_serial_port_returns_first_when_empty_or_single() {
+        assert_eq!(pick_default_nmea_serial_port(&[]), None);
+        assert_eq!(
+            pick_default_nmea_serial_port(&["/dev/cu.a".to_string()]),
+            Some("/dev/cu.a".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn pick_default_serial_port_prefers_highest_com_number_on_windows() {
+        let candidates = vec!["COM3".to_string(), "COM12".to_string(), "COM5".to_string()];
+        assert_eq!(
+            pick_default_nmea_serial_port(&candidates),
+            Some("COM12".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn pick_default_serial_port_uses_first_candidate_off_windows() {
+        let candidates = vec!["/dev/cu.b".to_string(), "/dev/cu.a".to_string()];
+        assert_eq!(
+            pick_default_nmea_serial_port(&candidates),
+            Some("/dev/cu.b".to_string())
+        );
+    }
+
+    #[test]
+    fn find_serial_port_index_matches_canonicalized_name() {
+        let candidates = vec!["/dev/cu.a".to_string(), "/dev/cu.b".to_string()];
+        assert_eq!(
+            find_nmea_serial_port_index(&candidates, "  /dev/cu.b  "),
+            Some(1)
+        );
+        assert_eq!(
+            find_nmea_serial_port_index(&candidates, "/dev/cu.missing"),
+            None
+        );
     }
 
     // ---- worker integration (real localhost sockets) ---------------------

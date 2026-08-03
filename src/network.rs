@@ -147,6 +147,39 @@ pub fn detect_rov_interface(rov_host: &str) -> Option<String> {
     }
 }
 
+/// Checks whether `interface` currently holds an IPv4 address on the same
+/// subnet as `rov_host`.
+///
+/// Unlike [`detect_rov_interface`] (which searches all interfaces for a
+/// match), this checks one specific interface — used to verify a
+/// previously-detected or user-selected interface is still valid.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::interface_has_rov_subnet_ipv4;
+///
+/// assert!(!interface_has_rov_subnet_ipv4("en0", "not-an-ip"));
+/// assert!(!interface_has_rov_subnet_ipv4("nonexistent-iface-xyz", "192.168.1.88"));
+/// ```
+#[must_use]
+pub fn interface_has_rov_subnet_ipv4(interface: &str, rov_host: &str) -> bool {
+    let Ok(rov_ip) = rov_host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return false;
+    };
+    interfaces.iter().any(|iface| {
+        iface.name == interface
+            && !iface.is_loopback()
+            && matches!(&iface.addr, if_addrs::IfAddr::V4(v4) if {
+                let mask = u32::from(v4.netmask);
+                (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask)
+            })
+    })
+}
+
 /// Returns the full `ifconfig -a` output on macOS.
 ///
 /// This is used to inspect interface media types so wired Ethernet adapters can
