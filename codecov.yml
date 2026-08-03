@@ -1,0 +1,6 @@
+# src/main.rs is Slint UI wiring (window setup, callback registration, event
+# loop) that can only be meaningfully exercised by a running GUI, not unit
+# tests. Its ~6,000 largely-unexercised lines otherwise swamp the coverage
+# number for the rest of the codebase, which sits in the high 80s/90s%.
+ignore:
+  - "src/main.rs"

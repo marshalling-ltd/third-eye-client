@@ -321,4 +321,153 @@ mod tests {
         store.enqueue(&req).unwrap();
         assert_eq!(store.pending_count().unwrap(), 1);
     }
+
+    // ---- attempt_send -------------------------------------------------
+
+    fn http_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    /// Enqueues `req` and immediately pops it back off, so callers get a real
+    /// `OutboxRow` (with a real `id`) to hand to `attempt_send`.
+    fn enqueue_and_pop(store: &OutboxStore, req: &OutboxRequest) -> OutboxRow {
+        store.enqueue(req).unwrap();
+        store
+            .pop_due(now_ms() + 1)
+            .unwrap()
+            .expect("row was just enqueued")
+    }
+
+    #[test]
+    fn attempt_send_marks_succeeded_on_2xx() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/ok").with_status(200).create();
+
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        let req = OutboxRequest::new_with_random_key("POST", &format!("{}/ok", server.url()));
+        let row = enqueue_and_pop(&store, &req);
+
+        attempt_send(&http_client(), &store, row).unwrap();
+        mock.assert();
+        assert_eq!(
+            store.pending_count().unwrap(),
+            0,
+            "success should delete the row"
+        );
+    }
+
+    #[test]
+    fn attempt_send_marks_failed_on_5xx_and_backs_off() {
+        let mut server = mockito::Server::new();
+        let mock = server.mock("POST", "/boom").with_status(500).create();
+
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        let req = OutboxRequest::new_with_random_key("POST", &format!("{}/boom", server.url()));
+        let row = enqueue_and_pop(&store, &req);
+
+        attempt_send(&http_client(), &store, row).unwrap();
+        mock.assert();
+        assert_eq!(
+            store.pending_count().unwrap(),
+            1,
+            "failure must not delete the row"
+        );
+        // next_retry_at_ms was pushed into the future by backoff; fetch with a
+        // far-future cutoff to see the updated attempts/error.
+        let retried = store
+            .pop_due(now_ms() + MAX_BACKOFF_SECS * 1000 + 1)
+            .unwrap()
+            .expect("row should still be queued");
+        assert_eq!(retried.attempts, 1);
+    }
+
+    #[test]
+    fn attempt_send_marks_failed_on_transport_error() {
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        // Port 1 is a reserved, always-unroutable TCP port.
+        let req = OutboxRequest::new_with_random_key("POST", "http://127.0.0.1:1/unreachable");
+        let row = enqueue_and_pop(&store, &req);
+
+        attempt_send(&http_client(), &store, row).unwrap();
+        assert_eq!(store.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn attempt_send_rejects_unsupported_method_without_network_call() {
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        let req = OutboxRequest::new_with_random_key("TRACE", "http://127.0.0.1:1/whatever");
+        let row = enqueue_and_pop(&store, &req);
+
+        attempt_send(&http_client(), &store, row).unwrap();
+        // Still failed (not deleted), but via the unsupported-method branch
+        // rather than a real request.
+        assert_eq!(store.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn attempt_send_forwards_idempotency_key_and_json_body() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/x")
+            .match_header("idempotency-key", "fixed-key")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::JsonString(r#"{"a":1}"#.to_string()))
+            .with_status(200)
+            .create();
+
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        let mut req = OutboxRequest::new_with_random_key("POST", &format!("{}/x", server.url()))
+            .with_json_body(&serde_json::json!({"a": 1}));
+        req.idempotency_key = "fixed-key".into();
+        let row = enqueue_and_pop(&store, &req);
+
+        attempt_send(&http_client(), &store, row).unwrap();
+        mock.assert();
+    }
+
+    // ---- OutboxWorker (full background-thread loop) --------------------
+
+    #[test]
+    fn worker_drains_queue_and_stops_cleanly() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/x")
+            .with_status(200)
+            .expect(2)
+            .create();
+
+        let db = open_in_memory().unwrap();
+        let store = OutboxStore::new(db);
+        for _ in 0..2 {
+            store
+                .enqueue(&OutboxRequest::new_with_random_key(
+                    "POST",
+                    &format!("{}/x", server.url()),
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.pending_count().unwrap(), 2);
+
+        let mut worker = OutboxWorker::spawn(store.clone());
+        let start = std::time::Instant::now();
+        while store.pending_count().unwrap() > 0 && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        worker.stop();
+
+        assert_eq!(
+            store.pending_count().unwrap(),
+            0,
+            "worker should have drained both queued requests"
+        );
+        mock.assert();
+    }
 }
