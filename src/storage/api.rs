@@ -10,10 +10,12 @@
 //!   2. if the server rejects it anyway with 401/403, refreshes once more and
 //!      retries the call exactly once.
 //!
-//! The practical effect is that a user who signed in once stays signed in
-//! indefinitely — across restarts, across access-token expiry, and across
-//! server-side access-token invalidation — for as long as the refresh cookie
-//! keeps being accepted.
+//! The server rotates the refresh cookie on every successful refresh (see
+//! `storage::auth`), so the practical effect is that a user who signed in
+//! once stays signed in indefinitely — across restarts, across access-token
+//! expiry, and across server-side access-token invalidation — for as long as
+//! the app keeps refreshing before the *current* refresh token's own expiry,
+//! not just the original one issued at login.
 //!
 //! Only a rejected *refresh* ends the session. That (and only that) clears the
 //! local session and surfaces [`ApiError::SessionExpired`], which the UI maps
@@ -382,8 +384,12 @@ mod tests {
         // it straight to the operation without a proactive refresh — the
         // only refresh in this test should be the reactive one after 401.
         let login_token = make_jwt(2_000_000_000);
-        let login_body =
-            serde_json::json!({"access_token": login_token, "status": "success"}).to_string();
+        let login_body = serde_json::json!({
+            "access_token": login_token,
+            "refresh_token": "abc",
+            "status": "success"
+        })
+        .to_string();
         server
             .mock("POST", "/api/v1/account/login")
             .with_status(200)
@@ -396,8 +402,12 @@ mod tests {
             .unwrap();
 
         let fresh_token = make_jwt(2_000_000_000);
-        let refresh_body =
-            serde_json::json!({"access_token": fresh_token, "status": "success"}).to_string();
+        let refresh_body = serde_json::json!({
+            "access_token": fresh_token,
+            "refresh_token": "def",
+            "status": "success"
+        })
+        .to_string();
         let refresh_mock = server
             .mock("POST", "/api/v1/account/refresh-access-token")
             .with_status(200)
@@ -430,8 +440,12 @@ mod tests {
         let store = crate::storage::AppStore::open_in_memory().unwrap();
 
         let token = make_jwt(2_000_000_000);
-        let login_body =
-            serde_json::json!({"access_token": token, "status": "success"}).to_string();
+        let login_body = serde_json::json!({
+            "access_token": token,
+            "refresh_token": "abc",
+            "status": "success"
+        })
+        .to_string();
         server
             .mock("POST", "/api/v1/account/login")
             .with_status(200)

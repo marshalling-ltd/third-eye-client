@@ -1,13 +1,24 @@
 //! Authentication against the third-eye server.
 //!
 //! Endpoints (from `/api/v1/api-doc/openapi.json`):
-//!   * `POST /api/v1/account/login`                     -> `{access_token, status}`
-//!   * `POST /api/v1/account/refresh-access-token`      -> `{access_token, status}`
+//!   * `POST /api/v1/account/login`                     -> `{access_token, refresh_token, status}`
+//!   * `POST /api/v1/account/refresh-access-token`      -> `{access_token, refresh_token, status}`
 //!   * `GET  /api/v1/account/logout`                    -> `204`
 //!
-//! The refresh token is set by the server as an `HttpOnly` cookie. A persisted
-//! cookie jar ([`PersistentCookieJar`]) mirrors those cookies to `SQLite` so the
-//! session survives restarts without the user re-entering credentials.
+//! The authoritative refresh token is the `HttpOnly` cookie set alongside
+//! both responses above - `refresh_access_token_handler` reads it from the
+//! cookie jar server-side and rejects the call outright if it's missing, so
+//! there is no way to submit a refresh token any other way (e.g. as a bearer
+//! token). The `refresh_token` field mirrored in the JSON body is informational
+//! only; this client never reads it back out.
+//!
+//! Critically, the server now *rotates* that cookie on every successful
+//! refresh (new value, new lifetime), not just on login. A persisted cookie
+//! jar ([`PersistentCookieJar`]) mirrors every `Set-Cookie` to `SQLite`,
+//! keyed by `(domain, path, name)`, so each rotation overwrites the prior
+//! refresh token in place. That's what makes the sliding session described in
+//! `storage::api` actually hold: as long as the app keeps refreshing before
+//! the *current* refresh token expires, the session has no fixed lifetime.
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
