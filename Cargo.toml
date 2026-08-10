@@ -1,7 +1,7 @@
 [package]
 authors = ["marshalling"]
 name = "third-eye-client"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -36,7 +36,7 @@ third-eye-openapi = { package = "openapi", path = "generated" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 if-addrs = "0.15"
-webbrowser = "1.2.3"
+webbrowser = "1.2.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager"] }

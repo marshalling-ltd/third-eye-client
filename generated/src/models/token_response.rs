@@ -15,14 +15,17 @@ use serde::{Deserialize, Serialize};
 pub struct TokenResponse {
     #[serde(rename = "access_token")]
     pub access_token: String,
+    #[serde(rename = "refresh_token")]
+    pub refresh_token: String,
     #[serde(rename = "status")]
     pub status: String,
 }
 
 impl TokenResponse {
-    pub fn new(access_token: String, status: String) -> TokenResponse {
+    pub fn new(access_token: String, refresh_token: String, status: String) -> TokenResponse {
         TokenResponse {
             access_token,
+            refresh_token,
             status,
         }
     }

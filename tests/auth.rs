@@ -17,7 +17,9 @@ fn make_jwt(exp_secs: i64) -> String {
 fn login_persists_token_and_cookie() {
     let mut server = mockito::Server::new();
     let token = make_jwt(2_000_000_000);
-    let body = serde_json::json!({"access_token": token, "status": "success"}).to_string();
+    let body =
+        serde_json::json!({"access_token": token, "refresh_token": "abc", "status": "success"})
+            .to_string();
 
     let login = server
         .mock("POST", "/api/v1/account/login")
@@ -49,6 +51,75 @@ fn login_persists_token_and_cookie() {
     assert_eq!(session.email.as_deref(), Some("me@example.test"));
 }
 
+/// The platform now rotates the refresh cookie on every successful refresh
+/// (previously the original login cookie stuck around, capping a session at
+/// its lifetime regardless of activity). This proves the client's persisted
+/// cookie jar picks up the rotated cookie rather than keeping the stale one,
+/// which is what actually makes the sliding session described in
+/// `storage::api` hold.
+#[test]
+fn refresh_rotates_persisted_refresh_cookie() {
+    let mut server = mockito::Server::new();
+    let token = make_jwt(2_000_000_000);
+    let login_body =
+        serde_json::json!({"access_token": token, "refresh_token": "abc", "status": "success"})
+            .to_string();
+    server
+        .mock("POST", "/api/v1/account/login")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header(
+            "set-cookie",
+            "refresh_token=abc; Path=/; HttpOnly; Max-Age=3600",
+        )
+        .with_body(login_body)
+        .create();
+
+    let store = AppStore::open_in_memory().unwrap();
+    store
+        .auth()
+        .login(&server.url(), "me@example.test", "secret")
+        .expect("login succeeds");
+
+    let refreshed_token = make_jwt(2_000_000_001);
+    let refresh_body = serde_json::json!({
+        "access_token": refreshed_token,
+        "refresh_token": "rotated",
+        "status": "success"
+    })
+    .to_string();
+    server
+        .mock("POST", "/api/v1/account/refresh-access-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header(
+            "set-cookie",
+            "refresh_token=rotated; Path=/; HttpOnly; Max-Age=3600",
+        )
+        .with_body(refresh_body)
+        .create();
+
+    store
+        .auth()
+        .refresh(&server.url())
+        .expect("refresh succeeds");
+
+    // The DB-mirrored cookie jar should now hold the rotated value, not the
+    // one issued at login - a stale row here would mean the *next* refresh
+    // (after the original cookie's now-irrelevant expiry) fails even though
+    // the session should still be alive.
+    let db = store.raw_db();
+    let conn = db.lock().unwrap();
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM http_cookies WHERE name = 'refresh_token'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("refresh cookie row present");
+    assert_eq!(value, "rotated");
+}
+
 #[test]
 fn login_surfaces_server_error() {
     let mut server = mockito::Server::new();
@@ -74,7 +145,9 @@ fn login_surfaces_server_error() {
 fn logout_clears_local_session_even_on_server_error() {
     let mut login_server = mockito::Server::new();
     let token = make_jwt(2_000_000_000);
-    let login_body = serde_json::json!({"access_token": token, "status": "success"}).to_string();
+    let login_body =
+        serde_json::json!({"access_token": token, "refresh_token": "abc", "status": "success"})
+            .to_string();
     login_server
         .mock("POST", "/api/v1/account/login")
         .with_status(200)

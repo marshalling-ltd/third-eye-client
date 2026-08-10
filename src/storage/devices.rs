@@ -424,7 +424,9 @@ mod tests {
     /// so subsequent `store.devices()` calls have a valid session to work with.
     fn sign_in(store: &AppStore, server: &mut mockito::Server) {
         let token = make_jwt(2_000_000_000);
-        let body = serde_json::json!({"access_token": token, "status": "success"}).to_string();
+        let body =
+            serde_json::json!({"access_token": token, "refresh_token": "abc", "status": "success"})
+                .to_string();
         server
             .mock("POST", "/api/v1/account/login")
             .with_status(200)
