@@ -45,14 +45,18 @@ use map::{
 use reqwest::Url;
 use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, VecModel};
+#[cfg(target_os = "windows")]
+use third_eye_client::camera::local_ipv4_for_interface_from;
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
 use third_eye_client::formatting::{
     build_media_download_url, format_bytes, format_epoch_ms_datetime, format_relative_age,
     is_image_name, is_video_name, parse_stale_timeout_ms,
 };
+#[cfg(target_os = "windows")]
+use third_eye_client::network::parse_rtsp_host_port;
 use third_eye_client::network::{
-    RecalibrateResult, detect_rov_interface, interface_has_rov_subnet_ipv4,
-    parse_host_from_http_base,
+    RecalibrateResult, detect_rov_interface, format_local_ipv4_summary,
+    interface_has_rov_subnet_ipv4, local_ipv4_addresses, parse_host_from_http_base,
 };
 use third_eye_client::nmea::{
     GpsProtocol, NmeaGpsState, canonical_serial_port_name, find_nmea_serial_port_index,
@@ -955,30 +959,22 @@ struct StreamState {
 impl StreamState {
     /// Start the RTSP stream for `rtsp_url`.
     ///
-    /// `rov_http_base` and `rov_interface` are used on Windows to pre-populate
-    /// the ARP cache before launching ffmpeg: without this, Windows may not
-    /// have resolved the ROV's MAC address and ffmpeg's TCP CONNECT will fail.
+    /// `rov_interface` is used on Windows to pre-populate the ARP cache for
+    /// the RTSP host before launching ffmpeg: without this, Windows may not
+    /// have resolved its MAC address and ffmpeg's TCP CONNECT will fail.
+    /// This targets `rtsp_url`'s own host deliberately, not `rov_http_base` —
+    /// the RTSP source and the ROV's HTTP camera API are independent
+    /// endpoints (e.g. a bare test RTSP server has no HTTP API at all), so
+    /// priming ARP for one must not depend on the other being reachable.
     #[allow(unused_variables)]
-    fn start(
-        &mut self,
-        rtsp_url: String,
-        rov_http_base: Option<&str>,
-        rov_interface: Option<&str>,
-    ) -> Result<String> {
+    fn start(&mut self, rtsp_url: String, rov_interface: Option<&str>) -> Result<String> {
         let ffmpeg_bin = locate_ffmpeg_binary().context(
             "ffmpeg binary not found. Bundle it as ./bin/ffmpeg beside the app executable.",
         )?;
         let ffmpeg_label = ffmpeg_bin.display().to_string();
 
-        // On Windows, make a quick HTTP request to the ROV before launching
-        // ffmpeg. This forces Windows to resolve the ROV's MAC address and
-        // populate the ARP cache so that ffmpeg's subsequent TCP connection
-        // goes to the right adapter instead of getting "connection refused".
         #[cfg(target_os = "windows")]
-        if let (Some(base), Some(iface)) = (rov_http_base, rov_interface) {
-            let client = CameraApiClient::new_bound(base.to_owned(), Some(iface));
-            let _ = client.list_medias(None::<MediaScene>);
-        }
+        prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
 
         let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url)?;
         self.event_rx = Some(rx);
@@ -1022,6 +1018,20 @@ impl StreamState {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        // The reader thread's sender was dropped without ever
+                        // sending Ended/Error — it died some other way (e.g.
+                        // it panicked before the catch_unwind guard above
+                        // existed, or a future change reintroduces an
+                        // unguarded panic path). Surface *something* rather
+                        // than silently leaving the last frame on screen
+                        // forever with no indication anything went wrong.
+                        if self.status.trim().is_empty()
+                            || self.status == "Streaming started. Waiting for frames..."
+                        {
+                            self.status =
+                                "Stream stopped unexpectedly (reader thread ended without a reason)."
+                                    .to_string();
+                        }
                         disconnected = true;
                         break;
                     }
@@ -1079,6 +1089,9 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_osm_tile_user_agent(state.config.osm_tile_user_agent.clone().into());
     ui.set_server_base_url(state.config.server_base_url.clone().into());
     ui.set_rov_info(state.rov_info.clone().into());
+    // Cheap to recompute every apply; interfaces rarely change mid-session
+    // and this is only user-visible diagnostic text, not something typed in.
+    ui.set_local_network_info(format_local_ipv4_summary(&local_ipv4_addresses()).into());
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
     ui.set_nmea_gps_protocol(state.config.nmea_gps_protocol.trim().parse().unwrap_or(0));
@@ -1245,6 +1258,26 @@ fn refresh_devices_blocking(state: &mut ThirdEyeState, store: &AppStore) {
         return;
     }
     let server_base = state.config.server_base_url.trim().to_owned();
+    state.devices.status_text = "Checking connection...".to_string();
+    // Verify the server is actually reachable and the session still works
+    // *before* calling the devices endpoint, so a connectivity/auth problem
+    // reads as exactly that instead of surfacing as a confusing
+    // devices-specific failure (e.g. a stale/wrong server URL 404ing the
+    // devices route would otherwise look like a devices-list bug rather
+    // than "can't reach this server at all").
+    if let Err(err) = store.devices().me_id(&server_base) {
+        state.devices.status_text = if note_api_error(state, &err) {
+            "Your session has expired. Sign in again to reload devices. Showing the last \
+             cached list in the meantime."
+                .to_string()
+        } else {
+            format!(
+                "Could not connect to the server: {err}. Showing the last cached list \
+                 (offshore/offline-safe) instead."
+            )
+        };
+        return;
+    }
     state.devices.status_text = "Loading devices...".to_string();
     match store.devices().list(&server_base) {
         Ok(rows) => {
@@ -2209,16 +2242,11 @@ fn navigate_to_stream(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppStor
         }
         state.stream.stop();
         let rtsp_url = state.config.rtsp_url.clone();
-        let rov_http_base = state.config.rov_http_base.clone();
         let rov_interface = state.config.rov_interface().map(str::to_owned);
-        state.stream.status =
-            match state
-                .stream
-                .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
-            {
-                Ok(msg) => msg,
-                Err(err) => format!("Failed to start stream: {err:#}"),
-            };
+        state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
+            Ok(msg) => msg,
+            Err(err) => format!("Failed to start stream: {err:#}"),
+        };
         ui.set_has_stream_image(false);
     }
 
@@ -3891,16 +3919,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         pull_configuration_from_ui(&ui, &mut state, &store_for_start_stream);
         state.stream.stop();
         let rtsp_url = state.config.rtsp_url.clone();
-        let rov_http_base = state.config.rov_http_base.clone();
         let rov_interface = state.config.rov_interface().map(str::to_owned);
-        state.stream.status =
-            match state
-                .stream
-                .start(rtsp_url, Some(&rov_http_base), rov_interface.as_deref())
-            {
-                Ok(msg) => msg,
-                Err(err) => format!("Failed to start stream: {err:#}"),
-            };
+        state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
+            Ok(msg) => msg,
+            Err(err) => format!("Failed to start stream: {err:#}"),
+        };
         ui.set_has_stream_image(false);
         apply_state_to_ui(&ui, &state);
     });
@@ -4764,6 +4787,50 @@ fn spawn_media_stream_pipeline(
     ))
 }
 
+/// Best-effort raw TCP connect to `rtsp_url`'s own host:port, purely to make
+/// Windows resolve ARP for it before ffmpeg's real RTSP connection.
+///
+/// Deliberately protocol-agnostic (a raw socket connect, not an RTSP or HTTP
+/// request): the goal is only the ARP side effect, so it doesn't matter
+/// whether anything is listening or what protocol it speaks. The outcome is
+/// ignored — refused, reset, or timed out are all fine, and a short timeout
+/// keeps this from ever blocking the UI thread for long even when the host
+/// is unreachable.
+#[cfg(target_os = "windows")]
+fn prime_arp_for_rtsp_host(rtsp_url: &str, interface: Option<&str>) {
+    use std::net::{SocketAddr, ToSocketAddrs};
+
+    let Some((host, port)) = parse_rtsp_host_port(rtsp_url) else {
+        return;
+    };
+    let Ok(Some(addr)) = (host.as_str(), port)
+        .to_socket_addrs()
+        .map(|mut a| a.next())
+    else {
+        return;
+    };
+
+    let local_ipv4 = interface.and_then(|iface| {
+        if_addrs::get_if_addrs()
+            .ok()
+            .and_then(|ifaces| local_ipv4_for_interface_from(&ifaces, iface))
+    });
+
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let Ok(socket) =
+        socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+    else {
+        return;
+    };
+    if let Some(local_ip) = local_ipv4 {
+        let _ = socket.bind(&SocketAddr::new(local_ip, 0).into());
+    }
+    let _ = socket.connect_timeout(&addr.into(), Duration::from_millis(800));
+}
+
 fn spawn_stream_pipeline(
     ffmpeg_bin: PathBuf,
     rtsp_url: String,
@@ -4855,15 +4922,27 @@ fn stream_worker_loop(
             Ok(n) => {
                 packet_buffer.extend_from_slice(&read_buffer[..n]);
                 while let Some(jpeg) = extract_jpeg_frame(&mut packet_buffer) {
-                    match decode_jpeg_to_frame(&jpeg) {
-                        Ok(frame) => {
+                    // A single malformed/truncated frame must not take down
+                    // this whole thread: without `catch_unwind`, a panic deep
+                    // in the JPEG decoder here would silently kill the reader
+                    // (the rest of the app stays alive and responsive, so
+                    // there's nothing to signal the freeze), leaving the
+                    // video stuck on its last frame forever with no error.
+                    match std::panic::catch_unwind(|| decode_jpeg_to_frame(&jpeg)) {
+                        Ok(Ok(frame)) => {
                             if tx.send(StreamEvent::Frame(frame)).is_err() {
                                 return;
                             }
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             let _ =
                                 tx.send(StreamEvent::Error(format!("JPEG decode failed: {err:#}")));
+                        }
+                        Err(_) => {
+                            let _ = tx.send(StreamEvent::Error(
+                                "JPEG decode panicked on a malformed frame; skipping it."
+                                    .to_string(),
+                            ));
                         }
                     }
                 }

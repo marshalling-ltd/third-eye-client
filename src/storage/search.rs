@@ -17,7 +17,7 @@ use anyhow::Context;
 use reqwest::Url;
 use serde_json::{Value, json};
 
-use super::api::{ApiError, ApiSession};
+use super::api::{ApiError, ApiSession, BACKEND_HTTP_TIMEOUT};
 
 /// Default search radius, in meters, used when pulling nearby resources for
 /// the Device Map screen. The OpenAPI schema doesn't document units for `r`;
@@ -57,7 +57,10 @@ pub struct SearchClient {
 impl SearchClient {
     pub(crate) fn new(api: ApiSession) -> Self {
         Self {
-            http: reqwest::blocking::Client::new(),
+            http: reqwest::blocking::Client::builder()
+                .timeout(BACKEND_HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             api,
         }
     }

@@ -1,7 +1,7 @@
 [package]
 authors = ["marshalling"]
 name = "third-eye-client"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -16,7 +16,7 @@ required-features = ["test-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
-base64 = "0.22"
+base64 = "0.23.1"
 cookie = "0.18"
 directories = "6"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

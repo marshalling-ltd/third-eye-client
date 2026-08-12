@@ -46,6 +46,15 @@ const ACCESS_TOKEN_EXPIRY_SKEW_MS: i64 = 30_000;
 /// every single call.
 const UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS: i64 = 5 * 60 * 1000;
 
+/// Request timeout for third-eye backend HTTP clients (`AuthClient`,
+/// `DevicesClient`, `SearchClient`). Without this, `reqwest` has no timeout
+/// at all: an unreachable/slow server leaves the call hanging indefinitely.
+/// Several call sites run synchronously on the UI thread — most critically
+/// the startup device sync in `main.rs`, which runs *before the window is
+/// even shown* — so an unbounded hang there doesn't just freeze the UI, it
+/// makes the whole app look like it never opened.
+pub const BACKEND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Error surface shared by every server call. Replaces the per-domain
 /// `DevicesError`/`SearchError` types, so all callers get the same
 /// `SessionExpired` signal to react to.
