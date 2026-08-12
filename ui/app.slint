@@ -34,6 +34,7 @@ export component AppWindow inherits Window {
     in-out property <string> max_tile_storage_mb: "1024";
     in-out property <string> tile_cache_size_text;
     in-out property <string> rov_info;
+    in-out property <string> local_network_info;
 
     // Phone GPS (NMEA/TAIP — auto-detects Bluetooth or TCP).
     in-out property <string> nmea_gps_port;
@@ -597,6 +598,7 @@ export component AppWindow inherits Window {
                 max_tile_storage_mb <=> root.max_tile_storage_mb;
                 tile_cache_size_text: root.tile_cache_size_text;
                 rov_info: root.rov_info;
+                local_network_info: root.local_network_info;
                 server_base_url <=> root.server_base_url;
                 app_version: root.app_version;
                 running_build_info: root.running_build_info;

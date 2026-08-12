@@ -74,6 +74,36 @@ pub fn parse_host_from_http_base(base: &str) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_owned))
 }
 
+/// Extracts the host and port an RTSP URL will actually connect to.
+///
+/// Used to prime ARP for the RTSP source itself (not `rov_http_base`, which
+/// may be a different, unrelated, or even unreachable endpoint — a bare
+/// test RTSP server has no HTTP API to probe at all). Defaults to the
+/// standard RTSP port 554 when the URL doesn't specify one.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::network::parse_rtsp_host_port;
+///
+/// assert_eq!(
+///     parse_rtsp_host_port("rtsp://admin:admin@192.168.1.88:8554/stream/0/0"),
+///     Some(("192.168.1.88".to_string(), 8554))
+/// );
+/// assert_eq!(
+///     parse_rtsp_host_port("rtsp://192.168.1.88/stream"),
+///     Some(("192.168.1.88".to_string(), 554))
+/// );
+/// assert_eq!(parse_rtsp_host_port("not a url"), None);
+/// ```
+#[must_use]
+pub fn parse_rtsp_host_port(rtsp_url: &str) -> Option<(String, u16)> {
+    let url = Url::parse(rtsp_url).ok()?;
+    let host = url.host_str()?.to_owned();
+    let port = url.port().unwrap_or(554);
+    Some((host, port))
+}
+
 /// Finds the network interface that is on the same subnet as `rov_host`.
 ///
 /// Uses `if-addrs` for cross-platform interface enumeration. On macOS, wired
@@ -379,9 +409,197 @@ pub fn select_active_macos_ethernet_interface(ifconfig_text: &str) -> Option<Str
     finish(&current)
 }
 
+/// Every non-loopback IPv4 address on this machine, paired with its
+/// interface name and sorted by interface name for stable display.
+///
+/// Used by the Settings screen so the operator can see (and hand off) the
+/// addresses another machine on the LAN would need to reach this one —
+/// e.g. confirming which adapter is actually on the ROV's subnet.
+#[must_use]
+pub fn local_ipv4_addresses() -> Vec<(String, std::net::Ipv4Addr)> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    local_ipv4_addresses_from(&interfaces)
+}
+
+/// Pure helper behind [`local_ipv4_addresses`], over a supplied interface
+/// list so it can be unit-tested on any platform.
+fn local_ipv4_addresses_from(
+    interfaces: &[if_addrs::Interface],
+) -> Vec<(String, std::net::Ipv4Addr)> {
+    let mut addrs: Vec<(String, std::net::Ipv4Addr)> = interfaces
+        .iter()
+        .filter(|iface| !iface.is_loopback())
+        .filter_map(|iface| match &iface.addr {
+            if_addrs::IfAddr::V4(v4) => Some((iface.name.clone(), v4.ip)),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect();
+    addrs.sort();
+    addrs
+}
+
+/// Formats interface/IP pairs (as returned by [`local_ipv4_addresses`]) into
+/// a single display line for the Settings screen.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::Ipv4Addr;
+/// use third_eye_client::network::format_local_ipv4_summary;
+///
+/// let addrs = vec![
+///     ("en0".to_string(), Ipv4Addr::new(10, 0, 0, 2)),
+///     ("en10".to_string(), Ipv4Addr::new(192, 168, 1, 103)),
+/// ];
+/// assert_eq!(
+///     format_local_ipv4_summary(&addrs),
+///     "en0: 10.0.0.2   \u{b7}   en10: 192.168.1.103"
+/// );
+/// assert_eq!(
+///     format_local_ipv4_summary(&[]),
+///     "No active network interfaces found."
+/// );
+/// ```
+#[must_use]
+pub fn format_local_ipv4_summary(addrs: &[(String, std::net::Ipv4Addr)]) -> String {
+    if addrs.is_empty() {
+        return "No active network interfaces found.".to_string();
+    }
+    addrs
+        .iter()
+        .map(|(name, ip)| format!("{name}: {ip}"))
+        .collect::<Vec<_>>()
+        .join("   \u{b7}   ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    fn make_iface(name: &str, addr: if_addrs::IfAddr) -> if_addrs::Interface {
+        if_addrs::Interface {
+            name: name.to_string(),
+            addr,
+            index: None,
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    fn v4_iface(name: &str, ip: [u8; 4]) -> if_addrs::Interface {
+        make_iface(
+            name,
+            if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+        )
+    }
+
+    fn v6_iface(name: &str) -> if_addrs::Interface {
+        make_iface(
+            name,
+            if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                ip: std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                netmask: std::net::Ipv6Addr::new(0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+        )
+    }
+
+    fn loopback_iface() -> if_addrs::Interface {
+        make_iface(
+            "lo0",
+            if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip: Ipv4Addr::LOCALHOST,
+                netmask: Ipv4Addr::new(255, 0, 0, 0),
+                prefixlen: 8,
+                broadcast: None,
+            }),
+        )
+    }
+
+    // ---- local_ipv4_addresses_from -----------------------------------------
+
+    #[test]
+    fn local_ipv4_addresses_skips_loopback_and_ipv6() {
+        let ifaces = vec![
+            loopback_iface(),
+            v6_iface("en0"),
+            v4_iface("en0", [10, 0, 0, 2]),
+        ];
+        assert_eq!(
+            local_ipv4_addresses_from(&ifaces),
+            vec![("en0".to_string(), Ipv4Addr::new(10, 0, 0, 2))]
+        );
+    }
+
+    #[test]
+    fn local_ipv4_addresses_sorted_by_interface_name() {
+        let ifaces = vec![
+            v4_iface("en10", [192, 168, 1, 103]),
+            v4_iface("en0", [10, 0, 0, 2]),
+        ];
+        assert_eq!(
+            local_ipv4_addresses_from(&ifaces),
+            vec![
+                ("en0".to_string(), Ipv4Addr::new(10, 0, 0, 2)),
+                ("en10".to_string(), Ipv4Addr::new(192, 168, 1, 103)),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_ipv4_addresses_empty_when_no_interfaces() {
+        assert_eq!(local_ipv4_addresses_from(&[]), Vec::new());
+    }
+
+    // ---- parse_rtsp_host_port -----------------------------------------------
+
+    #[test]
+    fn parse_rtsp_host_port_extracts_explicit_port() {
+        assert_eq!(
+            parse_rtsp_host_port("rtsp://admin:admin@192.168.1.88:8554/stream/0/0"),
+            Some(("192.168.1.88".to_string(), 8554))
+        );
+    }
+
+    #[test]
+    fn parse_rtsp_host_port_defaults_to_554() {
+        assert_eq!(
+            parse_rtsp_host_port("rtsp://192.168.1.88/stream"),
+            Some(("192.168.1.88".to_string(), 554))
+        );
+    }
+
+    #[test]
+    fn parse_rtsp_host_port_supports_hostnames() {
+        assert_eq!(
+            parse_rtsp_host_port("rtsp://rov.local:554/stream"),
+            Some(("rov.local".to_string(), 554))
+        );
+    }
+
+    #[test]
+    fn parse_rtsp_host_port_rejects_invalid_url() {
+        assert_eq!(parse_rtsp_host_port("not a url"), None);
+        assert_eq!(parse_rtsp_host_port(""), None);
+    }
+
+    #[test]
+    fn parse_rtsp_host_port_rejects_hostless_scheme() {
+        // A scheme without "//" (e.g. "rtsp:stream") parses as opaque with no
+        // host, unlike "rtsp://host/stream".
+        assert_eq!(parse_rtsp_host_port("rtsp:stream"), None);
+    }
 
     // ---- parse_host_from_http_base ----------------------------------------
 

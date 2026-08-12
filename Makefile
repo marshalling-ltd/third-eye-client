@@ -21,7 +21,7 @@ check: code nextest
 
 nextest:
 	@echo "third-eye-client: test (nextest)\n"
-	@cargo nextest run
+	@cargo nextest run --test-threads=1
 
 test:
 	@echo "third-eye-client: test\n"
@@ -31,7 +31,7 @@ test:
 
 nextest-cov:
 	@echo "third-eye-client: code coverage (nextest)\n"
-	@cargo llvm-cov --open nextest
+	@cargo llvm-cov --open nextest --test-threads=1
 
 test-cov:
 	@echo "third-eye-client: code coverage\n"
@@ -39,7 +39,7 @@ test-cov:
 
 coverage:
 	@echo "third-eye-client: code coverage (lcov)\n"
-	@cargo llvm-cov --lcov --output-path lcov.info nextest
+	@cargo llvm-cov --lcov --output-path lcov.info nextest --test-threads=1
 	@echo "Coverage report written to lcov.info"
 
 # --- Misc ---

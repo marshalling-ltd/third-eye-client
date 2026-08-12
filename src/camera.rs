@@ -4,6 +4,15 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::net::IpAddr;
+use std::time::Duration;
+
+/// Request timeout for `CameraApiClient`. Without this, a `reqwest` blocking
+/// client has no timeout at all: an unreachable ROV (interface not yet
+/// routed, ARP not resolved, wrong subnet) leaves the request hanging
+/// forever. Several call sites (e.g. the Windows ARP-priming probe in
+/// `main.rs` before starting the live stream) call this synchronously on the
+/// UI thread, so an unbounded hang there freezes the whole app.
+const CAMERA_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Photo format accepted by the camera's `/v1/capture` endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -302,8 +311,7 @@ impl CameraApiClient {
     #[must_use]
     #[allow(unused_variables)]
     pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
-        #[allow(unused_mut)]
-        let mut builder = Client::builder();
+        let mut builder = Client::builder().timeout(CAMERA_HTTP_TIMEOUT);
         #[cfg(unix)]
         if let Some(iface) = interface {
             builder = builder.interface(iface);

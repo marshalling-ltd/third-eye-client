@@ -114,6 +114,7 @@ impl AuthClient {
         let jar = Arc::new(PersistentCookieJar::load(Arc::clone(&db))?);
         let http = Client::builder()
             .cookie_provider(Arc::clone(&jar))
+            .timeout(super::api::BACKEND_HTTP_TIMEOUT)
             .build()
             .context("building authenticated reqwest client")?;
         Ok(Self { db, jar, http })

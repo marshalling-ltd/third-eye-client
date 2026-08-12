@@ -19,6 +19,10 @@ ffmpeg-arm64.zip
 ffmpeg-x86_64/
 ffmpeg-x86_64.zip
 
+# Local coverage output (cargo llvm-cov)
+lcov.info
+*.profraw
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

@@ -23,7 +23,7 @@ use third_eye_openapi::models::{
     PagedResponseDeviceModelItemsInner, UpdateDeviceSchema,
 };
 
-use super::api::{ApiError, ApiSession};
+use super::api::{ApiError, ApiSession, BACKEND_HTTP_TIMEOUT};
 use super::db::SharedDb;
 
 /// Flattened view of a `DeviceModel`/`PagedResponseDeviceModelItemsInner` for
@@ -86,7 +86,10 @@ pub struct DevicesClient {
 impl DevicesClient {
     pub(crate) fn new(api: ApiSession) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(BACKEND_HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             api,
         }
     }
