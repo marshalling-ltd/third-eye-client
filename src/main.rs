@@ -1774,6 +1774,11 @@ fn apply_device_configuration_to_client_config(
         && let Ok(mut url) = Url::parse(state.config.rtsp_url.trim())
     {
         let mut url_changed = false;
+        // Captured before `set_host` below overwrites it: tells us whether
+        // this device actually points at a different host than whatever
+        // was already in `rtsp_url`, as opposed to re-selecting/refreshing
+        // the same device.
+        let host_changed = host.as_deref().is_some_and(|h| Some(h) != url.host_str());
         if let Some(host) = host.as_deref() {
             url_changed |= url.set_host(Some(host)).is_ok();
         }
@@ -1786,8 +1791,6 @@ fn apply_device_configuration_to_client_config(
         if let Some(port) = rtsp_port {
             url_changed |= url.set_port(Some(port as u16)).is_ok();
         }
-        // Both optional: the path is only rebuilt when at least one is set.
-        // When neither is, the RTSP URL's own path is left untouched.
         if rtsp_channel.is_some() || rtsp_profile.is_some() {
             // Keep whichever of channel/profile isn't overridden at its
             // current value (defaulting to 0 if the path didn't already
@@ -1801,6 +1804,19 @@ fn apply_device_configuration_to_client_config(
             let channel = rtsp_channel.or(existing_channel).unwrap_or(0);
             let profile = rtsp_profile.or(existing_profile).unwrap_or(0);
             url.set_path(&format!("/stream/{channel}/{profile}"));
+            url_changed = true;
+        } else if host_changed {
+            // Neither channel nor profile is set on this device, but the
+            // host just changed to a *different* device. Carrying over the
+            // previous host's path here would silently splice two unrelated
+            // devices' paths together (e.g. a multi-camera ROV's
+            // "/stream/2/1" surviving into a device that should start at
+            // the default). Reset to the same "/stream/0/0" convention used
+            // above when channel/profile are set-but-default: it's the
+            // standard Chasing ROV path, and test RTSP servers that mirror
+            // it (e.g. MediaMTX configured with a "stream/0/0" path) work
+            // correctly out of the box instead of needing a manual edit.
+            url.set_path("/stream/0/0");
             url_changed = true;
         }
         if url_changed {
