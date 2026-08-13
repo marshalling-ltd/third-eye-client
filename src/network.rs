@@ -562,6 +562,44 @@ mod tests {
         assert_eq!(local_ipv4_addresses_from(&[]), Vec::new());
     }
 
+    // ---- local_ipv4_addresses (live wrapper) --------------------------------
+
+    #[test]
+    fn local_ipv4_addresses_returns_sorted_non_loopback() {
+        // Exercises the live `if_addrs::get_if_addrs()` wrapper itself (not
+        // just the pure `_from` helper above). The actual addresses depend
+        // on the machine running the test, so this only checks the
+        // invariants `local_ipv4_addresses_from` guarantees: sorted by
+        // interface name, loopback excluded.
+        let addrs = local_ipv4_addresses();
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        assert_eq!(addrs, sorted);
+        assert!(addrs.iter().all(|(_, ip)| !ip.is_loopback()));
+    }
+
+    // ---- format_local_ipv4_summary ------------------------------------------
+
+    #[test]
+    fn format_local_ipv4_summary_joins_multiple_entries() {
+        let addrs = vec![
+            ("en0".to_string(), Ipv4Addr::new(10, 0, 0, 2)),
+            ("en10".to_string(), Ipv4Addr::new(192, 168, 1, 103)),
+        ];
+        assert_eq!(
+            format_local_ipv4_summary(&addrs),
+            "en0: 10.0.0.2   \u{b7}   en10: 192.168.1.103"
+        );
+    }
+
+    #[test]
+    fn format_local_ipv4_summary_handles_empty() {
+        assert_eq!(
+            format_local_ipv4_summary(&[]),
+            "No active network interfaces found."
+        );
+    }
+
     // ---- parse_rtsp_host_port -----------------------------------------------
 
     #[test]
