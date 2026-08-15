@@ -121,7 +121,7 @@ fn recalibrate_result_delivered_from_background_thread() {
         .recv_timeout(Duration::from_secs(5))
         .expect("background thread should deliver result within 5 s");
 
-    assert!(result.interface.is_empty());
+    assert_eq!(result.interface, "");
     assert!(result.rov_info.contains("not-an-ip"));
     assert!(result.rov_info.contains("No ROV interface"));
 }

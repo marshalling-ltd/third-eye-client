@@ -20,8 +20,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
           rustup component add rustfmt clippy
 
       - name: Install system dependencies
@@ -65,8 +65,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -99,8 +99,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
 
       - name: Install system dependencies
         run: |

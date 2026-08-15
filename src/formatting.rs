@@ -256,7 +256,7 @@ mod tests {
     fn format_epoch_ms_datetime_returns_string() {
         // Just verify it doesn't panic and returns a non-empty string.
         let result = format_epoch_ms_datetime(1_705_321_845_000);
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         // Should contain a date-like pattern.
         assert!(result.contains("2024"));
     }

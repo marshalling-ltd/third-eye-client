@@ -205,7 +205,7 @@ mod tests {
         store.config().set("x", "1").unwrap();
         assert_eq!(store.config().get("x").unwrap().as_deref(), Some("1"));
         assert_eq!(store.outbox().pending_count().unwrap(), 0);
-        assert!(store.media().list_recent(10).unwrap().is_empty());
+        assert_eq!(store.media().list_recent(10).unwrap(), []);
         assert!(store.auth().current_session().unwrap().is_none());
     }
 
