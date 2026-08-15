@@ -5177,8 +5177,7 @@ fn cleanup_stale_rov_route(rov_host: &str) {
     let has_route = Command::new("netstat")
         .args(["-rn", "-f", "inet"])
         .output()
-        .ok()
-        .is_some_and(|output| {
+        .is_ok_and(|output| {
             let text = String::from_utf8_lossy(&output.stdout);
             text.lines().any(|line| {
                 line.contains(rov_host)

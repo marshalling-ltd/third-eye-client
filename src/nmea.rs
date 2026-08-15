@@ -1838,7 +1838,7 @@ mod tests {
         // On macOS this short-circuits before touching blueutil; elsewhere it
         // returns the platform message. Either way it must be non-empty.
         let msg = NmeaGpsState::prepare_bluetooth("");
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
     }
 
     // ---- poll_events via injected events ----------------------------------
@@ -2239,7 +2239,7 @@ mod tests {
     #[test]
     fn bt_guidance_other_os_is_nonempty() {
         let msg = bluetooth_pairing_guidance("freebsd", "");
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
         assert!(msg.to_lowercase().contains("bluetooth"), "{msg}");
     }
 
