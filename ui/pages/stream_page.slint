@@ -10,6 +10,12 @@ export component StreamPage inherits Rectangle {
     in property <image> stream_image;
     in property <bool> has_stream_image: false;
     in property <bool> stream_is_active: false;
+    // Human-readable stream status/error text (e.g. "Failed to start
+    // stream: ...", a JPEG decode error, "Stream ended."). Computed and set
+    // in main.rs on every state change, but previously never displayed
+    // anywhere in this page — shown here so connection failures are
+    // diagnosable instead of just leaving the "No stream active" fallback.
+    in property <string> stream_status;
     in property <bool> has_rov_status: false;
     in property <bool> rov_listener_running: false;
     in property <bool> nmea_gps_running: false;
@@ -27,28 +33,34 @@ export component StreamPage inherits Rectangle {
 
     callback capture_photo();
     callback navigate_profile();
-    // Re-runs ROV network auto-detection + OS route setup (same background
-    // flow as Configuration's "Recalibrate ROV network" button). Exposed
-    // here too since a bad route is most visible — and most useful to fix —
-    // right on the stream itself.
+    // Re-runs ROV network auto-detection + OS route setup, *and* restarts
+    // the ffmpeg pipeline from scratch (fresh process, fresh RTSP session,
+    // fresh keyframe) — so this recovers both a bad route and on-screen
+    // decode corruption (garbled/blocky video) in one action.
     callback recalibrate_rov_network();
 
     background: #000000;
     clip: true;
 
-    // Full-bleed video
+    // Full-bleed video: `cover` crops to fill edge-to-edge (no letterbox
+    // bars), matching the Device Map's full-bleed tile background rather
+    // than the previous `contain`, which shrank the video to fit inside
+    // black bars whenever its aspect ratio didn't match the window.
     if root.has_stream_image : Image {
         width: parent.width;
         height: parent.height;
         source: root.stream_image;
-        image-fit: contain;
+        image-fit: cover;
     }
     if !root.has_stream_image : Text {
-        text: "No stream active. Press \u{25b6} Start to begin.";
-        color: #555555;
-        font-size: 18px;
+        text: root.stream_status == "" ? "No stream active. Press \u{25b6} Start to begin." : root.stream_status;
+        color: #8f96a3;
+        font-size: 16px;
+        wrap: word-wrap;
         horizontal-alignment: center;
         vertical-alignment: center;
+        width: parent.width * 0.7;
+        x: parent.width * 0.15;
     }
 
     // Top-left: active-device indicator. Clicking it when no device is set
