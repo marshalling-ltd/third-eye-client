@@ -34,11 +34,23 @@ jobs:
 
       - name: Bundle ffmpeg
         run: |
-          # brew gives us the native arm64 binary; Rosetta 2 runs it
-          # transparently on Intel Macs so no lipo is needed.
+          # macos-14 runners are arm64 (Apple Silicon) natively, so plain
+          # `brew install` only gives us an arm64 binary. Rosetta 2 only
+          # translates x86_64 -> arm64; it does NOT run arm64 binaries on
+          # Intel Macs. An arm64-only ffmpeg fails outright on Intel users
+          # ("Bad CPU type in executable"), so build both slices and lipo
+          # them together, same as the app binary above.
           brew install --quiet ffmpeg
-          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-bundled
+          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-arm64
+
+          softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          arch -x86_64 /usr/local/bin/brew install --quiet ffmpeg
+          cp /usr/local/bin/ffmpeg ffmpeg-x86_64
+
+          lipo -create ffmpeg-arm64 ffmpeg-x86_64 -output ffmpeg-bundled
           chmod +x ffmpeg-bundled
+          lipo -info ffmpeg-bundled
           file ffmpeg-bundled
 
       - name: Assemble .app bundle
@@ -64,7 +76,8 @@ jobs:
           # The app is already staged/codesigned; target artifacts are no longer
           # needed for DMG creation.
           rm -rf target
-          rm -f ffmpeg-bundled
+          rm -f ffmpeg-bundled ffmpeg-arm64 ffmpeg-x86_64
+          sudo rm -rf /usr/local/Homebrew /usr/local/Cellar || true
 
           # Homebrew package/cache cleanup can recover significant space on
           # hosted runners.
