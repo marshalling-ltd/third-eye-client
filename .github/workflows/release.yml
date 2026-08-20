@@ -37,34 +37,58 @@ jobs:
           # macos-14 runners are arm64 (Apple Silicon) natively, so plain
           # `brew install` only gives us an arm64 binary. Rosetta 2 only
           # translates x86_64 -> arm64; it does NOT run arm64 binaries on
-          # Intel Macs. An arm64-only ffmpeg fails outright on Intel users
-          # ("Bad CPU type in executable"), so build both slices and lipo
-          # them together, same as the app binary above.
+          # Intel Macs, so an arm64-only ffmpeg fails outright there
+          # ("Bad CPU type in executable"). We build both slices below.
+          #
+          # A plain lipo-merged ffmpeg still wouldn't run anywhere else,
+          # though: Homebrew's ffmpeg is dynamically linked against ~20
+          # Cellar/opt dylibs (libavcodec, libx264, openssl, ...), and those
+          # absolute paths only exist on the machine that built it ("Reason:
+          # tried '.../Cellar/ffmpeg/.../libavdevice.dylib' (no such file)"
+          # on any other machine, or even the same machine after a `brew
+          # upgrade`). So instead of one universal ffmpeg, bundle each arch
+          # as a self-contained {ffmpeg binary + its dylibs} directory via
+          # dylibbundler, and let the app pick the matching one at launch.
+          brew install --quiet dylibbundler
+
           brew install --quiet ffmpeg
-          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-arm64
+          mkdir -p ffmpeg-arm64/lib
+          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-arm64/ffmpeg
+          dylibbundler -od -b \
+            -x ffmpeg-arm64/ffmpeg \
+            -d ffmpeg-arm64/lib \
+            -p '@executable_path/lib/'
+          file ffmpeg-arm64/ffmpeg
 
           softwareupdate --install-rosetta --agree-to-license
           arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
           arch -x86_64 /usr/local/bin/brew install --quiet ffmpeg
-          cp /usr/local/bin/ffmpeg ffmpeg-x86_64
-
-          lipo -create ffmpeg-arm64 ffmpeg-x86_64 -output ffmpeg-bundled
-          chmod +x ffmpeg-bundled
-          lipo -info ffmpeg-bundled
-          file ffmpeg-bundled
+          mkdir -p ffmpeg-x86_64/lib
+          cp /usr/local/bin/ffmpeg ffmpeg-x86_64/ffmpeg
+          dylibbundler -od -b \
+            -x ffmpeg-x86_64/ffmpeg \
+            -d ffmpeg-x86_64/lib \
+            -p '@executable_path/lib/'
+          file ffmpeg-x86_64/ffmpeg
 
       - name: Assemble .app bundle
         run: |
           APP="staging/Third Eye.app"
-          mkdir -p "$APP/Contents/MacOS/bin"
+          mkdir -p "$APP/Contents/MacOS/bin/arm64/lib" "$APP/Contents/MacOS/bin/x86_64/lib"
           mkdir -p "$APP/Contents/Resources"
           cp target/third-eye-client-universal "$APP/Contents/MacOS/third-eye-client"
           chmod 755 "$APP/Contents/MacOS/third-eye-client"
-          cp ffmpeg-bundled "$APP/Contents/MacOS/bin/ffmpeg"
-          chmod 755 "$APP/Contents/MacOS/bin/ffmpeg"
+
+          cp ffmpeg-arm64/ffmpeg "$APP/Contents/MacOS/bin/arm64/ffmpeg"
+          cp ffmpeg-arm64/lib/*.dylib "$APP/Contents/MacOS/bin/arm64/lib/" 2>/dev/null || true
+          cp ffmpeg-x86_64/ffmpeg "$APP/Contents/MacOS/bin/x86_64/ffmpeg"
+          cp ffmpeg-x86_64/lib/*.dylib "$APP/Contents/MacOS/bin/x86_64/lib/" 2>/dev/null || true
+          chmod -R 755 "$APP/Contents/MacOS/bin"
+
           cp macos/Info.plist "$APP/Contents/Info.plist"
           cp assets/logo.icns "$APP/Contents/Resources/logo.icns"
-          codesign --force --sign - "$APP/Contents/MacOS/bin/ffmpeg"
+
+          find "$APP/Contents/MacOS/bin" -type f -exec codesign --force --sign - {} \;
           codesign --force --sign - "$APP/Contents/MacOS/third-eye-client"
           codesign --force --sign - "$APP"
       - name: Reclaim disk space before DMG
@@ -76,7 +100,7 @@ jobs:
           # The app is already staged/codesigned; target artifacts are no longer
           # needed for DMG creation.
           rm -rf target
-          rm -f ffmpeg-bundled ffmpeg-arm64 ffmpeg-x86_64
+          rm -rf ffmpeg-arm64 ffmpeg-x86_64
           sudo rm -rf /usr/local/Homebrew /usr/local/Cellar || true
 
           # Homebrew package/cache cleanup can recover significant space on

@@ -269,9 +269,9 @@ export component AppWindow inherits Window {
     }
 
     // Absolute positioning rather than a VerticalBox so the full-bleed Device
-    // Map can run edge to edge with the top bar floating over it; every other
-    // screen starts below the bar as before. content_panel is declared first so
-    // the bar paints on top of it.
+    // Map and Live Stream screens can run edge to edge with the top bar
+    // floating over them; every other screen starts below the bar as before.
+    // content_panel is declared first so the bar paints on top of it.
     //
     // No permanent sidebar (grid-menu popup instead) and no native OS menu bar
     // (previously File/View/Help): every action either menu exposed is reachable
@@ -280,7 +280,7 @@ export component AppWindow inherits Window {
     Rectangle {
         content_panel := Rectangle {
             x: 0;
-            y: root.active_screen == 0 ? 0px : top_bar.height;
+            y: (root.active_screen == 0 || root.active_screen == 1) ? 0px : top_bar.height;
             width: parent.width;
             height: parent.height - self.y;
             background: #202328;
@@ -745,9 +745,9 @@ export component AppWindow inherits Window {
             x: 0;
             y: 0;
             width: parent.width;
-            // Transparent and floating over the Device Map; a solid bar
-            // everywhere else.
-            overlay: root.active_screen == 0;
+            // Transparent and floating over the Device Map / Live Stream;
+            // a solid bar everywhere else.
+            overlay: root.active_screen == 0 || root.active_screen == 1;
             auth_is_signed_in: root.auth_is_signed_in;
             avatar_text: root.auth_avatar_text;
             active_screen: root.active_screen;

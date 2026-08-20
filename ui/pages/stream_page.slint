@@ -64,12 +64,14 @@ export component StreamPage inherits Rectangle {
     }
 
     // Top-left: active-device indicator. Clicking it when no device is set
-    // jumps to Profile > Devices so the user can pick one.
+    // jumps to Profile > Devices so the user can pick one. Dropped below the
+    // floating top bar (52px) so it clears the logo, matching the map's own
+    // top-right zoom group.
     Rectangle {
         width: 220px;
         height: 32px;
         x: 10px;
-        y: 10px;
+        y: 52px;
         border-radius: 8px;
         background: #0d1a2acc;
         border-width: 1px;
@@ -115,7 +117,7 @@ export component StreamPage inherits Rectangle {
         width: 220px;
         height: 26px;
         x: 10px;
-        y: 46px;
+        y: 88px;
         border-radius: 8px;
         background: recalibrate-ta.pressed ? #0a84ff55 : recalibrate-ta.has-hover ? #0a84ff33 : #0d1a2acc;
         border-width: 1px;
@@ -136,12 +138,13 @@ export component StreamPage inherits Rectangle {
         }
     }
 
-    // Top-right: compact status indicators
+    // Top-right: compact status indicators. Dropped below the floating top
+    // bar (52px) so it clears the grid-menu and avatar buttons.
     Rectangle {
         width: 130px;
         height: 60px;
         x: parent.width - self.width - 10px;
-        y: 10px;
+        y: 52px;
         border-radius: 12px;
         background: #0d1a2acc;
         border-width: 1px;
