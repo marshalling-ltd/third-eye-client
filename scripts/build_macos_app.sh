@@ -42,7 +42,11 @@ ARCH_BINARIES=()
 
 for target in "${TARGETS[@]}"; do
   echo "Building $EXECUTABLE_NAME ($BUILD_PROFILE) for $target..."
-  cargo build "${CARGO_BUILD_ARGS[@]}" --bin "$EXECUTABLE_NAME" --target "$target"
+  # .cargo/config.toml sets rustflags = ["-Z", "threads=4"] for fast nightly
+  # dev builds; that flag is rejected by the stable toolchain this packaging
+  # script runs release builds with, so clear it here (release.yml does the
+  # same for its release build steps).
+  RUSTFLAGS="" cargo build "${CARGO_BUILD_ARGS[@]}" --bin "$EXECUTABLE_NAME" --target "$target"
   bin="$ROOT_DIR/target/$target/$PROFILE_DIR/$EXECUTABLE_NAME"
   if [[ ! -f "$bin" ]]; then
     echo "Error: expected binary not found at $bin" >&2
@@ -95,11 +99,26 @@ if [[ -n "$FFMPEG_SOURCE" ]]; then
       echo "  lipo -info output: $FFMPEG_ARCHS" >&2
     fi
   done
+  # Homebrew's ffmpeg is dynamically linked against ~20 Cellar/opt dylibs
+  # (libavcodec, libx264, openssl, ...); copying just the binary breaks the
+  # moment those exact paths/versions aren't present (e.g. after `brew
+  # upgrade ffmpeg`, or on any other machine). dylibbundler rewrites the
+  # binary to load bundled copies via @executable_path instead.
+  if ! command -v dylibbundler >/dev/null 2>&1; then
+    echo "Error: dylibbundler is required to bundle ffmpeg's shared library dependencies." >&2
+    echo "  Install it with: brew install dylibbundler" >&2
+    exit 1
+  fi
+
   FFMPEG_DEST_DIR="$MACOS_DIR/bin"
-  mkdir -p "$FFMPEG_DEST_DIR"
+  mkdir -p "$FFMPEG_DEST_DIR/lib"
   cp "$FFMPEG_SOURCE" "$FFMPEG_DEST_DIR/ffmpeg"
   chmod 755 "$FFMPEG_DEST_DIR/ffmpeg"
-  echo "Bundled ffmpeg from: $FFMPEG_SOURCE"
+  dylibbundler -od -b \
+    -x "$FFMPEG_DEST_DIR/ffmpeg" \
+    -d "$FFMPEG_DEST_DIR/lib" \
+    -p '@executable_path/lib/'
+  echo "Bundled ffmpeg (with its shared libraries) from: $FFMPEG_SOURCE"
 else
   echo "Warning: ffmpeg was not found. Stream feature may fail inside the .app bundle."
 fi

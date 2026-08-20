@@ -5670,14 +5670,32 @@ fn locate_ffmpeg_binary() -> Option<PathBuf> {
     } else {
         "ffmpeg"
     };
+    // The macOS release build ships a self-contained ffmpeg (binary + its
+    // dylibs) per architecture under bin/<arch>/, since arm64 and x86_64
+    // builds pull in different Homebrew shared libraries; each universal
+    // binary slice compiles this constant separately, so it matches the
+    // arch actually running (never Rosetta-translated).
+    let arch_dir = if cfg!(target_arch = "aarch64") {
+        Some("arm64")
+    } else if cfg!(target_arch = "x86_64") {
+        Some("x86_64")
+    } else {
+        None
+    };
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
+        if let Some(arch_dir) = arch_dir {
+            candidates.push(dir.join("bin").join(arch_dir).join(exe_name));
+        }
         candidates.push(dir.join("bin").join(exe_name));
         candidates.push(dir.join(exe_name));
     }
     if let Ok(cwd) = std::env::current_dir() {
+        if let Some(arch_dir) = arch_dir {
+            candidates.push(cwd.join("bin").join(arch_dir).join(exe_name));
+        }
         candidates.push(cwd.join("bin").join(exe_name));
         candidates.push(cwd.join(exe_name));
     }
