@@ -21,7 +21,7 @@ check: code nextest
 
 nextest:
 	@echo "third-eye-client: test (nextest)\n"
-	@rustup run nightly cargo nextest run --test-threads=1
+	@rustup run nightly cargo nextest run
 
 test:
 	@echo "third-eye-client: test\n"
@@ -31,7 +31,7 @@ test:
 
 nextest-cov:
 	@echo "third-eye-client: code coverage (nextest)\n"
-	@rustup run nightly cargo llvm-cov --open nextest --test-threads=1
+	@rustup run nightly cargo llvm-cov --open nextest
 
 test-cov:
 	@echo "third-eye-client: code coverage\n"
@@ -39,7 +39,7 @@ test-cov:
 
 coverage:
 	@echo "third-eye-client: code coverage (lcov)\n"
-	@rustup run nightly cargo llvm-cov --lcov --output-path lcov.info nextest --test-threads=1
+	@rustup run nightly cargo llvm-cov --lcov --output-path lcov.info nextest
 	@echo "Coverage report written to lcov.info"
 	
 # --- Misc ---
@@ -60,6 +60,7 @@ requirements:
 	@echo "third-eye-client: requirements\n"
 	@rustup update
 	@rustup install nightly
+	@rustup component add rustc-codegen-cranelift-preview --toolchain nightly
 	@cargo install cargo-audit
 	@cargo install cargo-deny
 	@cargo install cargo-edit
