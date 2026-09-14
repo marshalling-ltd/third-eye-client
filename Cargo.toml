@@ -10,7 +10,7 @@ default = []
 test-tools = []
 
 [[bin]]
-name = "test_udp_server"
+name = "test-udp-server"
 path = "src/bin/test_udp_server.rs"
 required-features = ["test-tools"]
 
