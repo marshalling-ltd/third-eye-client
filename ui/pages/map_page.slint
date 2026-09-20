@@ -71,10 +71,10 @@ export component MapPage inherits Rectangle {
         background: #ffffff;
 
         map_fli := Flickable {
-            viewport-x <=> root.map_viewport_x;
-            viewport-y <=> root.map_viewport_y;
-            viewport-width: root.map_viewport_width;
-            viewport-height: root.map_viewport_height;
+            content-x <=> root.map_viewport_x;
+            content-y <=> root.map_viewport_y;
+            content-width: root.map_viewport_width;
+            content-height: root.map_viewport_height;
 
             for tile in root.map_tiles : Image {
                 x: tile.x;
@@ -215,12 +215,12 @@ export component MapPage inherits Rectangle {
             }
 
             flicked => {
-                root.map_flicked(map_fli.viewport-x, map_fli.viewport-y, map_canvas.width, map_canvas.height);
+                root.map_flicked(map_fli.content-x, map_fli.content-y, map_canvas.width, map_canvas.height);
             }
 
             wheel_zoom_area := TouchArea {
-                x: -map_fli.viewport-x;
-                y: -map_fli.viewport-y;
+                x: -map_fli.content-x;
+                y: -map_fli.content-y;
                 width: map_canvas.width;
                 height: map_canvas.height;
 
@@ -228,8 +228,8 @@ export component MapPage inherits Rectangle {
                     if (event.delta-y != 0px) {
                         root.map_scroll_zoom(
                             event.delta-y,
-                            map_fli.viewport-x,
-                            map_fli.viewport-y,
+                            map_fli.content-x,
+                            map_fli.content-y,
                             map_canvas.width,
                             map_canvas.height
                         );
@@ -257,8 +257,8 @@ export component MapPage inherits Rectangle {
                     self.scale,
                     self.center.x,
                     self.center.y,
-                    map_fli.viewport-x,
-                    map_fli.viewport-y,
+                    map_fli.content-x,
+                    map_fli.content-y,
                     map_canvas.width,
                     map_canvas.height
                 );
@@ -310,8 +310,8 @@ export component MapPage inherits Rectangle {
                 btn-plus-ta := TouchArea {
                     clicked => {
                         root.map_zoom_in(
-                            map_fli.viewport-x,
-                            map_fli.viewport-y,
+                            map_fli.content-x,
+                            map_fli.content-y,
                             map_canvas.width,
                             map_canvas.height
                         );
@@ -347,8 +347,8 @@ export component MapPage inherits Rectangle {
                 btn-minus-ta := TouchArea {
                     clicked => {
                         root.map_zoom_out(
-                            map_fli.viewport-x,
-                            map_fli.viewport-y,
+                            map_fli.content-x,
+                            map_fli.content-y,
                             map_canvas.width,
                             map_canvas.height
                         );
@@ -431,8 +431,8 @@ export component MapPage inherits Rectangle {
                 btn-center-ta := TouchArea {
                     clicked => {
                         root.center_map_on_pin(
-                            map_fli.viewport-x,
-                            map_fli.viewport-y,
+                            map_fli.content-x,
+                            map_fli.content-y,
                             map_canvas.width,
                             map_canvas.height
                         );

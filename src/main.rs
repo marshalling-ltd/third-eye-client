@@ -1176,8 +1176,7 @@ fn apply_devices_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
         state
             .devices
             .active()
-            .map(|device| device.name.clone())
-            .unwrap_or_default()
+            .map_or_default(|device| device.name.clone())
             .into(),
     );
     if let Some(device) = state.devices.selected() {
@@ -1468,14 +1467,11 @@ impl DeviceConfigDraft {
     /// ROV the user is already talking to.
     fn default_from_config(config: &AppConfig) -> Self {
         let rtsp_url = Url::parse(config.rtsp_url.trim()).ok();
-        let (username, password) = rtsp_url
-            .as_ref()
-            .map(|url| {
-                let username = (!url.username().is_empty()).then(|| url.username().to_owned());
-                let password = url.password().map(str::to_owned);
-                (username, password)
-            })
-            .unwrap_or_default();
+        let (username, password) = rtsp_url.as_ref().map_or_default(|url| {
+            let username = (!url.username().is_empty()).then(|| url.username().to_owned());
+            let password = url.password().map(str::to_owned);
+            (username, password)
+        });
         let rtsp_port = rtsp_url
             .as_ref()
             .and_then(reqwest::Url::port)
@@ -1537,13 +1533,12 @@ impl DeviceConfigDraft {
             .rtsp
             .as_deref()
             .and_then(|r| r.credentials.as_deref())
-            .map(|c| {
+            .map_or_default(|c| {
                 (
                     c.username.clone().unwrap_or_default(),
                     c.password.clone().unwrap_or_default(),
                 )
-            })
-            .unwrap_or_default();
+            });
         let rtsp_transport = configuration
             .rtsp
             .as_deref()
@@ -1745,8 +1740,7 @@ fn apply_device_configuration_to_client_config(
         .rtsp
         .as_deref()
         .and_then(|r| r.credentials.as_deref())
-        .map(|c| (c.username.clone(), c.password.clone()))
-        .unwrap_or_default();
+        .map_or_default(|c| (c.username.clone(), c.password.clone()));
     let rtsp_port = configuration.rtsp.as_deref().and_then(|r| r.port);
     let rtsp_channel = configuration.rtsp.as_deref().and_then(|r| r.channel);
     let rtsp_profile = configuration.rtsp.as_deref().and_then(|r| r.profile);
@@ -2038,15 +2032,14 @@ fn pull_configuration_from_ui(ui: &AppWindow, state: &mut ThirdEyeState, store: 
         .tile_cache()
         .total_size()
         .ok()
-        .map(|bytes| {
+        .map_or_default(|bytes| {
             let mb = bytes as f64 / (1024.0 * 1024.0);
             if mb < 0.1 {
                 format!("{} KB", bytes / 1024)
             } else {
                 format!("{mb:.1} MB")
             }
-        })
-        .unwrap_or_default();
+        });
     state.auth.email = ui.get_auth_email().to_string();
     state.auth.password = ui.get_auth_password().to_string();
     if let Err(err) = store.config().save_client(&state.config.to_client_config()) {
@@ -2473,18 +2466,13 @@ fn load_image_preview(path: &str, max_dim: u32) -> Option<slint::Image> {
 
 fn populate_capture_overlay(state: &mut ThirdEyeState, meta: &StoredCaptureMetadata) {
     state.media.capture_datetime = format_epoch_ms_datetime(meta.captured_at_ms);
-    state.media.capture_depth = meta
-        .depth_m
-        .map(|d| format!("{d:.1} m"))
-        .unwrap_or_default();
+    state.media.capture_depth = meta.depth_m.map_or_default(|d| format!("{d:.1} m"));
     state.media.capture_temp = meta
         .temperature_c
-        .map(|t| format!("{t:.1} \u{00b0}C"))
-        .unwrap_or_default();
+        .map_or_default(|t| format!("{t:.1} \u{00b0}C"));
     state.media.capture_heading = meta
         .yaw
-        .map(|y| format!("{:.0}\u{00b0}", y.to_degrees().rem_euclid(360.0)))
-        .unwrap_or_default();
+        .map_or_default(|y| format!("{:.0}\u{00b0}", y.to_degrees().rem_euclid(360.0)));
     state.media.capture_attitude = match (meta.pitch, meta.roll) {
         (Some(p), Some(r)) => format!(
             "P {:.1}\u{00b0}  R {:.1}\u{00b0}",
@@ -2505,15 +2493,14 @@ fn populate_capture_overlay(state: &mut ThirdEyeState, meta: &StoredCaptureMetad
         .batteries_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
-        .map(|batts| {
+        .map_or_default(|batts| {
             batts
                 .iter()
                 .filter_map(|b| b.get("remain").and_then(serde_json::Value::as_i64))
                 .map(|r| format!("{r}%"))
                 .collect::<Vec<_>>()
                 .join(" / ")
-        })
-        .unwrap_or_default();
+        });
 }
 
 fn clear_capture_overlay(state: &mut ThirdEyeState) {
@@ -2609,8 +2596,7 @@ fn apply_media_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
                 has_thumbnail: thumb.is_some(),
                 captured_at_text: r
                     .captured_at_ms
-                    .map(format_epoch_ms_datetime)
-                    .unwrap_or_default()
+                    .map_or_default(format_epoch_ms_datetime)
                     .into(),
             }
         })
@@ -3009,8 +2995,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     .rows
                     .iter()
                     .find(|device| device.id == id)
-                    .map(|device| device.name.clone())
-                    .unwrap_or_default();
+                    .map_or_default(|device| device.name.clone());
                 state.devices.status_text = format!(
                     "\"{device_name}\" is now your active device for Device Map / Live Stream."
                 );

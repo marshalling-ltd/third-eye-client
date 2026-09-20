@@ -586,7 +586,7 @@ fn format_legacy_error(op: &str, status: reqwest::StatusCode, body: &str) -> Str
         return format!("{op} failed with HTTP {status}");
     }
     if let Ok(envelope) = serde_json::from_str::<LegacyErrorEnvelope>(body) {
-        let code = envelope.code.map(|c| c.to_string()).unwrap_or_default();
+        let code = envelope.code.map_or_default(|c| c.to_string());
         let err = envelope.error.unwrap_or_default();
         if !code.is_empty() || !err.is_empty() {
             return format!("{op} failed (HTTP {status}, code={code}, error={err:?})");

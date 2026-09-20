@@ -845,9 +845,8 @@ fn macos_command_available(cmd: &str) -> bool {
     if path.is_absolute() {
         return path.exists();
     }
-    let mut dirs: Vec<String> = std::env::var("PATH")
-        .map(|value| value.split(':').map(str::to_owned).collect())
-        .unwrap_or_default();
+    let mut dirs: Vec<String> =
+        std::env::var("PATH").map_or_default(|value| value.split(':').map(str::to_owned).collect());
     for extra in [
         "/usr/bin",
         "/bin",
