@@ -69,11 +69,16 @@ jobs:
           # no such restriction, so bootstrap it manually the same way
           # install.sh would lay it out (this mirrors Homebrew's own
           # documented portable/manual install method).
-          sudo mkdir -p /usr/local/Homebrew
-          sudo chown -R "$(whoami)" /usr/local/Homebrew
+          sudo mkdir -p /usr/local/Homebrew \
+            /usr/local/bin /usr/local/etc /usr/local/include /usr/local/lib \
+            /usr/local/sbin /usr/local/share /usr/local/var /usr/local/opt \
+            /usr/local/Cellar /usr/local/Caskroom /usr/local/Frameworks
+          sudo chown -R "$(whoami)" /usr/local/Homebrew \
+            /usr/local/bin /usr/local/etc /usr/local/include /usr/local/lib \
+            /usr/local/sbin /usr/local/share /usr/local/var /usr/local/opt \
+            /usr/local/Cellar /usr/local/Caskroom /usr/local/Frameworks
           git clone --depth=1 https://github.com/Homebrew/brew /usr/local/Homebrew
-          sudo mkdir -p /usr/local/bin
-          sudo ln -sf /usr/local/Homebrew/bin/brew /usr/local/bin/brew
+          ln -sf /usr/local/Homebrew/bin/brew /usr/local/bin/brew
           arch -x86_64 /usr/local/bin/brew install --quiet ffmpeg
           mkdir -p ffmpeg-x86_64/lib
           cp /usr/local/bin/ffmpeg ffmpeg-x86_64/ffmpeg
