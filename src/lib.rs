@@ -16,6 +16,7 @@
 
 pub mod camera;
 pub mod formatting;
+pub mod ip_location;
 pub mod network;
 pub mod nmea;
 pub mod rov_status;
