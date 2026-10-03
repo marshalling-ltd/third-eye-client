@@ -716,10 +716,10 @@ struct ThirdEyeState {
     /// Background refresh-cookie keepalive, so an idle-but-signed-in app keeps
     /// a usable session indefinitely.
     session_keepalive: SessionKeepaliveState,
-    /// Background startup location warmup (Windows only). A background thread
-    /// calls the blocking GPS API and sends the result here; the timer loop
-    /// picks it up and applies it without blocking the UI.
-    #[cfg(target_os = "windows")]
+    /// Background startup location warmup (Windows: OS GPS API; Linux/others:
+    /// IP geolocation). A background thread sends the result here; the timer
+    /// loop picks it up and applies it without blocking the UI.
+    #[cfg(not(target_os = "macos"))]
     startup_location_rx: Option<mpsc::Receiver<Result<(f64, f64), String>>>,
 }
 
@@ -834,7 +834,7 @@ impl ThirdEyeState {
             update: UpdateUiState::new(),
             nearby: NearbyResourcesState::new(),
             session_keepalive: SessionKeepaliveState::new(),
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_os = "macos"))]
             startup_location_rx: None,
         };
         let _ = refresh_nmea_serial_candidates(&mut state);
@@ -3847,6 +3847,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 None
             }
         };
+        // Linux / others: retry the approximate IP lookup in the background.
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        if fresh.is_none() && state.startup_location_rx.is_none() {
+            state.startup_location_rx = Some(spawn_ip_location_lookup());
+        }
         if let Some((lat, lon, source)) = fresh {
             state.map.lat = Some(lat);
             state.map.lon = Some(lon);
@@ -5715,7 +5720,8 @@ fn main() -> Result<()> {
     // Windows – the blocking GPS call runs in a background thread; the result
     //            is forwarded to the UI timer via an mpsc channel.
     //
-    // Linux / others – no native GPS source; nothing to warm up.
+    // Linux / others – no native location service; fall back to approximate
+    //            IP-based geolocation in a background thread.
     #[cfg(target_os = "macos")]
     {
         let mut s = state.borrow_mut();
@@ -5739,6 +5745,10 @@ fn main() -> Result<()> {
             let _ = loc_tx.send(result);
         });
         state.borrow_mut().startup_location_rx = Some(loc_rx);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        state.borrow_mut().startup_location_rx = Some(spawn_ip_location_lookup());
     }
     // Auto-detect ROV network interface at startup (passive ifconfig scan).
     {
@@ -5892,7 +5902,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_os = "macos"))]
             {
                 let warmup_fix = if let Some(rx) = &state.startup_location_rx {
                     rx.try_recv().ok()
@@ -5902,13 +5912,27 @@ fn main() -> Result<()> {
                 if let Some(result) = warmup_fix {
                     state.startup_location_rx = None;
                     if let Ok((lat, lon)) = result {
-                        if state.location_detected_at_ms == 0 {
+                        // Windows reports a real device position. The Linux IP
+                        // lookup is only an approximate centering hint: it never
+                        // overrides an NMEA fix, and it leaves
+                        // `location_detected_at_ms` unset so the guess is not
+                        // attached to captured photos / ROV telemetry.
+                        let is_ip_hint = cfg!(not(target_os = "windows"));
+                        let allowed = if is_ip_hint {
+                            state.nmea_gps.latest_location().is_none()
+                                && state.location_detected_at_ms == 0
+                        } else {
+                            state.location_detected_at_ms == 0
+                        };
+                        if allowed {
                             state.map.lat = Some(lat);
                             state.map.lon = Some(lon);
-                            state.location_detected_at_ms = current_unix_ms();
+                            if !is_ip_hint {
+                                state.location_detected_at_ms = current_unix_ms();
+                            }
                             if state.active_screen == Screen::Map {
                                 state.load_map_tile_for_current_location(
-                                    "Location detected (Windows GPS).".to_string(),
+                                    LOCATION_WARMUP_STATUS.to_string(),
                                 );
                                 apply_map_runtime_to_ui(&ui, &state);
                             }
@@ -5960,6 +5984,24 @@ fn main() -> Result<()> {
     store.shutdown();
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+const LOCATION_WARMUP_STATUS: &str = "Location detected (Windows GPS).";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LOCATION_WARMUP_STATUS: &str = "Approximate location detected from IP address.";
+
+/// Starts a background IP-geolocation lookup and returns the result channel.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn spawn_ip_location_lookup() -> mpsc::Receiver<Result<(f64, f64), String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let url = third_eye_client::ip_location::ip_geolocation_url();
+        let result = third_eye_client::ip_location::detect_location_from_ip_blocking(&url)
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 #[cfg(test)]
