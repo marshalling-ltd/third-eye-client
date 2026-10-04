@@ -20,5 +20,7 @@ pub mod ip_location;
 pub mod network;
 pub mod nmea;
 pub mod rov_status;
+#[cfg(feature = "test-tools")]
+pub mod simulator;
 pub mod storage;
 pub mod update_check;

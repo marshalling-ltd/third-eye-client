@@ -75,6 +75,38 @@ Cross-platform desktop client for controlling and interacting with Chasing under
 - **Coverage** – `make coverage` writes `lcov.info`; `make test-cov` / `make
   nextest-cov` open an HTML report.
 
+### ROV Simulator
+`chasing-simulator` is a CLI that stands in for a real ROV so the client can be
+exercised without hardware. It runs three servers at once:
+
+- **UDP telemetry** – synthetic status packets sent to `127.0.0.1:8500` (same
+  generator as `test-udp-server`).
+- **RTSP video** – loops the first `.mp4` in `samples/` at
+  `rtsp://admin:admin@127.0.0.1:8554/stream/0/0` (credentials are not checked).
+- **Camera HTTP API** – `/v1/capture`, `/v1/lamp` and `/v1/medias` (list, info,
+  download with Range support, delete) on port 8080, backed by the files in
+  `samples/`. Deleting only hides a file for the session; nothing is removed
+  from disk.
+
+Prerequisites: `ffmpeg` and [`mediamtx`](https://github.com/bluenviron/mediamtx)
+on `PATH` (`brew install ffmpeg mediamtx`). mediamtx is the RTSP server, since
+ffmpeg cannot serve RTSP on its own.
+
+```sh
+cargo run --features test-tools --bin chasing-simulator
+```
+
+Then point the client at `rtsp://admin:admin@127.0.0.1:8554/stream/0/0` and
+`http://127.0.0.1:8080`. Stop with Ctrl+C. Useful options (see `--help` for all):
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `--udp-target <HOST>` / `--udp-port <PORT>` | `127.0.0.1` / `8500` | Where telemetry is sent |
+| `--rtsp-port <PORT>` / `--http-port <PORT>` | `8554` / `8080` | Server ports |
+| `--samples <DIR>` | `samples` | Media served over HTTP |
+| `--video <FILE>` | first `.mp4` in samples | Video looped over RTSP |
+| `--ffmpeg <PATH>` / `--mediamtx <PATH>` | from `PATH` | Binary locations |
+
 ## Release checklist
 
 1. Merge or cherry-pick only release-ready commits into the `release` branch.
