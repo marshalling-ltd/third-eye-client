@@ -30,6 +30,7 @@ Built with Rust 🦀 and [Slint](https://slint.dev/) — native GUI on macOS, Wi
   - [Testing](#testing)
   - [ROV simulator](#rov-simulator)
 - [🚀 Release process](#-release-process)
+- [📄 License](#-license)
 
 ---
 
@@ -468,3 +469,9 @@ flowchart LR
 
 > [!WARNING]
 > The `publish` job fails if the pushed tag does not match the version in `Cargo.toml`.
+
+---
+
+## 📄 License
+
+Copyright (c) 2024-2026 Marshalling Ltd. Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).
