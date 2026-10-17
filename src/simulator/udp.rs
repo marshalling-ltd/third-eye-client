@@ -18,8 +18,19 @@ const PACKET_TYPE_ROV_STATUS: u8 = 0x01;
 /// Sends synthetic status packets to `destination` every `interval` until
 /// `stop` is set (pass a never-set flag to run forever).
 pub fn run(destination: SocketAddr, interval: Duration, stop: &AtomicBool) -> Result<()> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .context("failed to bind local UDP socket for test server")?;
+    run_from(Ipv4Addr::UNSPECIFIED, destination, interval, stop)
+}
+
+/// Like [`run`], but sends from `source` so the packets carry the simulated
+/// ROV's address (use [`Ipv4Addr::UNSPECIFIED`] to let the OS choose).
+pub fn run_from(
+    source: Ipv4Addr,
+    destination: SocketAddr,
+    interval: Duration,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let socket =
+        UdpSocket::bind((source, 0)).context("failed to bind local UDP socket for test server")?;
     socket
         .set_broadcast(true)
         .context("failed to enable UDP broadcast mode")?;
