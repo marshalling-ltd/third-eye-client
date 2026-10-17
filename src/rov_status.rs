@@ -488,7 +488,7 @@ fn create_bound_udp_socket(
 /// On macOS/iOS this uses `IP_BOUND_IF` (via `bind_device_by_index_v4`).
 /// On Linux this uses `SO_BINDTODEVICE` (via `bind_device`).
 #[allow(unused_variables)] // `iface` unused on unsupported platforms
-fn bind_socket_to_interface(socket: &Socket, iface: &str) -> Result<()> {
+pub fn bind_socket_to_interface(socket: &Socket, iface: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let index = interface_name_to_index(iface)?;

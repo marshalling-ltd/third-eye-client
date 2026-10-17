@@ -66,6 +66,7 @@ use third_eye_client::rov_status::{
     ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
     UdpStatusState,
 };
+use third_eye_client::rtsp_forwarder::{RtspForwarder, start_url_forwarder};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::api::ApiError;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -973,10 +974,21 @@ impl StreamState {
         )?;
         let ffmpeg_label = ffmpeg_bin.display().to_string();
 
-        #[cfg(target_os = "windows")]
-        prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
+        let forwarder = if rtsp_forwarder_enabled() {
+            start_url_forwarder(&rtsp_url, rov_interface, 554)?
+        } else {
+            None
+        };
+        let (rtsp_url, proxy_guard) = match forwarder {
+            Some((local_url, guard)) => (local_url, Some(guard)),
+            None => {
+                #[cfg(target_os = "windows")]
+                prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
+                (rtsp_url, None)
+            }
+        };
 
-        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url)?;
+        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url, proxy_guard)?;
         self.event_rx = Some(rx);
         self.controller = Some(controller);
         self.frames_received = 0;
@@ -4507,7 +4519,23 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         };
-        match spawn_media_stream_pipeline(ffmpeg_bin, download_url) {
+        // Recorded-video playback goes through the same interface-bound
+        // forwarder as live video, since it skips the legacy route setup.
+        let (download_url, proxy_guard) = if rtsp_forwarder_enabled() {
+            let rov_interface = state.config.rov_interface().map(str::to_owned);
+            match start_url_forwarder(&download_url, rov_interface.as_deref(), 80) {
+                Ok(Some((local_url, guard))) => (local_url, Some(guard)),
+                Ok(None) => (download_url, None),
+                Err(err) => {
+                    state.media.status_text = format!("Failed to start media stream: {err:#}");
+                    apply_state_to_ui(&ui, &state);
+                    return;
+                }
+            }
+        } else {
+            (download_url, None)
+        };
+        match spawn_media_stream_pipeline(ffmpeg_bin, download_url, proxy_guard) {
             Ok((controller, rx)) => {
                 state.media.media_stream_controller = Some(controller);
                 state.media.media_stream_event_rx = Some(rx);
@@ -4733,6 +4761,7 @@ fn stream_stderr_loop(
 fn spawn_media_stream_pipeline(
     ffmpeg_bin: PathBuf,
     http_url: String,
+    proxy_guard: Option<TcpProxyGuard>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
     let mut cmd = Command::new(&ffmpeg_bin);
     cmd.arg("-hide_banner")
@@ -4787,7 +4816,7 @@ fn spawn_media_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: None,
+            _proxy_guard: proxy_guard,
         },
         rx,
     ))
@@ -4840,6 +4869,7 @@ fn prime_arp_for_rtsp_host(rtsp_url: &str, interface: Option<&str>) {
 fn spawn_stream_pipeline(
     ffmpeg_bin: PathBuf,
     rtsp_url: String,
+    proxy_guard: Option<TcpProxyGuard>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
     let mut command = Command::new(ffmpeg_bin);
     command
@@ -4906,7 +4936,7 @@ fn spawn_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: None,
+            _proxy_guard: proxy_guard,
         },
         rx,
     ))
@@ -5099,14 +5129,35 @@ fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
 // OS-level route for external processes (ffmpeg can't use IP_BOUND_IF)
 // -------------------------------------------------------------------------
 
-/// Placeholder for the proxy guard; kept for `StreamController` layout.
-type TcpProxyGuard = ();
+/// Keeps the in-process RTSP forwarder alive for as long as its stream runs.
+type TcpProxyGuard = RtspForwarder;
+
+/// Switch for the interface-bound RTSP forwarder. Off by default while
+/// the legacy route/ARP path is still the supported one; set
+/// `THIRD_EYE_RTSP_FORWARDER=1` to route ffmpeg through the forwarder.
+///
+/// Never enabled on Windows: there the forwarder can only bind the source
+/// address, which does not force the outgoing adapter (`IP_UNICAST_IF` is not
+/// implemented yet), so the legacy host-route path stays in charge.
+fn rtsp_forwarder_enabled() -> bool {
+    cfg!(not(target_os = "windows"))
+        && std::env::var("THIRD_EYE_RTSP_FORWARDER")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+}
 
 /// Probes the ROV via HTTP (to populate ARP) then ensures the OS-level
 /// route exists. Called by `refresh_rov_network` when a wired interface
 /// is detected. Returns `Ok(())` when the route is ready, or an error
 /// if ARP/route setup failed (e.g. ROV is off).
 fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
+    if rtsp_forwarder_enabled()
+        && parse_host_from_http_base(rov_http_base)
+            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
+    {
+        // The forwarder pins the connection to the interface, so no host
+        // route, ARP entry or elevated prompt is needed.
+        return Ok(());
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
@@ -5128,6 +5179,14 @@ fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()>
 /// On Windows: performs the HTTP probe (to populate ARP) then runs the
 /// normal `route ADD` / UAC elevation path.
 fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
+    if rtsp_forwarder_enabled()
+        && parse_host_from_http_base(rov_http_base)
+            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
+    {
+        // The forwarder pins the connection to the interface, so no host
+        // route, ARP entry or elevated prompt is needed.
+        return Ok(());
+    }
     // On non-macOS platforms, the HTTP probe is still useful for ARP.
     #[cfg(not(target_os = "macos"))]
     {
