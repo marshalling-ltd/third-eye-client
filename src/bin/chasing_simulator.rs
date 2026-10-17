@@ -1,5 +1,5 @@
 use std::env;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -39,6 +39,7 @@ struct Config {
     video: Option<PathBuf>,
     ffmpeg: PathBuf,
     mediamtx: PathBuf,
+    verbose: bool,
 }
 
 fn main() -> Result<()> {
@@ -56,18 +57,27 @@ fn main() -> Result<()> {
         None => rtsp::find_sample_video(&config.samples)?,
     };
 
+    // The ROV's address as clients see it: the bind address, or loopback when
+    // listening on every interface.
+    let advertised = if config.bind == "0.0.0.0" {
+        "127.0.0.1".to_owned()
+    } else {
+        config.bind.clone()
+    };
+    let udp_source: Ipv4Addr = config.bind.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
+
     println!("Chasing ROV simulator");
     println!(
         "  UDP telemetry -> {udp_dest} every {}ms",
         config.interval_ms
     );
     println!(
-        "  RTSP          -> rtsp://admin:admin@127.0.0.1:{}/{DEFAULT_RTSP_PATH}  ({})",
+        "  RTSP          -> rtsp://admin:admin@{advertised}:{}/{DEFAULT_RTSP_PATH}  ({})",
         config.rtsp_port,
         video.display()
     );
     println!(
-        "  HTTP camera   -> http://127.0.0.1:{}  (media from {})",
+        "  HTTP camera   -> http://{advertised}:{}  (media from {})",
         config.http_port,
         config.samples.display()
     );
@@ -82,12 +92,13 @@ fn main() -> Result<()> {
         bind_host: config.bind.clone(),
         port: config.rtsp_port,
         path: DEFAULT_RTSP_PATH.to_owned(),
+        verbose: config.verbose,
     };
 
     let tasks: Vec<(&str, thread::JoinHandle<Result<()>>)> = vec![
         (
             "udp",
-            thread::spawn(move || udp::run(udp_dest, interval, &STOP)),
+            thread::spawn(move || udp::run_from(udp_source, udp_dest, interval, &STOP)),
         ),
         (
             "rtsp",
@@ -96,7 +107,13 @@ fn main() -> Result<()> {
         (
             "http",
             thread::spawn(move || {
-                http::run(&config.bind, config.http_port, &config.samples, &STOP)
+                http::run(
+                    &config.bind,
+                    config.http_port,
+                    &config.samples,
+                    config.verbose,
+                    &STOP,
+                )
             }),
         ),
     ];
@@ -136,6 +153,7 @@ fn parse_config() -> Result<Config> {
         video: None,
         ffmpeg: PathBuf::from("ffmpeg"),
         mediamtx: PathBuf::from("mediamtx"),
+        verbose: false,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -168,6 +186,7 @@ fn parse_config() -> Result<Config> {
             "--video" => c.video = Some(value("--video")?.into()),
             "--mediamtx" => c.mediamtx = value("--mediamtx")?.into(),
             "--ffmpeg" => c.ffmpeg = value("--ffmpeg")?.into(),
+            "--verbose" | "-v" => c.verbose = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -190,7 +209,12 @@ fn print_help() {
     println!("  --udp-target <HOST>    UDP telemetry destination (default: {DEFAULT_TARGET_HOST})");
     println!("  --udp-port <PORT>      UDP telemetry port (default: {DEFAULT_TARGET_PORT})");
     println!("  --interval-ms <MS>     Telemetry interval (default: {DEFAULT_INTERVAL_MS})");
-    println!("  --bind <ADDR>          Bind address for RTSP/HTTP (default: 0.0.0.0)");
+    println!(
+        "  --bind <ADDR>          Address to act as the ROV on, e.g. 192.168.1.88; RTSP, HTTP and the\n                         telemetry source use it (default: 0.0.0.0, all interfaces)"
+    );
+    println!(
+        "  -v, --verbose          Log client connections (RTSP and HTTP) with their source address"
+    );
     println!("  --rtsp-port <PORT>     RTSP port (default: {DEFAULT_RTSP_PORT})");
     println!("  --http-port <PORT>     HTTP port (default: {DEFAULT_HTTP_PORT})");
     println!("  --samples <DIR>        Samples directory (default: samples)");

@@ -25,6 +25,21 @@ pub struct RtspConfig {
     pub bind_host: String,
     pub port: u16,
     pub path: String,
+    /// Log client connections (mediamtx `info` level) instead of warnings only.
+    pub verbose: bool,
+}
+
+impl RtspConfig {
+    /// Address this process uses to reach its own server: loopback when
+    /// listening on all interfaces, otherwise the specific bind address
+    /// (mediamtx does not accept loopback connections in that case).
+    fn local_host(&self) -> &str {
+        if self.bind_host == "0.0.0.0" || self.bind_host.is_empty() {
+            "127.0.0.1"
+        } else {
+            &self.bind_host
+        }
+    }
 }
 
 /// Kills and reaps the child on drop so a failing simulator never leaves
@@ -42,8 +57,10 @@ fn spawn_server(config: &RtspConfig) -> Result<ChildGuard> {
     // mediamtx only accepts publishers on configured paths, hence the
     // `all_others` entry. Everything but RTSP is switched off.
     let yaml = format!(
-        "logLevel: warn\nrtspAddress: \"{}:{}\"\nrtmp: no\nhls: no\nwebrtc: no\nsrt: no\napi: no\nmetrics: no\nplayback: no\npprof: no\npaths:\n  all_others:\n",
-        config.bind_host, config.port
+        "logLevel: {}\nrtspAddress: \"{}:{}\"\nrtmp: no\nhls: no\nwebrtc: no\nsrt: no\napi: no\nmetrics: no\nplayback: no\npprof: no\npaths:\n  all_others:\n",
+        if config.verbose { "info" } else { "warn" },
+        config.bind_host,
+        config.port
     );
     let conf_path = std::env::temp_dir().join(format!(
         "chasing-simulator-mediamtx-{}.yml",
@@ -66,7 +83,12 @@ fn spawn_server(config: &RtspConfig) -> Result<ChildGuard> {
 }
 
 fn spawn_publisher(config: &RtspConfig) -> Result<ChildGuard> {
-    let url = format!("rtsp://127.0.0.1:{}/{}", config.port, config.path);
+    let url = format!(
+        "rtsp://{}:{}/{}",
+        config.local_host(),
+        config.port,
+        config.path
+    );
     let child = Command::new(&config.ffmpeg)
         .args([
             "-hide_banner",
@@ -94,8 +116,11 @@ fn spawn_publisher(config: &RtspConfig) -> Result<ChildGuard> {
     Ok(ChildGuard(child))
 }
 
-fn wait_for_port(port: u16, server: &mut ChildGuard, stop: &AtomicBool) -> Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+fn wait_for_port(config: &RtspConfig, server: &mut ChildGuard, stop: &AtomicBool) -> Result<()> {
+    let port = config.port;
+    let addr: SocketAddr = format!("{}:{port}", config.local_host())
+        .parse()
+        .with_context(|| format!("invalid --bind address {}", config.bind_host))?;
     let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
     while !stop.load(Ordering::Relaxed) {
         if let Some(status) = server.0.try_wait()? {
@@ -116,7 +141,7 @@ fn wait_for_port(port: u16, server: &mut ChildGuard, stop: &AtomicBool) -> Resul
 /// Runs the RTSP server and keeps the ffmpeg publisher alive until `stop` is set.
 pub fn run(config: &RtspConfig, stop: &AtomicBool) -> Result<()> {
     let mut server = spawn_server(config)?;
-    wait_for_port(config.port, &mut server, stop)?;
+    wait_for_port(config, &mut server, stop)?;
 
     while !stop.load(Ordering::Relaxed) {
         let mut publisher = spawn_publisher(config)?;

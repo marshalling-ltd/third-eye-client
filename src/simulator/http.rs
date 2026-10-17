@@ -262,7 +262,13 @@ fn route(state: &State, req: &mut Request) -> Response<Body> {
 }
 
 /// Serves the camera API on `bind:port` until `stop` is set.
-pub fn run(bind_host: &str, port: u16, samples_dir: &Path, stop: &AtomicBool) -> Result<()> {
+pub fn run(
+    bind_host: &str,
+    port: u16,
+    samples_dir: &Path,
+    verbose: bool,
+    stop: &AtomicBool,
+) -> Result<()> {
     let server = Arc::new(
         Server::http((bind_host, port))
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -277,6 +283,12 @@ pub fn run(bind_host: &str, port: u16, samples_dir: &Path, stop: &AtomicBool) ->
         let Some(mut req) = server.recv_timeout(Duration::from_millis(200))? else {
             continue;
         };
+        if verbose {
+            let peer = req
+                .remote_addr()
+                .map_or_else(|| "?".to_owned(), ToString::to_string);
+            println!("[http] {peer} {} {}", req.method(), req.url());
+        }
         let state = Arc::clone(&state);
         // One thread per request: ffmpeg may hold a download open while the UI polls.
         std::thread::spawn(move || {
