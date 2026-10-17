@@ -16,6 +16,9 @@ export component StreamPage inherits Rectangle {
     // anywhere in this page — shown here so connection failures are
     // diagnosable instead of just leaving the "No stream active" fallback.
     in property <string> stream_status;
+    // How this computer currently reaches the ROV (Wi-Fi or USB Ethernet, and
+    // which adapter), or what to check when it cannot be found.
+    in property <string> rov_link_text;
     in property <bool> has_rov_status: false;
     in property <bool> rov_listener_running: false;
     in property <bool> nmea_gps_running: false;
@@ -53,7 +56,8 @@ export component StreamPage inherits Rectangle {
         image-fit: cover;
     }
     if !root.has_stream_image : Text {
-        text: root.stream_status == "" ? "No stream active. Press \u{25b6} Start to begin." : root.stream_status;
+        text: (root.stream_status == "" ? "No stream active. Press \u{25b6} Start to begin." : root.stream_status)
+            + (root.rov_link_text == "" ? "" : "\n\n" + root.rov_link_text);
         color: #8f96a3;
         font-size: 16px;
         wrap: word-wrap;

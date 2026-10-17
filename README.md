@@ -104,7 +104,8 @@ The stale-timeout is configurable per session; the map auto-centers on the lates
 
 ### 🔌 ROV network interface binding
 
-- Auto-detects the wired USB-ethernet adapter on the same subnet as the ROV
+- Auto-detects how the computer reaches the ROV, whether over its Wi-Fi or a USB-ethernet cable: the interface with an address on the ROV's subnet is chosen (a cable wins over Wi-Fi), and an unrelated link such as a phone hotspot is ignored
+- Watches for cables and Wi-Fi coming and going (every 2 s) and, within a few seconds, moves video and telemetry onto the new link; the stream screen shows which link is in use, or what to check when the ROV cannot be found
 - Binds HTTP, UDP and (on Unix) socket-level traffic to that interface via `IP_BOUND_IF` / `SO_BINDTODEVICE`
 - Sets up an OS-level host route so ffmpeg (an external process that can't use `IP_BOUND_IF`) reaches the ROV through the correct adapter:
   - **macOS** — `osascript` with administrator privileges (one-time password prompt)
@@ -440,6 +441,8 @@ Then point the client at `rtsp://admin:admin@127.0.0.1:8554/stream/0/0` and `htt
 ```sh
 chasing-simulator --bind 192.168.1.88 --udp-target 192.168.1.103 --verbose
 ```
+
+To check what the client would detect on a given machine without starting the GUI (useful on Windows and Linux), run `ROV_HOST=192.168.1.88 cargo test --test rov_link_diagnostic -- --nocapture`; it lists the interfaces, how each was classified (wired or wireless) and which one it would use for the ROV.
 
 With `--verbose` the log shows the source address of every client connection, which shows which laptop interface the video actually used.
 
