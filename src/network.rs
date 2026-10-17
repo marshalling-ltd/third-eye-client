@@ -423,6 +423,41 @@ pub fn local_ipv4_addresses() -> Vec<(String, std::net::Ipv4Addr)> {
     local_ipv4_addresses_from(&interfaces)
 }
 
+/// Picks the local IPv4 address on `interface` to use as the source address
+/// for connections to `host`.
+///
+/// Prefers the address on the same subnet as `host`, so an unrelated address
+/// or alias listed first on the adapter is never chosen. If `host` is not on
+/// any subnet of the interface (off-subnet, reached through a gateway), falls
+/// back to the interface's first IPv4 address. Returns `None` when the
+/// interface has no IPv4 address at all.
+///
+/// Pure over the supplied interface list so it can be unit-tested on any
+/// platform.
+#[must_use]
+pub fn source_ipv4_for_host(
+    interfaces: &[if_addrs::Interface],
+    interface: &str,
+    host: std::net::Ipv4Addr,
+) -> Option<std::net::Ipv4Addr> {
+    let candidates: Vec<&if_addrs::Ifv4Addr> = interfaces
+        .iter()
+        .filter(|iface| iface.name == interface && !iface.is_loopback())
+        .filter_map(|iface| match &iface.addr {
+            if_addrs::IfAddr::V4(v4) => Some(v4),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect();
+    candidates
+        .iter()
+        .find(|v4| {
+            let mask = u32::from(v4.netmask);
+            (u32::from(v4.ip) & mask) == (u32::from(host) & mask)
+        })
+        .or(candidates.first())
+        .map(|v4| v4.ip)
+}
+
 /// Pure helper behind [`local_ipv4_addresses`], over a supplied interface
 /// list so it can be unit-tested on any platform.
 fn local_ipv4_addresses_from(
@@ -525,6 +560,49 @@ mod tests {
                 broadcast: None,
             }),
         )
+    }
+
+    // ---- source_ipv4_for_host ----------------------------------------------
+
+    #[test]
+    fn source_ipv4_prefers_address_on_hosts_subnet() {
+        let ifaces = vec![
+            v4_iface("eth1", [169, 254, 7, 7]),
+            v4_iface("eth1", [192, 168, 1, 103]),
+        ];
+        assert_eq!(
+            source_ipv4_for_host(&ifaces, "eth1", Ipv4Addr::new(192, 168, 1, 88)),
+            Some(Ipv4Addr::new(192, 168, 1, 103))
+        );
+    }
+
+    #[test]
+    fn source_ipv4_falls_back_to_first_address_for_off_subnet_host() {
+        let ifaces = vec![
+            v4_iface("eth1", [10, 0, 0, 5]),
+            v4_iface("eth1", [10, 0, 1, 5]),
+        ];
+        assert_eq!(
+            source_ipv4_for_host(&ifaces, "eth1", Ipv4Addr::new(192, 168, 1, 88)),
+            Some(Ipv4Addr::new(10, 0, 0, 5))
+        );
+    }
+
+    #[test]
+    fn source_ipv4_ignores_other_interfaces_ipv6_and_loopback() {
+        let ifaces = vec![
+            v4_iface("wifi0", [192, 168, 1, 50]),
+            v6_iface("eth1"),
+            loopback_iface(),
+        ];
+        assert_eq!(
+            source_ipv4_for_host(&ifaces, "eth1", Ipv4Addr::new(192, 168, 1, 88)),
+            None
+        );
+        assert_eq!(
+            source_ipv4_for_host(&ifaces, "missing", Ipv4Addr::new(192, 168, 1, 88)),
+            None
+        );
     }
 
     // ---- local_ipv4_addresses_from -----------------------------------------

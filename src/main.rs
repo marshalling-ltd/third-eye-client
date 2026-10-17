@@ -54,6 +54,8 @@ use third_eye_client::formatting::{
 };
 #[cfg(target_os = "windows")]
 use third_eye_client::network::parse_rtsp_host_port;
+#[cfg(target_os = "windows")]
+use third_eye_client::network::source_ipv4_for_host;
 use third_eye_client::network::{
     RecalibrateResult, detect_rov_interface, format_local_ipv4_summary,
     interface_has_rov_subnet_ipv4, local_ipv4_addresses, parse_host_from_http_base,
@@ -66,6 +68,7 @@ use third_eye_client::rov_status::{
     ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
     UdpStatusState,
 };
+use third_eye_client::rtsp_forwarder::{ForwarderTarget, RtspForwarder, rewrite_rtsp_url};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::api::ApiError;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -973,10 +976,21 @@ impl StreamState {
         )?;
         let ffmpeg_label = ffmpeg_bin.display().to_string();
 
-        #[cfg(target_os = "windows")]
-        prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
+        let forwarder = if rtsp_forwarder_enabled() {
+            start_url_forwarder(&rtsp_url, rov_interface, 554)?
+        } else {
+            None
+        };
+        let (rtsp_url, proxy_guard) = match forwarder {
+            Some((local_url, guard)) => (local_url, Some(guard)),
+            None => {
+                #[cfg(target_os = "windows")]
+                prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
+                (rtsp_url, None)
+            }
+        };
 
-        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url)?;
+        let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url, proxy_guard)?;
         self.event_rx = Some(rx);
         self.controller = Some(controller);
         self.frames_received = 0;
@@ -4507,7 +4521,23 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         };
-        match spawn_media_stream_pipeline(ffmpeg_bin, download_url) {
+        // Recorded-video playback goes through the same interface-bound
+        // forwarder as live video, since it skips the legacy route setup.
+        let (download_url, proxy_guard) = if rtsp_forwarder_enabled() {
+            let rov_interface = state.config.rov_interface().map(str::to_owned);
+            match start_url_forwarder(&download_url, rov_interface.as_deref(), 80) {
+                Ok(Some((local_url, guard))) => (local_url, Some(guard)),
+                Ok(None) => (download_url, None),
+                Err(err) => {
+                    state.media.status_text = format!("Failed to start media stream: {err:#}");
+                    apply_state_to_ui(&ui, &state);
+                    return;
+                }
+            }
+        } else {
+            (download_url, None)
+        };
+        match spawn_media_stream_pipeline(ffmpeg_bin, download_url, proxy_guard) {
             Ok((controller, rx)) => {
                 state.media.media_stream_controller = Some(controller);
                 state.media.media_stream_event_rx = Some(rx);
@@ -4733,6 +4763,7 @@ fn stream_stderr_loop(
 fn spawn_media_stream_pipeline(
     ffmpeg_bin: PathBuf,
     http_url: String,
+    proxy_guard: Option<TcpProxyGuard>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
     let mut cmd = Command::new(&ffmpeg_bin);
     cmd.arg("-hide_banner")
@@ -4787,7 +4818,7 @@ fn spawn_media_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: None,
+            _proxy_guard: proxy_guard,
         },
         rx,
     ))
@@ -4840,6 +4871,7 @@ fn prime_arp_for_rtsp_host(rtsp_url: &str, interface: Option<&str>) {
 fn spawn_stream_pipeline(
     ffmpeg_bin: PathBuf,
     rtsp_url: String,
+    proxy_guard: Option<TcpProxyGuard>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
     let mut command = Command::new(ffmpeg_bin);
     command
@@ -4906,7 +4938,7 @@ fn spawn_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: None,
+            _proxy_guard: proxy_guard,
         },
         rx,
     ))
@@ -5099,14 +5131,100 @@ fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
 // OS-level route for external processes (ffmpeg can't use IP_BOUND_IF)
 // -------------------------------------------------------------------------
 
-/// Placeholder for the proxy guard; kept for `StreamController` layout.
-type TcpProxyGuard = ();
+/// Keeps the in-process RTSP forwarder alive for as long as its stream runs.
+type TcpProxyGuard = RtspForwarder;
+
+/// Switch for the interface-bound RTSP forwarder. Off by default while
+/// the legacy route/ARP path is still the supported one; set
+/// `THIRD_EYE_RTSP_FORWARDER=1` to route ffmpeg through the forwarder.
+fn rtsp_forwarder_enabled() -> bool {
+    std::env::var("THIRD_EYE_RTSP_FORWARDER")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+}
+
+/// Port the forwarder should dial: the one in the URL, else the scheme's
+/// well-known port (80 for `http`), else `fallback` (e.g. 554 for `rtsp`).
+fn forward_target_port(url: &Url, fallback: u16) -> u16 {
+    url.port_or_known_default().unwrap_or(fallback)
+}
+
+/// Starts a forwarder for `url` (RTSP or HTTP) pinned to `rov_interface` and
+/// returns the URL ffmpeg should use instead. `default_port` applies when the
+/// URL names none. Returns `Ok(None)` when forwarding does not apply: no
+/// interface is selected, or the URL points at this machine (the bundled test
+/// server).
+///
+/// # Errors
+///
+/// Fails rather than falling back to unpinned routing, e.g. on Windows when
+/// the selected adapter has no usable IPv4 source address.
+fn start_url_forwarder(
+    url: &str,
+    rov_interface: Option<&str>,
+    default_port: u16,
+) -> Result<Option<(String, TcpProxyGuard)>> {
+    use std::net::ToSocketAddrs;
+
+    let Some(interface) = rov_interface else {
+        return Ok(None);
+    };
+    let parsed = Url::parse(url).context("invalid stream URL")?;
+    // The forwarder carries raw TCP, so TLS would be negotiated with the
+    // loopback address and fail certificate validation.
+    anyhow::ensure!(
+        parsed.scheme() != "https",
+        "HTTPS streams cannot go through the interface-bound forwarder"
+    );
+    let host = parsed.host_str().context("stream URL has no host")?;
+    let port = forward_target_port(&parsed, default_port);
+    let addr = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("cannot resolve ROV host {host}"))?
+        .find(std::net::SocketAddr::is_ipv4)
+        .with_context(|| format!("ROV host {host} has no IPv4 address"))?;
+    if addr.ip().is_loopback() {
+        return Ok(None);
+    }
+
+    // Windows cannot bind by interface name here, so pin the source address:
+    // the one on the ROV's subnet, never an unrelated alias on the adapter.
+    #[cfg(target_os = "windows")]
+    let source_ip = {
+        let std::net::IpAddr::V4(rov_ip) = addr.ip() else {
+            anyhow::bail!("ROV host {host} is not an IPv4 address");
+        };
+        let ifaces = if_addrs::get_if_addrs().context("failed to enumerate network interfaces")?;
+        let source = source_ipv4_for_host(&ifaces, interface, rov_ip).with_context(|| {
+            format!("interface {interface:?} has no IPv4 address to send ROV traffic from")
+        })?;
+        Some(std::net::IpAddr::V4(source))
+    };
+    #[cfg(not(target_os = "windows"))]
+    let source_ip = None;
+
+    let forwarder = RtspForwarder::start(ForwarderTarget {
+        addr,
+        interface: Some(interface.to_owned()),
+        source_ip,
+    })?;
+    let local_url = rewrite_rtsp_url(url, forwarder.local_addr())
+        .context("cannot point the stream URL at the forwarder")?;
+    Ok(Some((local_url, forwarder)))
+}
 
 /// Probes the ROV via HTTP (to populate ARP) then ensures the OS-level
 /// route exists. Called by `refresh_rov_network` when a wired interface
 /// is detected. Returns `Ok(())` when the route is ready, or an error
 /// if ARP/route setup failed (e.g. ROV is off).
 fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
+    if rtsp_forwarder_enabled()
+        && parse_host_from_http_base(rov_http_base)
+            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
+    {
+        // The forwarder pins the connection to the interface, so no host
+        // route, ARP entry or elevated prompt is needed.
+        return Ok(());
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
@@ -5128,6 +5246,14 @@ fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()>
 /// On Windows: performs the HTTP probe (to populate ARP) then runs the
 /// normal `route ADD` / UAC elevation path.
 fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
+    if rtsp_forwarder_enabled()
+        && parse_host_from_http_base(rov_http_base)
+            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
+    {
+        // The forwarder pins the connection to the interface, so no host
+        // route, ARP entry or elevated prompt is needed.
+        return Ok(());
+    }
     // On non-macOS platforms, the HTTP probe is still useful for ARP.
     #[cfg(not(target_os = "macos"))]
     {
@@ -6006,6 +6132,60 @@ fn spawn_ip_location_lookup() -> mpsc::Receiver<Result<(f64, f64), String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{forward_target_port, start_url_forwarder};
+    use reqwest::Url;
+
+    // ---- interface-bound forwarder helpers ---------------------------------
+
+    #[test]
+    fn forward_target_port_prefers_url_then_scheme_then_fallback() {
+        let port = |u: &str| forward_target_port(&Url::parse(u).unwrap(), 554);
+        assert_eq!(port("rtsp://10.0.0.1:8554/s"), 8554);
+        assert_eq!(port("rtsp://10.0.0.1/s"), 554);
+        assert_eq!(port("http://10.0.0.1/x"), 80);
+        assert_eq!(port("http://10.0.0.1:8080/x"), 8080);
+        assert_eq!(port("https://10.0.0.1/x"), 443);
+    }
+
+    #[test]
+    fn forwarder_is_skipped_without_interface_or_for_loopback_hosts() {
+        assert!(
+            start_url_forwarder("rtsp://192.0.2.1:8554/s", None, 554)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            start_url_forwarder("rtsp://127.0.0.1:8554/s", Some("en0"), 554)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn forwarder_rejects_bad_or_https_urls() {
+        assert!(start_url_forwarder("not a url", Some("en0"), 554).is_err());
+        match start_url_forwarder("https://192.0.2.1/x", Some("en0"), 80) {
+            Err(err) => assert!(format!("{err:#}").contains("HTTPS")),
+            Ok(_) => panic!("HTTPS must be rejected"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forwarder_rewrites_url_to_loopback_keeping_credentials_and_path() {
+        let (local_url, guard) = start_url_forwarder(
+            "rtsp://admin:pw@192.0.2.1:8554/stream/0/0",
+            Some("en0"),
+            554,
+        )
+        .unwrap()
+        .unwrap();
+        let expected = format!(
+            "rtsp://admin:pw@127.0.0.1:{}/stream/0/0",
+            guard.local_addr().port()
+        );
+        assert_eq!(local_url, expected);
+    }
     use super::{ZOOM_SETTLE_TIMEOUT_MS, pinch_zoom_step_from_scale, scroll_zoom_allowed};
 
     #[test]
