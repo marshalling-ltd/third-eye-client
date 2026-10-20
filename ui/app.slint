@@ -169,6 +169,10 @@ export component AppWindow inherits Window {
 
     in-out property <string> stream_status;
     in-out property <string> rov_link_text;
+    in-out property <bool> address_setup_visible: false;
+    in-out property <string> address_setup_steps;
+    in-out property <string> address_setup_command;
+    callback dismiss_address_setup();
     in-out property <string> frames_received_text;
     in-out property <image> stream_image;
     in-out property <bool> has_stream_image: false;
@@ -695,6 +699,10 @@ export component AppWindow inherits Window {
                 stream_is_active: root.stream_is_active;
                 stream_status: root.stream_status;
                 rov_link_text: root.rov_link_text;
+                address_setup_visible: root.address_setup_visible;
+                address_setup_steps: root.address_setup_steps;
+                address_setup_command: root.address_setup_command;
+                dismiss_address_setup => { root.dismiss_address_setup(); }
                 has_rov_status: root.has_rov_status;
                 rov_listener_running: root.rov_listener_running;
                 nmea_gps_running: root.nmea_gps_running;

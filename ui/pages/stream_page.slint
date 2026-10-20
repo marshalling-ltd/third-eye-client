@@ -1,4 +1,4 @@
-import { HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 // Full-bleed live stream screen (RTSP video + compact telemetry overlay).
 //
@@ -19,6 +19,13 @@ export component StreamPage inherits Rectangle {
     // How this computer currently reaches the ROV (Wi-Fi or USB Ethernet, and
     // which adapter), or what to check when it cannot be found.
     in property <string> rov_link_text;
+    // One-time "give the USB adapter an address" help. Shown while a cable is
+    // connected but has no address on the ROV's network; the app notices the
+    // address by itself, so the dialog is only a guide and can be dismissed.
+    in property <bool> address_setup_visible: false;
+    in property <string> address_setup_steps;
+    in property <string> address_setup_command;
+    callback dismiss_address_setup();
     in property <bool> has_rov_status: false;
     in property <bool> rov_listener_running: false;
     in property <bool> nmea_gps_running: false;
@@ -344,6 +351,83 @@ export component StreamPage inherits Rectangle {
                     text: root.rov_battery_short;
                     color: #ffffff;
                     font-size: 16px;
+                }
+            }
+        }
+    }
+
+    // Modal help dialog, last child so it sits above everything else. The
+    // command is a read-only TextInput so it can be selected and copied.
+    if root.address_setup_visible : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+
+        // Swallow clicks so the page underneath is inert while the dialog is up.
+        TouchArea { }
+
+        Rectangle {
+            width: min(parent.width - 40px, 640px);
+            height: dialog-content.preferred-height + 40px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1b1f27;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #0a84ff66;
+
+            dialog-content := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Set an address for the USB adapter";
+                    color: #ffffff;
+                    font-size: 18px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "The ROV is connected by cable, but this computer has no address on its network yet. Do this once; the app notices the address by itself.";
+                    color: #c5cad3;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.address_setup_steps;
+                    color: #ffffff;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Or run this command in a terminal (select it and press Ctrl+C / Cmd+C):";
+                    color: #8f96a3;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    background: #0f1218;
+                    border-radius: 6px;
+                    height: command-text.preferred-height + 16px;
+
+                    command-text := TextInput {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 16px;
+                        text: root.address_setup_command;
+                        read-only: true;
+                        wrap: word-wrap;
+                        color: #7ee787;
+                        font-size: 13px;
+                        selection-background-color: #0a84ff88;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        clicked => { root.dismiss_address_setup(); }
+                    }
                 }
             }
         }

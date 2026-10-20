@@ -54,7 +54,7 @@ objc2-core-location = { version = "0.3.2", default-features = false, features = 
 objc2 = "0.6.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Devices_Geolocation", "Foundation"] }
+windows = { version = "0.62", features = ["Devices_Geolocation", "Foundation", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 slint-build = "1.18.1"

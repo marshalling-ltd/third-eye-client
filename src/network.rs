@@ -5,28 +5,6 @@
 
 use reqwest::Url;
 
-/// Result of a background ROV network recalibration.
-///
-/// # Examples
-///
-/// ```
-/// use third_eye_client::network::RecalibrateResult;
-///
-/// let result = RecalibrateResult {
-///     interface: "en10".to_string(),
-///     rov_info: "Detected ROV interface en10.".to_string(),
-/// };
-///
-/// assert_eq!(result.interface, "en10");
-/// assert!(result.rov_info.contains("en10"));
-/// ```
-pub struct RecalibrateResult {
-    /// Detected interface name, or empty if none found.
-    pub interface: String,
-    /// Human-readable status summary for `rov_info`.
-    pub rov_info: String,
-}
-
 /// Extracts the host from an HTTP base URL string.
 ///
 /// If `base` has no scheme, `http://` is prepended so bare IP addresses such
@@ -219,7 +197,7 @@ pub fn describe_rov_link(
         ),
         Some(RovLink { interface, .. }) => format!(
             "Cable detected on {interface}, but it has no address on the ROV's network \
-             ({rov_host}). Press Recalibrate to set one up."
+             ({rov_host})."
         ),
         None => match rov_host.parse::<std::net::Ipv4Addr>() {
             // The ROV address comes from the active device's configuration and
@@ -261,31 +239,150 @@ pub fn describe_rov_link(
     }
 }
 
-/// Whether Windows `route PRINT <host>` output lists a /32 route for `host`
-/// that leaves through the adapter whose address is `local_ip`. A route
-/// through another adapter (for example a leftover one over Wi-Fi) does not
-/// count.
+/// Operating system the app runs on, for platform-specific instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    MacOs,
+    Windows,
+    Linux,
+}
+
+impl HostOs {
+    /// The OS this build runs on (anything that is not macOS or Windows is
+    /// treated as Linux).
+    #[must_use]
+    pub fn current() -> Self {
+        const CURRENT: HostOs = if cfg!(target_os = "macos") {
+            HostOs::MacOs
+        } else if cfg!(target_os = "windows") {
+            HostOs::Windows
+        } else {
+            HostOs::Linux
+        };
+        CURRENT
+    }
+}
+
+/// The address to suggest for this computer on the ROV's network: `preferred`
+/// (the one the ROV expects its client at) when it is on the ROV's subnet and
+/// not the ROV's own address, otherwise `.103` on the ROV's subnet (`.104` if
+/// that is the ROV itself).
 ///
 /// # Examples
 ///
 /// ```
 /// use std::net::Ipv4Addr;
-/// use third_eye_client::network::route_print_uses_interface;
+/// use third_eye_client::network::suggest_client_ip;
 ///
-/// let output = "  192.168.1.88  255.255.255.255  On-link  192.168.1.103  281";
-/// assert!(route_print_uses_interface(output, "192.168.1.88", Ipv4Addr::new(192, 168, 1, 103)));
-/// assert!(!route_print_uses_interface(output, "192.168.1.88", Ipv4Addr::new(192, 168, 1, 50)));
+/// let mask = Ipv4Addr::new(255, 255, 255, 0);
+/// let preferred = Ipv4Addr::new(192, 168, 1, 103);
+/// // On the usual subnet the expected address is kept.
+/// assert_eq!(suggest_client_ip(Ipv4Addr::new(192, 168, 1, 88), preferred, mask), preferred);
+/// // Another subnet gets the same host number there.
+/// assert_eq!(
+///     suggest_client_ip(Ipv4Addr::new(10, 20, 30, 88), preferred, mask),
+///     Ipv4Addr::new(10, 20, 30, 103)
+/// );
 /// ```
 #[must_use]
-pub fn route_print_uses_interface(output: &str, host: &str, local_ip: std::net::Ipv4Addr) -> bool {
-    let want = local_ip.to_string();
-    output.lines().any(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        fields.len() >= 4
-            && fields[0] == host
-            && fields[1] == "255.255.255.255"
-            && fields[3] == want
-    })
+pub fn suggest_client_ip(
+    rov_ip: std::net::Ipv4Addr,
+    preferred: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> std::net::Ipv4Addr {
+    if preferred != rov_ip && on_subnet(preferred, mask, rov_ip) {
+        return preferred;
+    }
+    let network = u32::from(rov_ip) & u32::from(mask);
+    let candidate = std::net::Ipv4Addr::from(network.saturating_add(103));
+    if candidate == rov_ip {
+        std::net::Ipv4Addr::from(network.saturating_add(104))
+    } else {
+        candidate
+    }
+}
+
+/// How to give a cable adapter an address on the ROV's network by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressSetup {
+    pub client_ip: std::net::Ipv4Addr,
+    pub mask: std::net::Ipv4Addr,
+    /// Where to click in the operating system's settings.
+    pub gui_steps: String,
+    /// The same thing as one terminal command (the user may need to run it
+    /// as administrator).
+    pub command: String,
+}
+
+/// Setup instructions for `os`: setting an address needs administrator rights,
+/// which the app does not ask for, so the user does it once by hand.
+#[must_use]
+pub fn address_setup(
+    os: HostOs,
+    interface: &str,
+    client_ip: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> AddressSetup {
+    let prefix = u32::from(mask).count_ones();
+    let (gui_steps, command) = match os {
+        HostOs::MacOs => (
+            format!(
+                "System Settings > Network > the USB adapter > Details > TCP/IP > Configure \
+                 IPv4: Manually, IP {client_ip}, subnet mask {mask}, router empty"
+            ),
+            format!("sudo ifconfig {interface} inet {client_ip} netmask {mask}"),
+        ),
+        HostOs::Windows => (
+            format!(
+                "Settings > Network & Internet > Ethernet > IP assignment > Edit > Manual > \
+                 IPv4: IP {client_ip}, subnet mask {mask}, gateway empty"
+            ),
+            format!(
+                "netsh interface ip set address name=\"{interface}\" static {client_ip} {mask}"
+            ),
+        ),
+        HostOs::Linux => (
+            format!(
+                "Set a manual IPv4 address in your network settings: IP {client_ip}, subnet \
+                 mask {mask}, gateway empty"
+            ),
+            format!("sudo ip addr add {client_ip}/{prefix} dev {interface}"),
+        ),
+    };
+    AddressSetup {
+        client_ip,
+        mask,
+        gui_steps,
+        command,
+    }
+}
+
+/// One-line status text for the same instructions, ending with the
+/// reassurance that the app picks the address up on its own.
+#[must_use]
+pub fn address_setup_hint(
+    os: HostOs,
+    interface: &str,
+    client_ip: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> String {
+    let setup = address_setup(os, interface, client_ip, mask);
+    format!(
+        "Give {interface} the address {client_ip} (subnet mask {mask}) once: {}. Or in a \
+         terminal: {}. The app picks it up on its own.",
+        setup.gui_steps, setup.command
+    )
+}
+
+/// The IPv4 interface index (Windows `IfIndex`) of the interface called
+/// `name`, from `if-addrs` output. Only an interface with an IPv4 address
+/// has one to give.
+#[must_use]
+pub fn ipv4_interface_index(ifaces: &[if_addrs::Interface], name: &str) -> Option<u32> {
+    ifaces
+        .iter()
+        .find(|i| i.name == name && matches!(i.addr, if_addrs::IfAddr::V4(_)))
+        .and_then(|i| i.index)
 }
 
 /// Whether `interface` appears in `snapshot` (so it is up) with an address on
@@ -522,112 +619,6 @@ pub fn snapshot_interfaces() -> Vec<InterfaceInfo> {
     }
 }
 
-/// Finds the network interface that is on the same subnet as `rov_host`.
-///
-/// Uses `if-addrs` for cross-platform interface enumeration. On macOS, wired
-/// links are preferred by inspecting `ifconfig` media types. On other
-/// platforms, interface names that do not look wireless are preferred.
-///
-/// # Arguments
-///
-/// * `rov_host` - The ROV IPv4 address as a string.
-///
-/// # Returns
-///
-/// * `Option<String>` - The detected interface name, or `None` if no matching
-///   interface is found or `rov_host` is not a valid IPv4 address.
-///
-/// # Examples
-///
-/// ```
-/// use third_eye_client::network::detect_rov_interface;
-///
-/// assert!(detect_rov_interface("not-an-ip").is_none());
-/// assert!(detect_rov_interface("").is_none());
-/// ```
-///
-/// No doctest is provided for successful detection because available network
-/// interfaces depend on the host running the test.
-pub fn detect_rov_interface(rov_host: &str) -> Option<String> {
-    let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
-    let interfaces = if_addrs::get_if_addrs().ok()?;
-
-    let candidates: Vec<String> = interfaces
-        .into_iter()
-        .filter(|iface| !iface.is_loopback())
-        .filter_map(|iface| {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr
-                && v4.ip != rov_ip
-            {
-                let mask = u32::from(v4.netmask);
-                if (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask) {
-                    return Some(iface.name);
-                }
-            }
-            None
-        })
-        .collect();
-
-    #[cfg(target_os = "macos")]
-    {
-        // Classify by media type rather than interface name so a wired `en0`
-        // (desktop / Thunderbolt dock) is usable while a Wi-Fi adapter is not
-        // mistaken for the ROV link. Read `ifconfig -a` only once.
-        match macos_ifconfig_text() {
-            Some(text) => candidates
-                .iter()
-                .find(|name| macos_interface_is_wired(&text, name.as_str()))
-                .cloned()
-                // No subnet-matching wired candidate: fall back to an active
-                // wired adapter that has no IPv4 yet so recalibrate can assign
-                // one.
-                .or_else(|| select_active_macos_ethernet_interface(&text)),
-            // `ifconfig` is unavailable: fall back to the first subnet match.
-            None => candidates.into_iter().next(),
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // No media metadata here; prefer an interface whose name does not look
-        // wireless so the ROV route is not bound to Wi-Fi.
-        prefer_wired_interface(&candidates)
-    }
-}
-
-/// Checks whether `interface` currently holds an IPv4 address on the same
-/// subnet as `rov_host`.
-///
-/// Unlike [`detect_rov_interface`] (which searches all interfaces for a
-/// match), this checks one specific interface — used to verify a
-/// previously-detected or user-selected interface is still valid.
-///
-/// # Examples
-///
-/// ```
-/// use third_eye_client::network::interface_has_rov_subnet_ipv4;
-///
-/// assert!(!interface_has_rov_subnet_ipv4("en0", "not-an-ip"));
-/// assert!(!interface_has_rov_subnet_ipv4("nonexistent-iface-xyz", "192.168.1.88"));
-/// ```
-#[must_use]
-pub fn interface_has_rov_subnet_ipv4(interface: &str, rov_host: &str) -> bool {
-    let Ok(rov_ip) = rov_host.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return false;
-    };
-    interfaces.iter().any(|iface| {
-        iface.name == interface
-            && !iface.is_loopback()
-            && matches!(&iface.addr, if_addrs::IfAddr::V4(v4) if {
-                let mask = u32::from(v4.netmask);
-                (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask)
-            })
-    })
-}
-
 /// Returns the full `ifconfig -a` output on macOS.
 ///
 /// This is used to inspect interface media types so wired Ethernet adapters can
@@ -709,50 +700,6 @@ fn looks_wireless(name: &str) -> bool {
     ["wlan", "wlp", "wifi", "wi-fi", "wireless", "wl"]
         .iter()
         .any(|pattern| lower.contains(pattern))
-}
-
-/// Picks a non-wireless interface from a list of candidates.
-///
-/// This is used on Linux and Windows, where macOS `ifconfig` media metadata is
-/// not consulted. Interface names containing common wireless markers such as
-/// `wlan`, `wlp`, `wifi`, `wi-fi`, `wireless`, or `wl` are skipped when
-/// possible.
-///
-/// # Arguments
-///
-/// * `candidates` - Candidate interface names.
-///
-/// # Returns
-///
-/// * `Option<String>` - The preferred wired-looking interface, the first
-///   candidate if all look wireless, or `None` if the list is empty.
-///
-/// # Examples
-///
-/// ```
-/// use third_eye_client::network::prefer_wired_interface;
-///
-/// let candidates = vec!["wlan0".to_string(), "eth0".to_string()];
-/// assert_eq!(
-///     prefer_wired_interface(&candidates),
-///     Some("eth0".to_string())
-/// );
-///
-/// let candidates = vec!["wlan0".to_string(), "wlp2s0".to_string()];
-/// assert_eq!(
-///     prefer_wired_interface(&candidates),
-///     Some("wlan0".to_string())
-/// );
-///
-/// assert_eq!(prefer_wired_interface(&[]), None);
-/// ```
-#[must_use]
-pub fn prefer_wired_interface(candidates: &[String]) -> Option<String> {
-    candidates
-        .iter()
-        .find(|name| !looks_wireless(name.as_str()))
-        .or_else(|| candidates.first())
-        .cloned()
 }
 
 /// Selects an active wired macOS `en*` adapter from `ifconfig -a` output.
@@ -1213,7 +1160,8 @@ mod tests {
             local_ip: None,
             ..ready
         };
-        assert!(describe_rov_link(Some(&waiting), "192.168.1.88", &[]).contains("Recalibrate"));
+        let waiting_text = describe_rov_link(Some(&waiting), "192.168.1.88", &[]);
+        assert!(waiting_text.contains("no address") && waiting_text.contains("en7"));
 
         let ifaces = [info("en0", LinkKind::Wireless, &[[172, 20, 10, 4]])];
         let missing = describe_rov_link(None, "192.168.1.88", &ifaces);
@@ -1412,22 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn route_print_must_leave_through_the_selected_adapter() {
-        let output = "Active Routes:\n  Network Destination   Netmask   Gateway   Interface  Metric\n  \
-                      192.168.1.88  255.255.255.255  On-link  192.168.1.50  306\n";
-        let ethernet = Ipv4Addr::new(192, 168, 1, 103);
-        let wifi = Ipv4Addr::new(192, 168, 1, 50);
-        assert!(route_print_uses_interface(output, "192.168.1.88", wifi));
-        assert!(!route_print_uses_interface(
-            output,
-            "192.168.1.88",
-            ethernet
-        ));
-        assert!(!route_print_uses_interface(output, "192.168.1.99", wifi));
-        assert!(!route_print_uses_interface("", "192.168.1.88", wifi));
-    }
-
-    #[test]
     fn binding_is_only_valid_while_the_adapter_is_up_with_a_rov_subnet_address() {
         let snapshot = [
             info("en7", LinkKind::Wired, &[[192, 168, 1, 103]]),
@@ -1459,6 +1391,92 @@ mod tests {
         ] {
             assert!(!rtsp_url_is_independent_of_rov_link(url), "{url}");
         }
+    }
+
+    #[test]
+    fn suggested_client_address_keeps_the_expected_one_or_follows_the_subnet() {
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        let preferred = Ipv4Addr::new(192, 168, 1, 103);
+        assert_eq!(suggest_client_ip(ROV, preferred, mask), preferred);
+        assert_eq!(
+            suggest_client_ip(Ipv4Addr::new(10, 4, 5, 88), preferred, mask),
+            Ipv4Addr::new(10, 4, 5, 103)
+        );
+        // The ROV sitting on .103 itself must not get the same suggestion.
+        assert_eq!(
+            suggest_client_ip(Ipv4Addr::new(10, 4, 5, 103), preferred, mask),
+            Ipv4Addr::new(10, 4, 5, 104)
+        );
+        assert_eq!(
+            suggest_client_ip(preferred, preferred, mask),
+            Ipv4Addr::new(192, 168, 1, 104)
+        );
+    }
+
+    #[test]
+    fn setup_hint_gives_exact_steps_for_each_os() {
+        let ip = Ipv4Addr::new(192, 168, 1, 103);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        let mac = address_setup_hint(HostOs::MacOs, "en7", ip, mask);
+        assert!(
+            mac.contains("System Settings") && mac.contains("sudo ifconfig en7 inet 192.168.1.103")
+        );
+        let win = address_setup_hint(HostOs::Windows, "Ethernet 2", ip, mask);
+        assert!(win.contains(
+            "netsh interface ip set address name=\"Ethernet 2\" static 192.168.1.103 255.255.255.0"
+        ));
+        let linux = address_setup_hint(HostOs::Linux, "enp3s0", ip, mask);
+        assert!(linux.contains("sudo ip addr add 192.168.1.103/24 dev enp3s0"));
+        for hint in [&mac, &win, &linux] {
+            assert!(hint.contains("192.168.1.103") && hint.contains("picks it up on its own"));
+        }
+    }
+
+    #[test]
+    fn address_setup_separates_the_settings_steps_from_the_terminal_command() {
+        let ip = Ipv4Addr::new(10, 4, 5, 103);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        for os in [HostOs::MacOs, HostOs::Windows, HostOs::Linux] {
+            let setup = address_setup(os, "if0", ip, mask);
+            assert_eq!((setup.client_ip, setup.mask), (ip, mask));
+            assert!(setup.gui_steps.contains("10.4.5.103") && !setup.gui_steps.contains("sudo"));
+            assert!(setup.command.contains("10.4.5.103") && setup.command.contains("if0"));
+            assert!(
+                !setup.command.contains('\n'),
+                "a command must paste as one line"
+            );
+        }
+        assert!(
+            address_setup(HostOs::Windows, "Ethernet 2", ip, mask)
+                .command
+                .starts_with("netsh interface ip set address name=\"Ethernet 2\"")
+        );
+    }
+
+    #[test]
+    fn interface_index_comes_from_the_ipv4_entry_of_that_name() {
+        let mut v4 = v4_iface("Ethernet 2", [192, 168, 1, 103]);
+        v4.index = Some(14);
+        let mut v6 = v6_iface("Ethernet 2");
+        v6.index = Some(99);
+        let mut other = v4_iface("Wi-Fi", [10, 0, 0, 2]);
+        other.index = Some(7);
+        let ifaces = vec![v6, v4, other];
+        assert_eq!(ipv4_interface_index(&ifaces, "Ethernet 2"), Some(14));
+        assert_eq!(ipv4_interface_index(&ifaces, "Wi-Fi"), Some(7));
+        assert_eq!(ipv4_interface_index(&ifaces, "missing"), None);
+        // An interface the OS reported without an index has none to give.
+        assert_eq!(
+            ipv4_interface_index(&[v4_iface("eth0", [10, 0, 0, 5])], "eth0"),
+            None
+        );
+    }
+
+    #[test]
+    fn current_os_matches_the_build_target() {
+        let os = HostOs::current();
+        assert_eq!(os == HostOs::MacOs, cfg!(target_os = "macos"));
+        assert_eq!(os == HostOs::Windows, cfg!(target_os = "windows"));
     }
 
     #[test]
@@ -1679,24 +1697,6 @@ mod tests {
         );
     }
 
-    // ---- detect_rov_interface (live system) --------------------------------
-
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn detect_interface_unreachable() {
-        assert!(detect_rov_interface("1.2.3.4").is_none());
-    }
-
-    #[test]
-    fn detect_interface_invalid_ip() {
-        assert!(detect_rov_interface("not-an-ip").is_none());
-    }
-
-    #[test]
-    fn detect_interface_empty() {
-        assert!(detect_rov_interface("").is_none());
-    }
-
     // ---- select_active_macos_ethernet_interface ---------------------------
 
     #[test]
@@ -1867,58 +1867,5 @@ en6: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 16000
             "\tmedia: autoselect (1000baseT <full-duplex>)\n",
         );
         assert!(!macos_interface_is_wired(ifconfig, "en9"));
-    }
-
-    // ---- prefer_wired_interface -------------------------------------------
-
-    #[test]
-    fn prefer_wired_skips_linux_wireless_names() {
-        let candidates = vec!["wlan0".to_string(), "eth0".to_string()];
-        assert_eq!(
-            prefer_wired_interface(&candidates),
-            Some("eth0".to_string())
-        );
-    }
-
-    #[test]
-    fn prefer_wired_skips_windows_wifi_name() {
-        let candidates = vec!["Wi-Fi".to_string(), "Ethernet".to_string()];
-        assert_eq!(
-            prefer_wired_interface(&candidates),
-            Some("Ethernet".to_string())
-        );
-    }
-
-    #[test]
-    fn prefer_wired_falls_back_to_first_when_all_wireless() {
-        let candidates = vec!["wlan0".to_string(), "wlp2s0".to_string()];
-        assert_eq!(
-            prefer_wired_interface(&candidates),
-            Some("wlan0".to_string())
-        );
-    }
-
-    #[test]
-    fn prefer_wired_returns_first_when_all_wired() {
-        let candidates = vec!["eth0".to_string(), "eth1".to_string()];
-        assert_eq!(
-            prefer_wired_interface(&candidates),
-            Some("eth0".to_string())
-        );
-    }
-
-    #[test]
-    fn prefer_wired_none_on_empty() {
-        assert_eq!(prefer_wired_interface(&[]), None);
-    }
-
-    #[test]
-    fn recalibrate_result_holds_fields() {
-        let result = RecalibrateResult {
-            interface: "en10".to_string(),
-            rov_info: "Detected ROV interface en10.".to_string(),
-        };
-        assert_eq!(result.interface, "en10");
-        assert!(result.rov_info.contains("en10"));
     }
 }
