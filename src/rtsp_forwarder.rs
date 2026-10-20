@@ -8,8 +8,8 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -18,12 +18,10 @@ use reqwest::Url;
 use socket2::{Domain, Protocol, Socket, Type};
 
 #[cfg(target_os = "windows")]
-use crate::network::source_ipv4_for_host;
+use crate::network::{ipv4_interface_index, source_ipv4_for_host};
 use crate::rov_status::bind_socket_to_interface;
 
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often a blocked pump wakes up to notice a stop request.
-const READ_POLL: Duration = Duration::from_millis(200);
 const BUFFER_SIZE: usize = 16 * 1024;
 const HISTOGRAM_BUCKETS: usize = 32;
 
@@ -35,6 +33,10 @@ pub struct ForwarderTarget {
     /// Interface to pin the outgoing connection to (`IP_BOUND_IF` /
     /// `SO_BINDTODEVICE`). `None` leaves routing to the OS.
     pub interface: Option<String>,
+    /// Index of that interface, used on Windows to set `IP_UNICAST_IF` so the
+    /// connection leaves through that adapter even when other routes
+    /// overlap. Ignored elsewhere.
+    pub interface_index: Option<u32>,
     /// Source address to bind before connecting. This selects the source
     /// interface on Windows, where binding by name is not available.
     pub source_ip: Option<IpAddr>,
@@ -86,6 +88,18 @@ struct Stats {
     bytes_to_rov: AtomicU64,
     bytes_from_rov: AtomicU64,
     write_delay: Histogram,
+    /// Why the most recent attempt to reach the ROV failed; cleared by the
+    /// next success.
+    last_connect_error: Mutex<Option<String>>,
+}
+
+impl Stats {
+    fn set_connect_error(&self, error: Option<String>) {
+        *self
+            .last_connect_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = error;
+    }
 }
 
 /// Point-in-time copy of the forwarder's counters.
@@ -105,10 +119,66 @@ pub struct ForwarderStats {
     pub write_p99_micros: u64,
 }
 
+/// Live sockets of every session, so teardown can shut them down: a thread
+/// blocked in a read or write on a socket returns as soon as another thread
+/// shuts that socket down. No read or write timeouts are used anywhere, which
+/// matters on Windows, where a send that times out leaves the socket in an
+/// indeterminate state.
+#[derive(Default)]
+struct Registry {
+    stopped: bool,
+    next_id: u64,
+    sockets: Vec<(u64, TcpStream)>,
+}
+
+#[derive(Default)]
+struct Shared {
+    registry: Mutex<Registry>,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.lock().stopped
+    }
+
+    /// Registers a session's two sockets for teardown. Returns `None` once the
+    /// forwarder has stopped (the session must not start).
+    fn register(&self, client: &TcpStream, upstream: &TcpStream) -> Option<u64> {
+        let handles = (client.try_clone().ok()?, upstream.try_clone().ok()?);
+        let mut registry = self.lock();
+        if registry.stopped {
+            return None;
+        }
+        registry.next_id += 1;
+        let id = registry.next_id;
+        registry.sockets.push((id, handles.0));
+        registry.sockets.push((id, handles.1));
+        Some(id)
+    }
+
+    fn deregister(&self, id: u64) {
+        self.lock().sockets.retain(|(sid, _)| *sid != id);
+    }
+
+    /// Marks the forwarder stopped and shuts down every live socket, which
+    /// unblocks all reads and writes in progress.
+    fn shutdown_all(&self) {
+        let mut registry = self.lock();
+        registry.stopped = true;
+        for (_, socket) in registry.sockets.drain(..) {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
 /// A running forwarder. Dropping it stops the listener and all connections.
 pub struct RtspForwarder {
     local_addr: SocketAddr,
-    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     stats: Arc<Stats>,
     accept_thread: Option<JoinHandle<()>>,
 }
@@ -123,18 +193,18 @@ impl RtspForwarder {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .context("failed to bind RTSP forwarder listener on 127.0.0.1")?;
         let local_addr = listener.local_addr()?;
-        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared::default());
         let stats = Arc::new(Stats::default());
 
         let accept_thread = {
-            let stop = Arc::clone(&stop);
+            let shared = Arc::clone(&shared);
             let stats = Arc::clone(&stats);
-            thread::spawn(move || accept_loop(&listener, &target, &stop, &stats))
+            thread::spawn(move || accept_loop(&listener, &target, &shared, &stats))
         };
 
         Ok(Self {
             local_addr,
-            stop,
+            shared,
             stats,
             accept_thread: Some(accept_thread),
         })
@@ -144,6 +214,18 @@ impl RtspForwarder {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Why the most recent attempt to reach the ROV failed (for example
+    /// "failed to connect to ROV at 192.168.1.88:8554: Network is unreachable"),
+    /// or `None` if the last attempt worked or none was made yet.
+    #[must_use]
+    pub fn last_connect_error(&self) -> Option<String> {
+        self.stats
+            .last_connect_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     #[must_use]
@@ -162,8 +244,8 @@ impl RtspForwarder {
 
 impl Drop for RtspForwarder {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Wake the blocking `accept` so the thread can see the stop flag.
+        self.shared.shutdown_all();
+        // Wake the blocking `accept` so the thread can see that it stopped.
         let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_millis(500));
         let _ = self.accept_thread.take().map(JoinHandle::join);
     }
@@ -172,37 +254,49 @@ impl Drop for RtspForwarder {
 fn accept_loop(
     listener: &TcpListener,
     target: &ForwarderTarget,
-    stop: &Arc<AtomicBool>,
+    shared: &Arc<Shared>,
     stats: &Arc<Stats>,
 ) {
     for incoming in listener.incoming() {
-        if stop.load(Ordering::Relaxed) {
+        if shared.is_stopped() {
             break;
         }
         let Ok(client) = incoming else { continue };
         let target = target.clone();
-        let stop = Arc::clone(stop);
+        let shared = Arc::clone(shared);
         let stats = Arc::clone(stats);
-        thread::spawn(move || handle_client(client, &target, &stop, &stats));
+        thread::spawn(move || handle_client(client, &target, &shared, &stats));
     }
 }
 
 fn handle_client(
     client: TcpStream,
     target: &ForwarderTarget,
-    stop: &Arc<AtomicBool>,
+    shared: &Arc<Shared>,
     stats: &Arc<Stats>,
 ) {
     stats.connections.fetch_add(1, Ordering::Relaxed);
     let _active = ActiveSession::start(stats);
-    let Ok(upstream) = connect_upstream(target) else {
-        stats.connect_failures.fetch_add(1, Ordering::Relaxed);
-        return;
+    let upstream = match connect_upstream(target) {
+        Ok(stream) => {
+            stats.set_connect_error(None);
+            stream
+        }
+        Err(err) => {
+            stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+            stats.set_connect_error(Some(format!("{err:#}")));
+            return;
+        }
     };
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
 
-    let _ = relay(client, upstream, stop, stats);
+    // Not registered when the forwarder stopped while connecting.
+    let Some(id) = shared.register(&client, &upstream) else {
+        return;
+    };
+    let _ = relay(client, upstream, stats);
+    shared.deregister(id);
 }
 
 /// Counts a session as active for as long as it lives.
@@ -221,21 +315,15 @@ impl Drop for ActiveSession<'_> {
     }
 }
 
-/// Runs both directions until each side has closed or `stop` is set.
-fn relay(
-    client: TcpStream,
-    upstream: TcpStream,
-    stop: &Arc<AtomicBool>,
-    stats: &Arc<Stats>,
-) -> std::io::Result<()> {
+/// Runs both directions until each side has closed or a socket is shut down.
+fn relay(client: TcpStream, upstream: TcpStream, stats: &Arc<Stats>) -> std::io::Result<()> {
     let client_rx = client.try_clone()?;
     let upstream_tx = upstream.try_clone()?;
     let to_rov = {
-        let stop = Arc::clone(stop);
         let stats = Arc::clone(stats);
-        thread::spawn(move || pump(client_rx, upstream_tx, &stats.bytes_to_rov, &stats, &stop))
+        thread::spawn(move || pump(client_rx, upstream_tx, &stats.bytes_to_rov, &stats))
     };
-    pump(upstream, client, &stats.bytes_from_rov, stats, stop);
+    pump(upstream, client, &stats.bytes_from_rov, stats);
     let _ = to_rov.join();
     Ok(())
 }
@@ -250,6 +338,10 @@ fn connect_upstream(target: &ForwarderTarget) -> Result<TcpStream> {
     if let Some(interface) = &target.interface {
         bind_socket_to_interface(&socket, interface)?;
     }
+    #[cfg(windows)]
+    if let Some(index) = target.interface_index {
+        set_unicast_if(&socket, index, target.addr.is_ipv6())?;
+    }
     if let Some(ip) = target.source_ip {
         socket
             .bind(&SocketAddr::new(ip, 0).into())
@@ -261,40 +353,63 @@ fn connect_upstream(target: &ForwarderTarget) -> Result<TcpStream> {
     Ok(socket.into())
 }
 
-/// Copies `from` into `to` until either side closes or a stop is requested.
+/// Forces outgoing packets of `socket` through the adapter with `index`
+/// (`IP_UNICAST_IF` / `IPV6_UNICAST_IF`). Binding the adapter's source address
+/// alone does not do this: with overlapping routes Windows may still pick
+/// another adapter for the connection.
+#[cfg(windows)]
+fn set_unicast_if(socket: &Socket, index: u32, ipv6: bool) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, SOCKET_ERROR, setsockopt,
+    };
+
+    // IPv4 takes the interface index in network byte order, IPv6 in host order.
+    let (level, name, value) = if ipv6 {
+        (IPPROTO_IPV6.0, IPV6_UNICAST_IF, index)
+    } else {
+        (IPPROTO_IP.0, IP_UNICAST_IF, index.to_be())
+    };
+    let bytes = value.to_ne_bytes();
+    // SAFETY: the handle belongs to `socket`, which outlives the call, and
+    // `bytes` is a valid buffer of the length passed.
+    let result = unsafe {
+        setsockopt(
+            SOCKET(socket.as_raw_socket() as usize),
+            level,
+            name,
+            Some(&bytes),
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("IP_UNICAST_IF failed for interface index {index}"));
+    }
+    Ok(())
+}
+
+/// Copies `from` into `to` until either side closes or fails.
 ///
 /// An orderly EOF only half-closes `to`, so the peer sees EOF while the
-/// opposite direction can still finish. Any error (reset, failed write) or a
-/// stop shuts both sockets down in both directions: the sibling pump shares
-/// these sockets and would otherwise keep a dead session alive until the
-/// forwarder is dropped.
-fn pump(
-    mut from: TcpStream,
-    mut to: TcpStream,
-    byte_counter: &AtomicU64,
-    stats: &Stats,
-    stop: &AtomicBool,
-) {
-    let _ = from.set_read_timeout(Some(READ_POLL));
-    // A peer that stops reading must not pin this thread: writes time out too,
-    // so the stop flag is re-checked every `READ_POLL`.
-    let _ = to.set_write_timeout(Some(READ_POLL));
+/// opposite direction can still finish. Any error (reset, failed write, or a
+/// shutdown by the forwarder's teardown) shuts both sockets down in both
+/// directions: the sibling pump shares these sockets and would otherwise keep
+/// a dead session alive.
+fn pump(mut from: TcpStream, mut to: TcpStream, byte_counter: &AtomicU64, stats: &Stats) {
     let mut buffer = [0_u8; BUFFER_SIZE];
     let mut orderly_eof = false;
-    while !stop.load(Ordering::Relaxed) {
+    loop {
         let read = match from.read(&mut buffer) {
             Ok(0) => {
                 orderly_eof = true;
                 break;
             }
             Ok(n) => n,
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                continue;
-            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
         let started = Instant::now();
-        if !write_all_until_stopped(&mut to, &buffer[..read], stop) {
+        if to.write_all(&buffer[..read]).is_err() {
             break;
         }
         stats.write_delay.record(started.elapsed());
@@ -306,25 +421,6 @@ fn pump(
         let _ = to.shutdown(Shutdown::Both);
         let _ = from.shutdown(Shutdown::Both);
     }
-}
-
-/// `write_all` that gives up when `stop` is set. A write timeout only means the
-/// peer's buffer is full, so the bytes already written are kept and the rest
-/// is retried. Returns `false` if the connection failed or a stop was requested.
-fn write_all_until_stopped(to: &mut TcpStream, mut data: &[u8], stop: &AtomicBool) -> bool {
-    while !data.is_empty() && !stop.load(Ordering::Relaxed) {
-        match to.write(data) {
-            Ok(n) if n > 0 => data = &data[n..],
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
-            // A closed or failed connection (a zero-byte write counts as one).
-            _ => return false,
-        }
-    }
-    data.is_empty()
 }
 
 /// Port the forwarder should dial: the one in the URL, else the scheme's
@@ -373,8 +469,9 @@ pub fn start_url_forwarder(
 
     // Windows cannot bind by interface name here, so pin the source address:
     // the one on the ROV's subnet, never an unrelated alias on the adapter.
+    // The adapter's index is also needed there, for `IP_UNICAST_IF`.
     #[cfg(target_os = "windows")]
-    let source_ip = {
+    let (source_ip, interface_index) = {
         let std::net::IpAddr::V4(rov_ip) = addr.ip() else {
             anyhow::bail!("ROV host {host} is not an IPv4 address");
         };
@@ -382,19 +479,49 @@ pub fn start_url_forwarder(
         let source = source_ipv4_for_host(&ifaces, interface, rov_ip).with_context(|| {
             format!("interface {interface:?} has no IPv4 address to send ROV traffic from")
         })?;
-        Some(std::net::IpAddr::V4(source))
+        let index = ipv4_interface_index(&ifaces, interface)
+            .with_context(|| format!("cannot find the interface index of {interface:?}"))?;
+        (Some(std::net::IpAddr::V4(source)), Some(index))
     };
     #[cfg(not(target_os = "windows"))]
-    let source_ip = None;
+    let (source_ip, interface_index) = (None, None);
 
     let forwarder = RtspForwarder::start(ForwarderTarget {
         addr,
         interface: Some(interface.to_owned()),
+        interface_index,
         source_ip,
     })?;
     let local_url = rewrite_rtsp_url(url, forwarder.local_addr())
         .context("cannot point the stream URL at the forwarder")?;
     Ok(Some((local_url, forwarder)))
+}
+
+/// The `Host` header value a client would send for `url`: the host, plus the
+/// port when it is not the scheme's default. Behind the forwarder ffmpeg
+/// would send the forwarder's own address instead, which a ROV's HTTP server
+/// may not accept, so the real value is passed explicitly.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::rtsp_forwarder::http_host_header;
+///
+/// assert_eq!(http_host_header("http://192.168.1.88/v1/medias").as_deref(), Some("192.168.1.88"));
+/// assert_eq!(http_host_header("http://192.168.1.88:8080/x").as_deref(), Some("192.168.1.88:8080"));
+/// assert_eq!(http_host_header("http://rov.local:80/x").as_deref(), Some("rov.local"));
+/// assert!(http_host_header("not a url").is_none());
+/// ```
+#[must_use]
+pub fn http_host_header(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    // `port()` is `None` for the scheme's default port, so only an explicit,
+    // non-default one is appended.
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
 }
 
 /// Points a URL (RTSP or HTTP) at the forwarder, keeping credentials, path
@@ -476,6 +603,33 @@ mod tests {
     }
 
     #[test]
+    fn host_header_keeps_explicit_non_default_ports_only() {
+        let header = |url: &str| http_host_header(url);
+        assert_eq!(
+            header("http://192.168.1.88/v1/x").as_deref(),
+            Some("192.168.1.88")
+        );
+        assert_eq!(
+            header("http://192.168.1.88:80/x").as_deref(),
+            Some("192.168.1.88")
+        );
+        assert_eq!(
+            header("http://192.168.1.88:8080/x").as_deref(),
+            Some("192.168.1.88:8080")
+        );
+        assert_eq!(
+            header("https://rov.local:443/x").as_deref(),
+            Some("rov.local")
+        );
+        assert_eq!(
+            header("rtsp://10.0.0.5:8554/s").as_deref(),
+            Some("10.0.0.5:8554")
+        );
+        assert!(header("not a url").is_none());
+        assert!(header("mailto:rov@example.com").is_none());
+    }
+
+    #[test]
     fn rewrite_rejects_urls_that_cannot_carry_a_host() {
         let local: SocketAddr = "127.0.0.1:4000".parse().unwrap();
         assert!(rewrite_rtsp_url("mailto:rov@example.com", local).is_none());
@@ -532,7 +686,7 @@ mod tests {
         assert_eq!(local_url, expected);
     }
 
-    // ---- write_all_until_stopped -------------------------------------------
+    // ---- socket registry used for teardown ----------------------------------
 
     fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -541,65 +695,72 @@ mod tests {
         (client, server)
     }
 
-    /// Keeps writing 1 MiB chunks until `write_all_until_stopped` gives up.
-    /// How much the OS buffers before a write blocks or fails differs a lot
-    /// (Windows accepts very large writes at once), so the tests must not
-    /// assume a size; they only require that it gives up in bounded time.
-    fn write_until_it_gives_up(writer: &mut TcpStream, stop: &AtomicBool) {
-        let chunk = vec![0_u8; 1024 * 1024];
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while write_all_until_stopped(writer, &chunk, stop) && Instant::now() < deadline {}
-        assert!(Instant::now() < deadline, "never gave up");
+    #[test]
+    fn registry_refuses_sessions_after_shutdown() {
+        let shared = Shared::default();
+        assert!(!shared.is_stopped());
+        shared.shutdown_all();
+        assert!(shared.is_stopped());
+        let (a, b) = tcp_pair();
+        assert!(shared.register(&a, &b).is_none());
     }
 
     #[test]
-    fn write_all_until_stopped_delivers_everything_to_a_reading_peer() {
-        let (mut writer, mut reader) = tcp_pair();
-        let data = vec![7_u8; 1_000_000];
-        let sink = thread::spawn(move || {
-            let mut received = Vec::new();
-            reader.read_to_end(&mut received).unwrap();
-            received.len()
-        });
-        assert!(write_all_until_stopped(
-            &mut writer,
-            &data,
-            &AtomicBool::new(false)
-        ));
-        drop(writer);
-        assert_eq!(sink.join().unwrap(), data.len());
+    fn registry_hands_out_distinct_ids_and_forgets_finished_sessions() {
+        let shared = Shared::default();
+        let (a, b) = tcp_pair();
+        let (c, d) = tcp_pair();
+        let first = shared.register(&a, &b).unwrap();
+        let second = shared.register(&c, &d).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(shared.lock().sockets.len(), 4);
+        shared.deregister(first);
+        assert_eq!(shared.lock().sockets.len(), 2);
+
+        // A finished session is no longer touched by the teardown.
+        shared.shutdown_all();
+        let mut a = a;
+        assert!(a.write_all(b"still open").is_ok());
+        assert!(shared.lock().sockets.is_empty());
     }
 
     #[test]
-    fn write_all_until_stopped_retries_through_timeouts_until_stopped() {
-        // The reader never reads, so the socket buffers fill and writes time out.
-        let (mut writer, _reader) = tcp_pair();
-        writer
-            .set_write_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopper = {
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(300));
-                stop.store(true, Ordering::Relaxed);
-            })
+    fn a_session_that_connects_after_shutdown_is_dropped_without_relaying() {
+        let rov = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = ForwarderTarget {
+            addr: rov.local_addr().unwrap(),
+            interface: None,
+            interface_index: None,
+            source_ip: None,
         };
-        write_until_it_gives_up(&mut writer, &stop);
-        assert!(
-            stop.load(Ordering::Relaxed),
-            "gave up before the stop request"
-        );
-        stopper.join().unwrap();
+        let shared = Arc::new(Shared::default());
+        shared.shutdown_all();
+        let stats = Arc::new(Stats::default());
+        let (mut client, accepted) = tcp_pair();
+
+        handle_client(accepted, &target, &shared, &stats);
+
+        assert_eq!(stats.connections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.connect_failures.load(Ordering::Relaxed), 0);
+        // The client's socket was closed, not relayed.
+        let mut buf = [0_u8; 4];
+        assert_eq!(client.read(&mut buf).unwrap_or(0), 0);
     }
 
     #[test]
-    fn write_all_until_stopped_gives_up_when_the_peer_resets() {
-        let (mut writer, reader) = tcp_pair();
-        socket2::SockRef::from(&reader)
-            .set_linger(Some(Duration::ZERO))
-            .unwrap();
-        drop(reader);
-        write_until_it_gives_up(&mut writer, &AtomicBool::new(false));
+    fn shutdown_all_unblocks_a_blocked_reader() {
+        let shared = Shared::default();
+        let (a, b) = tcp_pair();
+        shared.register(&a, &b).unwrap();
+        let mut blocked = a.try_clone().unwrap();
+        let reader = thread::spawn(move || {
+            let mut buf = [0_u8; 8];
+            blocked.read(&mut buf).unwrap_or(0)
+        });
+        // Let the reader block first, then shut the session down.
+        thread::sleep(Duration::from_millis(100));
+        shared.shutdown_all();
+        assert_eq!(reader.join().unwrap(), 0);
     }
 }

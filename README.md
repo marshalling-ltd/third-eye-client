@@ -107,9 +107,8 @@ The stale-timeout is configurable per session; the map auto-centers on the lates
 - Auto-detects how the computer reaches the ROV, whether over its Wi-Fi or a USB-ethernet cable: the interface with an address on the ROV's subnet is chosen (a cable wins over Wi-Fi), and an unrelated link such as a phone hotspot is ignored
 - Watches for cables and Wi-Fi coming and going (every 2 s) and, within a few seconds, moves video and telemetry onto the new link; the stream screen shows which link is in use, or what to check when the ROV cannot be found
 - Binds HTTP, UDP and (on Unix) socket-level traffic to that interface via `IP_BOUND_IF` / `SO_BINDTODEVICE`
-- Sets up an OS-level host route so ffmpeg (an external process that can't use `IP_BOUND_IF`) reaches the ROV through the correct adapter:
-  - **macOS** — `osascript` with administrator privileges (one-time password prompt)
-  - **Windows** — ARP cache pre-population via an HTTP probe before launching ffmpeg
+- ffmpeg (an external process that can't bind to an interface) connects to a small in-process forwarder on `127.0.0.1`, which opens the real connection to the ROV from a socket pinned to the detected interface (`IP_BOUND_IF` on macOS, `SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF` plus a source-address bind on Windows). No host route, ARP entry or administrator prompt is needed.
+- If a cable is connected but the adapter has no address on the ROV's network, the app shows a one-time guide with the exact steps for your OS, since setting an address needs administrator rights.
 
 ### 🔐 Server authentication
 
@@ -176,7 +175,7 @@ downloads, server calls, the ffmpeg pipe) runs on its own thread and reports bac
 into the UI.
 
 **Live video.** ffmpeg is launched as a child process that pulls RTSP over TCP and writes MJPEG frames to stdout; a reader thread splits the stream into JPEGs and hands them
-to the UI. Because ffmpeg can't bind to a network interface itself, the app first installs an OS-level host route to the ROV (see [Network setup](#-network-setup-usb-ethernet-to-rov)).
+to the UI. Because ffmpeg can't bind to a network interface itself, it connects to an in-process forwarder that pins the connection to the ROV's interface (see [ROV network interface binding](#-rov-network-interface-binding)).
 
 **Server session.** Every backend call goes through `ApiSession`, which refreshes the access token from the persisted refresh cookie before it expires, and once more on a
 401/403. Only a rejected refresh signs the user out; transport failures don't, so the app stays usable offshore without internet.
@@ -299,6 +298,9 @@ The ROV communicates over a local ethernet link. UDP discovery uses broadcast, b
 
 ### 1. Set a static IP on the USB adapter
 
+The app detects a USB-Ethernet cable that has no address on the ROV's network and shows these steps, with your adapter's name filled in, on the stream screen. It notices the address within a few seconds of you setting it, so there is no need to restart or press Recalibrate. Assigning the address needs administrator rights, which the app does not ask for (except the legacy macOS flow that is used while the forwarder is off).
+
+
 <details open>
 <summary><b>macOS (GUI)</b></summary>
 
@@ -333,7 +335,7 @@ When set, the app binds all connections to that interface at the socket level:
 |---|---|
 | **HTTP/TCP** (camera API) | `IP_BOUND_IF` via reqwest's `interface()` method |
 | **UDP** (telemetry) | `IP_BOUND_IF` via `socket2::bind_device_by_index_v4()` |
-| **RTSP** (video via ffmpeg) | ffmpeg is an external process and can't use `IP_BOUND_IF`, so the app sets up an OS-level host route before launching it. On macOS this triggers a **one-time admin password prompt** (via `osascript`); the route persists for the session. |
+| **RTSP** (video via ffmpeg, also recorded-video playback) | ffmpeg is an external process and can't use `IP_BOUND_IF`, so it connects to an in-process forwarder on `127.0.0.1` that opens the real connection pinned to the interface. No host route or admin prompt. |
 
 Leave the field empty to use default OS routing (no interface binding).
 
@@ -455,7 +457,7 @@ cargo run --release --features test-tools --bin forwarder-probe -- \
 
 Run it on each OS and connection scenario and attach the output to the TE-2 ticket. `--mode direct` measures the baseline only; credentials are redacted in the report.
 
-The interface-bound RTSP forwarder is off by default; enable it for a client run with `THIRD_EYE_RTSP_FORWARDER=1`. It is ignored on Windows until egress-interface binding (`IP_UNICAST_IF`) is implemented there.
+Video goes through the interface-bound RTSP forwarder by default on every OS (on Windows it forces the outgoing adapter with `IP_UNICAST_IF`), so no host route, ARP entry or administrator prompt is needed.
 
 ---
 

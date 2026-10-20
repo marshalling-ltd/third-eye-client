@@ -45,23 +45,16 @@ use map::{
 use reqwest::Url;
 use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, VecModel};
-#[cfg(target_os = "windows")]
-use third_eye_client::camera::local_ipv4_for_interface_from;
 use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
 use third_eye_client::formatting::{
     build_media_download_url, format_bytes, format_epoch_ms_datetime, format_relative_age,
     is_image_name, is_video_name, parse_stale_timeout_ms,
 };
-#[cfg(target_os = "windows")]
-use third_eye_client::network::parse_rtsp_host_port;
-#[cfg(target_os = "windows")]
-use third_eye_client::network::route_print_uses_interface;
 use third_eye_client::network::{
-    LinkKind, LinkWatcher, RecalibrateResult, RovLink, describe_rov_link,
-    format_local_ipv4_summary, interface_has_rov_subnet_ipv4, local_ipv4_addresses,
-    network_signature, parse_host_from_http_base, plan_link_binding,
-    rtsp_url_is_independent_of_rov_link, select_rov_link, snapshot_has_rov_subnet_address,
-    snapshot_interfaces,
+    AddressSetup, HostOs, LinkWatcher, RovLink, address_setup, address_setup_hint,
+    describe_rov_link, format_local_ipv4_summary, local_ipv4_addresses, network_signature,
+    parse_host_from_http_base, plan_link_binding, rtsp_url_is_independent_of_rov_link,
+    select_rov_link, snapshot_has_rov_subnet_address, snapshot_interfaces, suggest_client_ip,
 };
 use third_eye_client::nmea::{
     GpsProtocol, NmeaGpsState, canonical_serial_port_name, find_nmea_serial_port_index,
@@ -71,7 +64,7 @@ use third_eye_client::rov_status::{
     ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
     UdpStatusState,
 };
-use third_eye_client::rtsp_forwarder::{RtspForwarder, start_url_forwarder};
+use third_eye_client::rtsp_forwarder::{RtspForwarder, http_host_header, start_url_forwarder};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::api::ApiError;
 use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
@@ -94,9 +87,7 @@ const DEFAULT_TEST_RTSP: &str = "rtsp://admin:admin@127.0.0.1:8554/stream";
 const DEFAULT_ROV_RTSP: &str = "rtsp://admin:admin@192.168.1.88:8554/stream/0/0";
 const DEFAULT_ROV_HTTP_BASE: &str = "http://192.168.1.88";
 const DEFAULT_SERVER_BASE_URL: &str = "https://third-eye.marshalling.eu";
-#[cfg(target_os = "macos")]
 const DEFAULT_ROV_CLIENT_IP: &str = "192.168.1.103";
-#[cfg(target_os = "macos")]
 const DEFAULT_ROV_CLIENT_NETMASK: &str = "255.255.255.0";
 const DEFAULT_ROV_UDP_BIND_HOST: &str = "0.0.0.0";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -702,17 +693,8 @@ struct ThirdEyeState {
     /// Unix-ms timestamp when the user left the stream screen.
     /// `0` means we are on the stream screen (or never were).
     stream_left_at_ms: i64,
-    /// Sender half of the background recalibration channel.  Cloned into the
-    /// worker thread so it can post results back to the UI loop.
-    recalibrate_tx: mpsc::Sender<RecalibrateResult>,
-    /// Receiver polled every frame by the timer callback.
-    recalibrate_rx: mpsc::Receiver<RecalibrateResult>,
-    /// True while a background recalibration is in flight.
-    recalibrate_in_progress: bool,
-    /// Raw interface name detected by `detect_rov_interface`, regardless of
-    /// whether it has an IPv4 yet.  Used so stream start can call
-    /// `ensure_rov_external_route` (which assigns the IP via osascript) even
-    /// when `rov_network_interface` is empty.
+    /// Interface chosen for the ROV, even if it has no IPv4 address on the
+    /// ROV's network yet (`rov_network_interface` is only set once it has).
     rov_detected_interface: String,
     /// How this computer currently reaches the ROV (`None` = not found).
     rov_link: Option<RovLink>,
@@ -724,6 +706,12 @@ struct ThirdEyeState {
     /// Video was stopped after a link change and still has to be restarted
     /// (waiting for the ROV, or for the route to be prepared).
     video_restart_pending: bool,
+    /// Help for giving the USB adapter an address by hand, with the adapter
+    /// it is for. Set while a cable has no address on the ROV's network and
+    /// the app cannot assign one itself.
+    address_setup: Option<(String, AddressSetup)>,
+    /// The user closed the help for the current adapter.
+    address_setup_dismissed: bool,
     /// Notices cables and Wi-Fi coming and going and says when to re-detect.
     link_watcher: LinkWatcher,
     /// In-app updater state (GitHub release checks and download CTA).
@@ -811,8 +799,6 @@ impl ThirdEyeState {
             );
         }
 
-        let (recalibrate_tx, recalibrate_rx) = mpsc::channel();
-
         let mut state = Self {
             // Device Map is the most useful "what's going on right now" view
             // for an ROV operator, so it's the default screen on launch
@@ -845,14 +831,13 @@ impl ThirdEyeState {
             devices: DevicesUiState::new(store),
             location_detected_at_ms: 0,
             stream_left_at_ms: 0,
-            recalibrate_tx,
-            recalibrate_rx,
-            recalibrate_in_progress: false,
             rov_detected_interface: String::new(),
             rov_link: None,
             rov_link_text: String::new(),
             rov_link_host: String::new(),
             video_restart_pending: false,
+            address_setup: None,
+            address_setup_dismissed: false,
             link_watcher: LinkWatcher::default(),
             update: UpdateUiState::new(),
             nearby: NearbyResourcesState::new(),
@@ -982,32 +967,21 @@ struct StreamState {
 impl StreamState {
     /// Start the RTSP stream for `rtsp_url`.
     ///
-    /// `rov_interface` is used on Windows to pre-populate the ARP cache for
-    /// the RTSP host before launching ffmpeg: without this, Windows may not
-    /// have resolved its MAC address and ffmpeg's TCP CONNECT will fail.
-    /// This targets `rtsp_url`'s own host deliberately, not `rov_http_base` —
-    /// the RTSP source and the ROV's HTTP camera API are independent
-    /// endpoints (e.g. a bare test RTSP server has no HTTP API at all), so
-    /// priming ARP for one must not depend on the other being reachable.
-    #[allow(unused_variables)]
+    /// ffmpeg cannot bind to a network interface, so when `rov_interface` is
+    /// set it connects to an in-process forwarder instead, which opens the
+    /// real connection to the ROV pinned to that interface. This targets
+    /// `rtsp_url`'s own host deliberately, not `rov_http_base`: the RTSP
+    /// source and the ROV's HTTP camera API are independent endpoints (e.g. a
+    /// bare test RTSP server has no HTTP API at all).
     fn start(&mut self, rtsp_url: String, rov_interface: Option<&str>) -> Result<String> {
         let ffmpeg_bin = locate_ffmpeg_binary().context(
             "ffmpeg binary not found. Bundle it as ./bin/ffmpeg beside the app executable.",
         )?;
         let ffmpeg_label = ffmpeg_bin.display().to_string();
 
-        let forwarder = if rtsp_forwarder_enabled() {
-            start_url_forwarder(&rtsp_url, rov_interface, 554)?
-        } else {
-            None
-        };
-        let (rtsp_url, proxy_guard) = match forwarder {
+        let (rtsp_url, proxy_guard) = match start_url_forwarder(&rtsp_url, rov_interface, 554)? {
             Some((local_url, guard)) => (local_url, Some(guard)),
-            None => {
-                #[cfg(target_os = "windows")]
-                prime_arp_for_rtsp_host(&rtsp_url, rov_interface);
-                (rtsp_url, None)
-            }
+            None => (rtsp_url, None),
         };
 
         let (controller, rx) = spawn_stream_pipeline(ffmpeg_bin, rtsp_url, proxy_guard)?;
@@ -1017,6 +991,14 @@ impl StreamState {
         Ok(format!(
             "Embedded stream started via ffmpeg at {ffmpeg_label}."
         ))
+    }
+
+    /// Why the video could not connect to the ROV, if the forwarder's last
+    /// attempt failed.
+    fn forwarder_error(&self) -> Option<String> {
+        self.controller
+            .as_ref()
+            .and_then(StreamController::forwarder_error)
     }
 
     fn stop(&mut self) {
@@ -1087,10 +1069,17 @@ struct StreamController {
     ffmpeg_child: Child,
     workers: Vec<JoinHandle<()>>,
     /// Keeps the RTSP TCP proxy alive for the lifetime of the stream.
-    _proxy_guard: Option<TcpProxyGuard>,
+    proxy_guard: Option<TcpProxyGuard>,
 }
 
 impl StreamController {
+    /// Why the forwarder could not reach the ROV, if its last attempt failed.
+    fn forwarder_error(&self) -> Option<String> {
+        self.proxy_guard
+            .as_ref()
+            .and_then(RtspForwarder::last_connect_error)
+    }
+
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         let _ = self.ffmpeg_child.kill();
@@ -1928,9 +1917,34 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     apply_stream_and_rov_runtime_to_ui(ui, state);
 }
 
+/// The stream status to show. While no frame has arrived, a forwarder that
+/// could not reach the ROV is the most useful thing to say: otherwise the
+/// user only sees ffmpeg's generic "Stream ended".
+fn stream_status_for_display(
+    status: &str,
+    frames_received: u64,
+    forwarder_error: Option<&str>,
+) -> String {
+    match forwarder_error {
+        Some(error) if frames_received == 0 => format!("Could not reach the ROV: {error}"),
+        _ => status.to_owned(),
+    }
+}
+
 fn apply_stream_and_rov_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
-    ui.set_stream_status(state.stream.status.clone().into());
+    ui.set_stream_status(
+        stream_status_for_display(
+            &state.stream.status,
+            state.stream.frames_received,
+            state.stream.forwarder_error().as_deref(),
+        )
+        .into(),
+    );
     ui.set_rov_link_text(state.rov_link_text.clone().into());
+    let setup = state.address_setup.as_ref().map(|(_, setup)| setup);
+    ui.set_address_setup_visible(setup.is_some() && !state.address_setup_dismissed);
+    ui.set_address_setup_steps(setup.map_or_default(|s| s.gui_steps.clone()).into());
+    ui.set_address_setup_command(setup.map_or_default(|s| s.command.clone()).into());
     ui.set_frames_received_text(state.stream.frames_received.to_string().into());
     ui.set_stream_is_active(state.stream.controller.is_some());
 
@@ -2197,75 +2211,6 @@ fn start_telemetry(state: &mut ThirdEyeState) {
     }
 }
 
-/// Runs the slow parts of ROV network recalibration on a background thread.
-///
-/// This is the `Send`-safe counterpart of `refresh_rov_network` — it performs
-/// the HTTP probe, route setup, and stale-route cleanup that can block for
-/// seconds (or trigger an OS admin dialog).  The result is sent back to the
-/// UI thread via `mpsc`.
-fn recalibrate_rov_network_blocking(rov_http_base: &str) -> RecalibrateResult {
-    let Some(rov_host) = parse_host_from_http_base(rov_http_base) else {
-        return RecalibrateResult {
-            interface: String::new(),
-            rov_info: "Could not extract host from ROV HTTP API URL.".to_string(),
-        };
-    };
-    let snapshot = snapshot_interfaces();
-    let link = rov_host
-        .parse::<std::net::Ipv4Addr>()
-        .ok()
-        .and_then(|ip| select_rov_link(&snapshot, ip));
-    let Some(link) = link else {
-        cleanup_stale_rov_route(&rov_host);
-        return RecalibrateResult {
-            interface: String::new(),
-            rov_info: describe_rov_link(None, &rov_host, &snapshot),
-        };
-    };
-    let interface = link.interface.clone();
-    let mut summary = format!("Using ROV interface {interface} for {rov_host}.");
-    if !needs_host_route(&link) {
-        cleanup_stale_rov_route(&rov_host);
-        return RecalibrateResult {
-            interface,
-            rov_info: summary,
-        };
-    }
-    match force_rov_external_route(rov_http_base, &interface) {
-        Ok(()) => {
-            summary.push_str(" External stream route is ready.");
-        }
-        Err(err) => {
-            let _ = write!(summary, " External stream route is not ready yet: {err:#}");
-        }
-    }
-    // Wait up to 3 s for networksetup/configd to apply the IPv4
-    // (networksetup -setmanual is asynchronous via configd).
-    let bindable = {
-        let mut found = false;
-        for _ in 0..6 {
-            if interface_has_rov_subnet_ipv4(&interface, &rov_host) {
-                found = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        if found {
-            interface
-        } else {
-            summary.push_str(" (HTTP via OS routing — interface has no IPv4)");
-            String::new()
-        }
-    };
-    RecalibrateResult {
-        interface: bindable,
-        rov_info: summary,
-    }
-}
-
-/// Returns `true` when `interface` has an IPv4 address on the same subnet
-/// as `rov_host`.  Used to decide whether the HTTP client should bind to
-/// the interface via `IP_BOUND_IF` (only safe when there is a usable IPv4).
 /// Starts (or restarts) the RTSP stream + telemetry listener using whatever
 /// is currently in `state.config`, and switches to the Live Stream screen.
 /// Shared by `navigate_stream` (Ctrl+2 / sidebar) and `go_live_with_device`
@@ -2283,7 +2228,7 @@ fn navigate_to_stream(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppStor
     // show "stale" or "—" if the fix is missing or outdated.
 
     // Auto-detect ROV interface before starting stream.
-    refresh_rov_network(state, false);
+    refresh_rov_network(state);
     persist_config(state, store);
 
     // Always restart stream+telemetry: the underlying network may have
@@ -2291,52 +2236,45 @@ fn navigate_to_stream(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppStor
     state.stream_left_at_ms = 0;
     state.stream.stop();
     state.rov_status.stop();
-    {
-        // Set up external route for ffmpeg now that we know the interface.
-        // Use the bindable interface if available; otherwise fall back to
-        // the raw detected interface (which may not have an IPv4 yet —
-        // ensure_rov_external_route will assign one via osascript).
-        let iface_for_route = state.config.rov_interface().map(str::to_owned).or_else(|| {
-            let d = state.rov_detected_interface.trim();
-            if d.is_empty() {
-                None
-            } else {
-                Some(d.to_owned())
-            }
-        });
-        // A Wi-Fi link routes normally; setting up a host route there would
-        // ask for admin rights and rewrite the Wi-Fi service's configuration.
-        // With no detected link (a manual binding) the legacy setup applies.
-        let route_needed = state.rov_link.as_ref().is_none_or(needs_host_route);
-        if route_needed && let Some(iface) = iface_for_route {
-            match ensure_rov_external_route(&state.config.rov_http_base, &iface) {
-                Ok(()) => {
-                    // IP was assigned by osascript; re-check binding eligibility.
-                    if let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base)
-                        && interface_has_rov_subnet_ipv4(&iface, &rov_host)
-                    {
-                        state.config.rov_network_interface.clone_from(&iface);
-                    }
-                }
-                Err(err) => {
-                    state.rov_info = format!(
-                        "Detected interface {iface} but route setup failed: {err:#}. RTSP may not work."
-                    );
-                }
-            }
-        }
-        start_stream_and_telemetry(state, ui);
-    }
+    start_stream_and_telemetry(state, ui);
 
     state.media.stop_media_stream();
     state.active_screen = Screen::Stream;
     state.last_screen = Screen::Stream;
 }
 
-/// Whether the OS-level host route (and its admin prompt) is part of reaching
-/// the ROV over `link`. On macOS only a cable needs it; Wi-Fi routes normally.
-fn needs_host_route(link: &RovLink) -> bool {
-    !cfg!(target_os = "macos") || link.kind == LinkKind::Wired
+/// The address this computer should use on the ROV's network and its subnet
+/// mask, or `None` when the ROV is not given as an IPv4 address.
+fn suggested_client_address(rov_host: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    let rov_ip = rov_host.parse::<std::net::Ipv4Addr>().ok()?;
+    let mask = DEFAULT_ROV_CLIENT_NETMASK
+        .parse()
+        .unwrap_or(std::net::Ipv4Addr::new(255, 255, 255, 0));
+    let preferred = DEFAULT_ROV_CLIENT_IP
+        .parse()
+        .unwrap_or(std::net::Ipv4Addr::new(192, 168, 1, 103));
+    Some((suggest_client_ip(rov_ip, preferred, mask), mask))
+}
+
+/// What to do next when `link` is a cable with no address on the ROV's network.
+/// Setting an address needs administrator rights, which the app never asks
+/// for, so the user does it once by hand.
+fn awaiting_address_hint(link: &RovLink, rov_host: &str) -> String {
+    suggested_client_address(rov_host).map_or_else(String::new, |(ip, mask)| {
+        address_setup_hint(HostOs::current(), &link.interface, ip, mask)
+    })
+}
+
+/// Setup help for a cable with no address, when the user has to set it by hand.
+fn awaiting_address_setup(link: &RovLink, rov_host: &str) -> Option<(String, AddressSetup)> {
+    if link.local_ip.is_some() {
+        return None;
+    }
+    let (ip, mask) = suggested_client_address(rov_host)?;
+    Some((
+        link.interface.clone(),
+        address_setup(HostOs::current(), &link.interface, ip, mask),
+    ))
 }
 
 /// Detects how this computer reaches the ROV and records it in `state`
@@ -2369,85 +2307,34 @@ fn update_rov_link(state: &mut ThirdEyeState) -> Option<RovLink> {
     state.rov_detected_interface = binding.detected_interface;
     state.config.rov_network_interface = binding.bound_interface;
     state.rov_link_text = describe_rov_link(link.as_ref(), &rov_host, &snapshot);
+    if let Some(waiting) = link.as_ref().filter(|l| l.local_ip.is_none()) {
+        state.rov_link_text.push(' ');
+        state
+            .rov_link_text
+            .push_str(&awaiting_address_hint(waiting, &rov_host));
+    }
     state.rov_info.clone_from(&state.rov_link_text);
+    // Show the help again for a new adapter, or after the address was
+    // fixed and the cable is replugged without one.
+    let setup = link
+        .as_ref()
+        .and_then(|l| awaiting_address_setup(l, &rov_host));
+    if setup.as_ref().map(|(name, _)| name) != state.address_setup.as_ref().map(|(name, _)| name) {
+        state.address_setup_dismissed = false;
+    }
+    state.address_setup = setup;
     state.rov_link.clone_from(&link);
     link
 }
 
-fn refresh_rov_network(state: &mut ThirdEyeState, setup_external_route: bool) {
+fn refresh_rov_network(state: &mut ThirdEyeState) {
     state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
-    let Some(rov_host) = parse_host_from_http_base(&state.config.rov_http_base) else {
-        state.rov_info = "Could not extract host from ROV HTTP API URL.".to_string();
-        return;
-    };
-
-    match update_rov_link(state) {
-        Some(link) if needs_host_route(&link) => {
-            if setup_external_route {
-                match ensure_rov_external_route(&state.config.rov_http_base, &link.interface) {
-                    Ok(()) => state.rov_info.push_str(" External stream route is ready."),
-                    Err(err) => {
-                        let _ = write!(
-                            state.rov_info,
-                            " External stream route is not ready yet: {err:#}"
-                        );
-                    }
-                }
-            }
-        }
-        // No ROV link, or one that routes normally: remove any stale host
-        // route from a previous cable session so ffmpeg uses default routing.
-        _ => cleanup_stale_rov_route(&rov_host),
-    }
-}
-
-/// Whether video can start over `link` without further setup: either no host
-/// route is involved, or the route already exists, so no admin prompt is due.
-fn video_route_ready(rov_http_base: &str, link: &RovLink) -> bool {
-    if rtsp_forwarder_enabled() {
-        return true;
-    }
-    let Some(host) = parse_host_from_http_base(rov_http_base) else {
-        return true;
-    };
-    if !needs_host_route(link) {
-        // No route is needed, but a host route left over from an earlier
-        // cable session would still capture the traffic.
-        return !has_stale_rov_route(&host);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        has_valid_rov_route(&host, &link.interface)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        link.local_ip
-            .is_some_and(|ip| has_valid_rov_route_win(&host, ip))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = host;
-        true
-    }
-}
-
-/// Whether a static host route for `rov_host` from an earlier session is
-/// still installed. Only macOS installs one for the cable and leaves it behind.
-fn has_stale_rov_route(rov_host: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        has_static_host_route(rov_host)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = rov_host;
-        false
-    }
+    update_rov_link(state);
 }
 
 /// Runs when the machine's network changed (cable plugged or pulled, Wi-Fi
 /// joined or lost): re-detects the ROV link and, if it moved, moves video and
-/// telemetry onto it. Never changes routes or asks for admin rights.
+/// telemetry onto it. Changes no system settings and asks for no admin rights.
 fn handle_network_change(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppStore) {
     let before = state.rov_link.clone();
     let before_host = state.rov_link_host.clone();
@@ -2477,19 +2364,8 @@ fn handle_network_change(state: &mut ThirdEyeState, ui: &AppWindow, store: &AppS
     state.stream.stop();
     ui.set_has_stream_image(false);
     state.video_restart_pending = true;
-    let Some(link) = after else {
+    if after.is_none() {
         state.stream.status = "Waiting for the ROV connection...".to_string();
-        return;
-    };
-    if !video_route_ready(&state.config.rov_http_base, &link) {
-        state
-            .rov_info
-            .push_str(" Press Recalibrate to prepare the video route.");
-        ui.set_rov_info(state.rov_info.clone().into());
-        // The stream page shows `stream.status`, not `rov_info`.
-        state.stream.status =
-            "Video stopped after a network change. Press Recalibrate to prepare the video route."
-                .to_string();
         return;
     }
     start_stream_and_telemetry(state, ui);
@@ -3671,6 +3547,13 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         apply_state_to_ui(&ui, &state);
     });
 
+    let state_for_dismiss_address_setup = Rc::clone(&state);
+    ui.on_dismiss_address_setup(move || {
+        if let Ok(mut state) = state_for_dismiss_address_setup.try_borrow_mut() {
+            state.address_setup_dismissed = true;
+        }
+    });
+
     let ui_weak = ui.as_weak();
     let state_for_recalibrate = Rc::clone(&state);
     let store_for_recalibrate = Rc::clone(&store);
@@ -3681,38 +3564,25 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Ok(mut state) = state_for_recalibrate.try_borrow_mut() else {
             return;
         };
-        if state.recalibrate_in_progress {
-            return;
-        }
         pull_configuration_from_ui(&ui, &mut state, &store_for_recalibrate);
 
-        // If a stream is already running, give it a fresh restart too: a
-        // new ffmpeg process, a new RTSP session, a new keyframe. This is
-        // the only thing that reliably clears on-screen decode corruption
-        // (garbled/blocky video) — network route recalibration alone never
-        // touches the running stream and can't fix that on its own. Only
-        // restarts when a stream is already active, so clicking Recalibrate
-        // from Settings (no stream running) stays a pure network action.
-        if state.stream.controller.is_some() {
-            let rtsp_url = state.config.rtsp_url.clone();
-            let rov_interface = state.config.rov_interface().map(str::to_owned);
-            state.stream.status = match state.stream.start(rtsp_url, rov_interface.as_deref()) {
-                Ok(msg) => msg,
-                Err(err) => format!("Failed to start stream: {err:#}"),
-            };
+        // Re-detect how the ROV is reached (nothing is changed on the system,
+        // no admin rights are involved), then move telemetry and video onto
+        // it. A running stream also gets a fresh ffmpeg process, RTSP session
+        // and keyframe: the only thing that reliably clears on-screen decode
+        // corruption (garbled/blocky video). Clicking Recalibrate from
+        // Settings with no stream running stays a pure detection.
+        refresh_rov_network(&mut state);
+        persist_config(&state, &store_for_recalibrate);
+        if state.rov_status.is_running() {
+            state.rov_status.stop();
+            start_telemetry(&mut state);
         }
-
-        state.recalibrate_in_progress = true;
-        state.rov_info = "Recalibrating ROV network...".to_string();
-
-        let rov_http_base = state.config.rov_http_base.clone();
-        let tx = state.recalibrate_tx.clone();
-
-        thread::spawn(move || {
-            let result = recalibrate_rov_network_blocking(&rov_http_base);
-            let _ = tx.send(result);
-        });
-
+        if state.stream.controller.is_some()
+            || (state.video_restart_pending && state.rov_link.is_some())
+        {
+            start_stream_and_telemetry(&mut state, &ui);
+        }
         apply_state_to_ui(&ui, &state);
     });
 
@@ -4699,9 +4569,10 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         // Recorded-video playback goes through the same interface-bound
-        // forwarder as live video, since it skips the legacy route setup.
-        let (download_url, proxy_guard) = if rtsp_forwarder_enabled() {
-            let rov_interface = state.config.rov_interface().map(str::to_owned);
+        // forwarder as live video.
+        let rov_interface = state.config.rov_interface().map(str::to_owned);
+        let real_host = http_host_header(&download_url);
+        let (download_url, proxy_guard) =
             match start_url_forwarder(&download_url, rov_interface.as_deref(), 80) {
                 Ok(Some((local_url, guard))) => (local_url, Some(guard)),
                 Ok(None) => (download_url, None),
@@ -4710,11 +4581,11 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     apply_state_to_ui(&ui, &state);
                     return;
                 }
-            }
-        } else {
-            (download_url, None)
-        };
-        match spawn_media_stream_pipeline(ffmpeg_bin, download_url, proxy_guard) {
+            };
+        // Behind the forwarder ffmpeg would announce the forwarder's address
+        // as the host; send the ROV's own.
+        let host_header = proxy_guard.as_ref().and(real_host);
+        match spawn_media_stream_pipeline(ffmpeg_bin, download_url, host_header, proxy_guard) {
             Ok((controller, rx)) => {
                 state.media.media_stream_controller = Some(controller);
                 state.media.media_stream_event_rx = Some(rx);
@@ -4937,15 +4808,25 @@ fn stream_stderr_loop(
     }
 }
 
+/// ffmpeg arguments that make an HTTP request carry `host` as its `Host`
+/// header instead of the address ffmpeg connected to. Empty without a host.
+fn host_header_args(host: Option<&str>) -> Vec<String> {
+    host.map_or_else(Vec::new, |host| {
+        vec!["-headers".to_owned(), format!("Host: {host}\r\n")]
+    })
+}
+
 fn spawn_media_stream_pipeline(
     ffmpeg_bin: PathBuf,
     http_url: String,
+    host_header: Option<String>,
     proxy_guard: Option<TcpProxyGuard>,
 ) -> Result<(StreamController, Receiver<StreamEvent>)> {
     let mut cmd = Command::new(&ffmpeg_bin);
     cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
+        .args(host_header_args(host_header.as_deref()))
         .arg("-i")
         .arg(&http_url)
         .arg("-vf")
@@ -4995,54 +4876,10 @@ fn spawn_media_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: proxy_guard,
+            proxy_guard,
         },
         rx,
     ))
-}
-
-/// Best-effort raw TCP connect to `rtsp_url`'s own host:port, purely to make
-/// Windows resolve ARP for it before ffmpeg's real RTSP connection.
-///
-/// Deliberately protocol-agnostic (a raw socket connect, not an RTSP or HTTP
-/// request): the goal is only the ARP side effect, so it doesn't matter
-/// whether anything is listening or what protocol it speaks. The outcome is
-/// ignored — refused, reset, or timed out are all fine, and a short timeout
-/// keeps this from ever blocking the UI thread for long even when the host
-/// is unreachable.
-#[cfg(target_os = "windows")]
-fn prime_arp_for_rtsp_host(rtsp_url: &str, interface: Option<&str>) {
-    use std::net::{SocketAddr, ToSocketAddrs};
-
-    let Some((host, port)) = parse_rtsp_host_port(rtsp_url) else {
-        return;
-    };
-    let Ok(Some(addr)) = (host.as_str(), port)
-        .to_socket_addrs()
-        .map(|mut a| a.next())
-    else {
-        return;
-    };
-
-    let local_ipv4 = interface.and_then(|iface| {
-        if_addrs::get_if_addrs()
-            .ok()
-            .and_then(|ifaces| local_ipv4_for_interface_from(&ifaces, iface))
-    });
-
-    let domain = match addr {
-        SocketAddr::V4(_) => socket2::Domain::IPV4,
-        SocketAddr::V6(_) => socket2::Domain::IPV6,
-    };
-    let Ok(socket) =
-        socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-    else {
-        return;
-    };
-    if let Some(local_ip) = local_ipv4 {
-        let _ = socket.bind(&SocketAddr::new(local_ip, 0).into());
-    }
-    let _ = socket.connect_timeout(&addr.into(), Duration::from_millis(800));
 }
 
 fn spawn_stream_pipeline(
@@ -5062,9 +4899,8 @@ fn spawn_stream_pipeline(
         .arg("-flags")
         .arg("low_delay");
     // Note: -localaddr is NOT a valid option for the RTSP demuxer (only for
-    // SDP/RTP). On macOS the osascript route+ARP handles interface binding;
-    // on Windows a /32 host route via `route ADD` directs ffmpeg's TCP
-    // connections through the correct adapter.
+    // SDP/RTP), so interface binding is done by the in-process forwarder that
+    // `rtsp_url` points at (see `start_url_forwarder`).
     command
         .arg("-i")
         .arg(&rtsp_url)
@@ -5115,7 +4951,7 @@ fn spawn_stream_pipeline(
             stop_flag,
             ffmpeg_child,
             workers: vec![stdout_worker, stderr_worker],
-            _proxy_guard: proxy_guard,
+            proxy_guard,
         },
         rx,
     ))
@@ -5304,596 +5140,8 @@ fn decode_jpeg_to_frame(jpeg: &[u8]) -> Result<RgbaFrame> {
     })
 }
 
-// -------------------------------------------------------------------------
-// OS-level route for external processes (ffmpeg can't use IP_BOUND_IF)
-// -------------------------------------------------------------------------
-
 /// Keeps the in-process RTSP forwarder alive for as long as its stream runs.
 type TcpProxyGuard = RtspForwarder;
-
-/// Switch for the interface-bound RTSP forwarder. Off by default while
-/// the legacy route/ARP path is still the supported one; set
-/// `THIRD_EYE_RTSP_FORWARDER=1` to route ffmpeg through the forwarder.
-///
-/// Never enabled on Windows: there the forwarder can only bind the source
-/// address, which does not force the outgoing adapter (`IP_UNICAST_IF` is not
-/// implemented yet), so the legacy host-route path stays in charge.
-fn rtsp_forwarder_enabled() -> bool {
-    cfg!(not(target_os = "windows"))
-        && std::env::var("THIRD_EYE_RTSP_FORWARDER")
-            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
-}
-
-/// Probes the ROV via HTTP (to populate ARP) then ensures the OS-level
-/// route exists. Called by `refresh_rov_network` when a wired interface
-/// is detected. Returns `Ok(())` when the route is ready, or an error
-/// if ARP/route setup failed (e.g. ROV is off).
-fn ensure_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
-    if rtsp_forwarder_enabled()
-        && parse_host_from_http_base(rov_http_base)
-            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
-    {
-        // The forwarder pins the connection to the interface, so no host
-        // route, ARP entry or elevated prompt is needed.
-        return Ok(());
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
-        let _ = client.list_medias(None::<MediaScene>);
-    }
-    let host =
-        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
-    let dummy_rtsp = format!("rtsp://x@{host}:8554/");
-    ensure_rov_route_for_rtsp(&dummy_rtsp, interface)
-}
-
-/// Like [`ensure_rov_external_route`] but re-runs the osascript admin prompt
-/// when the route/ARP actually needs (re)building. Used by the Recalibrate
-/// button so the user can force a re-setup after changing network conditions.
-///
-/// On macOS: the interface's static IP is assigned *inside* the osascript, so
-/// we set up the route first and then run an ARP-warming HTTP probe — the macOS
-/// equivalent of the non-macOS pre-probe. It needs no extra admin prompt.
-/// On Windows: performs the HTTP probe (to populate ARP) then runs the
-/// normal `route ADD` / UAC elevation path.
-fn force_rov_external_route(rov_http_base: &str, interface: &str) -> Result<()> {
-    if rtsp_forwarder_enabled()
-        && parse_host_from_http_base(rov_http_base)
-            .is_some_and(|host| interface_has_rov_subnet_ipv4(interface, &host))
-    {
-        // The forwarder pins the connection to the interface, so no host
-        // route, ARP entry or elevated prompt is needed.
-        return Ok(());
-    }
-    // On non-macOS platforms, the HTTP probe is still useful for ARP.
-    #[cfg(not(target_os = "macos"))]
-    {
-        let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
-        let _ = client.list_medias(None::<MediaScene>);
-    }
-    let host =
-        parse_host_from_http_base(rov_http_base).unwrap_or_else(|| "192.168.1.88".to_string());
-    let dummy_rtsp = format!("rtsp://x@{host}:8554/");
-    force_rov_route_for_rtsp(&dummy_rtsp, interface)?;
-
-    // On macOS the static IP is assigned by the osascript above (asynchronously
-    // via configd), so an interface-bound probe can only reach the ROV now.
-    // Wait briefly for the IPv4 to land, then probe so the ROV's MAC resolves
-    // into the ARP cache. This fixes ARP without a second password prompt.
-    #[cfg(target_os = "macos")]
-    {
-        for _ in 0..6 {
-            if interface_has_rov_subnet_ipv4(interface, &host) {
-                let client = CameraApiClient::new_bound(rov_http_base.to_owned(), Some(interface));
-                let _ = client.list_medias(None::<MediaScene>);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-    Ok(())
-}
-
-/// Whether the routing table holds a static host route for `rov_host`.
-#[cfg(target_os = "macos")]
-fn has_static_host_route(rov_host: &str) -> bool {
-    Command::new("netstat")
-        .args(["-rn", "-f", "inet"])
-        .output()
-        .is_ok_and(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.lines().any(|line| {
-                line.contains(rov_host)
-                    && line
-                        .split_whitespace()
-                        .nth(2)
-                        .is_some_and(|flags| flags.contains('H') && flags.contains('S'))
-            })
-        })
-}
-
-/// Removes a stale host route for `rov_host` that may have been created by a
-/// previous cable session. Without this, switching from cable to ROV WiFi
-/// leaves ffmpeg trying to reach the ROV through the disconnected wired
-/// interface.
-#[cfg(target_os = "macos")]
-fn cleanup_stale_rov_route(rov_host: &str) {
-    // Check if there's actually a static host route before prompting for admin.
-    if !has_static_host_route(rov_host) {
-        return;
-    }
-    let script = format!(
-        r#"do shell script "/sbin/route delete -host {rov_host} 2>/dev/null; /usr/sbin/arp -d {rov_host} 2>/dev/null" with administrator privileges"#
-    );
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stderr(Stdio::null())
-        .status();
-}
-
-/// On Windows, removes a stale /32 host route for `rov_host` that may have
-/// been added during a previous cable session.  Tries direct deletion first;
-/// falls back to UAC elevation via PowerShell.
-#[cfg(target_os = "windows")]
-fn cleanup_stale_rov_route(rov_host: &str) {
-    use std::os::windows::process::CommandExt;
-    // Check if there's a /32 host route before attempting deletion.
-    let has_route = Command::new("route")
-        .args(["PRINT", rov_host])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .ok()
-        .is_some_and(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.lines().any(|line| {
-                let fields: Vec<&str> = line.trim().split_whitespace().collect();
-                fields.len() >= 2 && fields[0] == rov_host && fields[1] == "255.255.255.255"
-            })
-        });
-    if !has_route {
-        return;
-    }
-    // Try direct deletion first; fall back to elevated deletion.
-    let direct = Command::new("route")
-        .args(["DELETE", rov_host, "MASK", "255.255.255.255"])
-        .creation_flags(0x0800_0000)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    if let Ok(ref output) = direct {
-        if output.status.success() {
-            return;
-        }
-    }
-    let route_args = format!("DELETE {rov_host} MASK 255.255.255.255");
-    let ps_script = format!(
-        "Start-Process -FilePath 'route.exe' -ArgumentList '{route_args}' \
-         -Verb RunAs -Wait -WindowStyle Hidden"
-    );
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_script])
-        .creation_flags(0x0800_0000)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn cleanup_stale_rov_route(_rov_host: &str) {}
-
-/// Resolves a macOS BSD interface name (e.g. `"en5"`) to its network service
-/// name (e.g. `"USB 10/100 LAN"`) by parsing `networksetup -listnetworkserviceorder`.
-/// Returns `None` when the interface has no registered service.
-#[cfg(target_os = "macos")]
-fn find_network_service_for_interface(interface: &str) -> Option<String> {
-    let output = Command::new("networksetup")
-        .arg("-listnetworkserviceorder")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut last_service: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // Service lines look like: (1) AX88179A
-        if let Some(rest) = trimmed.strip_prefix('(')
-            && let Some(after_num) = rest.find(") ")
-        {
-            last_service = Some(rest[after_num + 2..].to_string());
-        }
-        // Device lines look like: (Hardware Port: AX88179A, Device: en7)
-        if trimmed.starts_with("(Hardware Port:")
-            && let Some(dev_pos) = trimmed.find("Device: ")
-        {
-            let dev = trimmed[dev_pos + 8..].trim_end_matches(')');
-            if dev == interface {
-                return last_service;
-            }
-        }
-    }
-    None
-}
-
-/// Builds the shell command to assign an IPv4 address to the interface.
-///
-/// Prefers `networksetup -setmanual` via an existing registered service.
-/// When no service exists (e.g. Apple USB-C Ethernet adapters that macOS
-/// refuses to configure via `ifconfig SIOCAIFADDR`), creates a transient
-/// networksetup service called "ROV USB LAN" and uses that.
-#[cfg(target_os = "macos")]
-fn build_ip_assign_command(interface: &str) -> String {
-    let service =
-        find_network_service_for_interface(interface).unwrap_or_else(|| "ROV USB LAN".to_string());
-    format!(
-        // Create the service if it doesn't exist yet (idempotent — the
-        // error on a duplicate name is silenced by `|| true`).
-        "/usr/sbin/networksetup -createnetworkservice '{service}' {interface} 2>/dev/null || true; \
-/usr/sbin/networksetup -setmanual '{service}' {DEFAULT_ROV_CLIENT_IP} {DEFAULT_ROV_CLIENT_NETMASK} || true",
-    )
-}
-
-/// Sets up an OS-level host route + ARP entry so that ffmpeg's TCP connections
-/// to the ROV go through the correct network interface.
-///
-/// This is needed because ffmpeg is an external process and we can't set
-/// `IP_BOUND_IF` on its sockets. On macOS this uses `osascript` to request
-/// admin privileges with a native password dialog.
-#[cfg(target_os = "macos")]
-fn run_rov_route_osascript(rov_host: &str, interface: &str, rov_mac: &str) -> Result<()> {
-    let ip_cmd = build_ip_assign_command(interface);
-    let script = format!(
-        r#"do shell script "
-{ip_cmd}; 
-/sbin/route delete -host {rov_host} 2>/dev/null || true; 
-/sbin/route add -host {rov_host} -interface {interface} || exit $?; 
-/usr/sbin/arp -d {rov_host} 2>/dev/null || true; 
-/usr/sbin/arp -s {rov_host} {rov_mac} ifscope {interface} || true
-" with administrator privileges"#
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to run osascript for route setup")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "route setup via osascript failed (status {}): stdout={}, stderr={}",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
-    let rov_host = parsed
-        .host_str()
-        .context("RTSP URL has no host")?
-        .to_owned();
-    if has_valid_rov_route(&rov_host, interface) {
-        return Ok(());
-    }
-    match read_arp_mac_on_interface(&rov_host, interface) {
-        Some(rov_mac) => run_rov_route_osascript(&rov_host, interface, &rov_mac),
-        None => run_rov_route_only_osascript(&rov_host, interface),
-    }
-}
-
-/// Sets up the host route + ARP entry for the ROV, prompting for admin
-/// privileges via osascript **only when needed**. When a valid host route with
-/// a resolved ARP entry already exists this is a no-op (no password prompt), so
-/// Recalibrate can be pressed repeatedly without re-prompting. This mirrors the
-/// macOS `ensure_rov_route_for_rtsp` behavior.
-///
-/// If the ROV's MAC is available in the ARP table, the full route + ARP
-/// setup is performed.  Otherwise, only the host route is created (the OS
-/// will resolve ARP dynamically once traffic flows through the interface).
-#[cfg(target_os = "macos")]
-fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
-    let rov_host = parsed
-        .host_str()
-        .context("RTSP URL has no host")?
-        .to_owned();
-    // Don't call osascript every time: skip the prompt when the host route and
-    // ARP entry are already valid.
-    if has_valid_rov_route(&rov_host, interface) {
-        return Ok(());
-    }
-    match read_arp_mac_on_interface(&rov_host, interface) {
-        Some(rov_mac) => run_rov_route_osascript(&rov_host, interface, &rov_mac),
-        None => run_rov_route_only_osascript(&rov_host, interface),
-    }
-}
-
-/// Sets up the host route via osascript without a static ARP entry.
-/// Used when the ROV's MAC is not yet in the ARP table (e.g. first
-/// connection on WiFi before any HTTP probe has succeeded).
-#[cfg(target_os = "macos")]
-fn run_rov_route_only_osascript(rov_host: &str, interface: &str) -> Result<()> {
-    let ip_cmd = build_ip_assign_command(interface);
-    let script = format!(
-        r#"do shell script "
-{ip_cmd}; 
-/sbin/route delete -host {rov_host} 2>/dev/null || true; 
-/sbin/route add -host {rov_host} -interface {interface} || exit $?; 
-/usr/sbin/arp -d {rov_host} 2>/dev/null || true
-" with administrator privileges"#
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to run osascript for route setup")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "route setup via osascript failed (status {}): stdout={}, stderr={}",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn force_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    // No macOS-specific osascript needed; delegate to the normal route setup
-    // which handles Windows `route ADD` / UAC elevation.
-    ensure_rov_route_for_rtsp(rtsp_url, interface)
-}
-
-/// Windows implementation: adds a /32 host route via `route ADD` so that
-/// ffmpeg's TCP connections to the ROV go through the correct network adapter
-/// (e.g. a USB-C ethernet cable rather than WiFi).
-#[cfg(target_os = "windows")]
-fn ensure_rov_route_for_rtsp(rtsp_url: &str, interface: &str) -> Result<()> {
-    let parsed = Url::parse(rtsp_url).context("invalid RTSP URL")?;
-    let rov_host = parsed
-        .host_str()
-        .context("RTSP URL has no host")?
-        .to_owned();
-
-    let iface_index = resolve_windows_interface_index(interface)
-        .with_context(|| format!("failed to resolve Windows interface index for {interface}"))?;
-
-    let local_ip = interface_local_ipv4_for_host(interface, &rov_host).with_context(|| {
-        format!("no local IPv4 address found on interface {interface} for reaching {rov_host}")
-    })?;
-
-    // An existing route only counts when it leaves through this adapter.
-    if has_valid_rov_route_win(&rov_host, local_ip) {
-        return Ok(());
-    }
-
-    add_rov_host_route_win(&rov_host, &local_ip.to_string(), iface_index)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-#[allow(clippy::unnecessary_wraps)]
-fn ensure_rov_route_for_rtsp(_rtsp_url: &str, _interface: &str) -> Result<()> {
-    Ok(())
-}
-
-// ---- Windows route helpers ------------------------------------------------
-
-/// Resolves a Windows network adapter name (e.g. `"Ethernet 2"`) to its
-/// interface index by parsing `netsh interface ipv4 show interfaces`.
-#[cfg(target_os = "windows")]
-fn resolve_windows_interface_index(iface_name: &str) -> Result<u32> {
-    use std::os::windows::process::CommandExt;
-    let output = Command::new("netsh")
-        .args(["interface", "ipv4", "show", "interfaces"])
-        .creation_flags(0x0800_0000)
-        .output()
-        .context("failed to run netsh interface ipv4 show interfaces")?;
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    // Find the column offset of "Name" in the header so we can extract the
-    // interface name reliably even when it contains spaces.
-    let name_col = text
-        .lines()
-        .find_map(|line| line.find("Name"))
-        .context("unexpected netsh output: missing Name column header")?;
-
-    for line in text.lines() {
-        if line.len() <= name_col {
-            continue;
-        }
-        let name = line[name_col..].trim();
-        if name.eq_ignore_ascii_case(iface_name) {
-            if let Some(idx_str) = line.trim().split_whitespace().next() {
-                if let Ok(idx) = idx_str.parse::<u32>() {
-                    return Ok(idx);
-                }
-            }
-        }
-    }
-    anyhow::bail!("interface {iface_name:?} not found in netsh output")
-}
-
-/// Finds the local IPv4 address on `iface_name` that is on the same subnet
-/// as `rov_host`.
-#[cfg(target_os = "windows")]
-fn interface_local_ipv4_for_host(iface_name: &str, rov_host: &str) -> Result<std::net::Ipv4Addr> {
-    let rov_ip: std::net::Ipv4Addr = rov_host
-        .parse()
-        .context("ROV host is not a valid IPv4 address")?;
-    let interfaces = if_addrs::get_if_addrs().context("failed to enumerate network interfaces")?;
-    for iface in &interfaces {
-        if iface.name != iface_name || iface.is_loopback() {
-            continue;
-        }
-        if let if_addrs::IfAddr::V4(v4) = &iface.addr {
-            let mask = u32::from(v4.netmask);
-            if (u32::from(v4.ip) & mask) == (u32::from(rov_ip) & mask) {
-                return Ok(v4.ip);
-            }
-        }
-    }
-    anyhow::bail!("no IPv4 address on interface {iface_name:?} in the same subnet as {rov_host}")
-}
-
-/// Checks whether a /32 host route for `host` already exists in the Windows
-/// route table.
-#[cfg(target_os = "windows")]
-fn has_valid_rov_route_win(host: &str, local_ip: std::net::Ipv4Addr) -> bool {
-    use std::os::windows::process::CommandExt;
-    Command::new("route")
-        .args(["PRINT", host])
-        .creation_flags(0x0800_0000)
-        .output()
-        .ok()
-        .is_some_and(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            route_print_uses_interface(&text, host, local_ip)
-        })
-}
-
-/// Adds a /32 host route for `host` through the specified interface.
-///
-/// Tries the `route ADD` command directly first; if that fails (typically
-/// because the process is not elevated), falls back to requesting UAC
-/// elevation via PowerShell — this shows a native Windows elevation dialog,
-/// analogous to the macOS `osascript` password prompt.
-#[cfg(target_os = "windows")]
-fn add_rov_host_route_win(host: &str, local_ip: &str, iface_index: u32) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    let idx_str = iface_index.to_string();
-    let args = [
-        "ADD",
-        host,
-        "MASK",
-        "255.255.255.255",
-        local_ip,
-        "METRIC",
-        "1",
-        "IF",
-        &idx_str,
-    ];
-
-    // Try without elevation first (user may already be running as admin).
-    let direct = Command::new("route")
-        .args(&args)
-        .creation_flags(0x0800_0000)
-        .output()
-        .context("failed to run route command")?;
-    if direct.status.success() {
-        return Ok(());
-    }
-
-    // Direct attempt failed — request elevation via UAC.
-    let route_args =
-        format!("ADD {host} MASK 255.255.255.255 {local_ip} METRIC 1 IF {iface_index}");
-    let ps_script = format!(
-        "$p = Start-Process -FilePath 'route.exe' \
-         -ArgumentList '{route_args}' \
-         -Verb RunAs -Wait -PassThru -WindowStyle Hidden; \
-         exit $p.ExitCode"
-    );
-    let elevated = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_script])
-        .creation_flags(0x0800_0000)
-        .status()
-        .context("failed to run elevated route command via PowerShell")?;
-    if !elevated.success() {
-        anyhow::bail!(
-            "route ADD for {host} via interface index {iface_index} failed. \
-             Try running the application as Administrator."
-        );
-    }
-    Ok(())
-}
-
-/// Checks whether a valid host route
-/// on the specified interface.
-#[cfg(target_os = "macos")]
-fn has_valid_rov_route(host: &str, interface: &str) -> bool {
-    // Check ARP: must have a real MAC (not incomplete, not adapter's own MAC)
-    // on the correct interface.
-    let adapter_mac = get_interface_mac(interface).unwrap_or_default();
-    if let Some(mac) = read_arp_mac_on_interface(host, interface) {
-        // Also check the route table has a host entry on our interface.
-        if mac != adapter_mac && has_host_route(host, interface) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Checks if a **non-scoped** host route for `host` exists on `interface`.
-///
-/// ARP-cache entries show up as `UHLSI` (scoped) and don't override the subnet
-/// route for processes that don't use `IP_BOUND_IF`. We need `UHLS` (no `I`)
-/// created by `route add -host -interface`.
-#[cfg(target_os = "macos")]
-fn has_host_route(host: &str, interface: &str) -> bool {
-    let output = Command::new("netstat")
-        .args(["-rn", "-f", "inet"])
-        .output()
-        .ok();
-    let Some(output) = output else { return false };
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| {
-        if !line.contains(host) || !line.contains(interface) {
-            return false;
-        }
-        // Extract the flags column (typically the 3rd whitespace-delimited field).
-        let flags = line.split_whitespace().nth(2).unwrap_or("");
-        // Must be a host route (H), static (S), and NOT interface-scoped (no I).
-        flags.contains('H') && flags.contains('S') && !flags.contains('I')
-    })
-}
-
-/// Returns the MAC address of a network interface (e.g. en10's own MAC).
-#[cfg(target_os = "macos")]
-fn get_interface_mac(interface: &str) -> Option<String> {
-    let output = Command::new("ifconfig").arg(interface).output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("ether ") {
-            return trimmed.strip_prefix("ether ").map(|s| s.trim().to_owned());
-        }
-    }
-    None
-}
-
-/// Reads the MAC address for `host` from the ARP table, filtered to entries
-/// on the specified interface.
-#[cfg(target_os = "macos")]
-fn read_arp_mac_on_interface(host: &str, interface: &str) -> Option<String> {
-    let output = Command::new("arp").arg("-an").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let host_pattern = format!("({host})");
-    for line in text.lines() {
-        if !line.contains(&host_pattern) || !line.contains(interface) {
-            continue;
-        }
-        if let Some(at_pos) = line.find(" at ") {
-            let after_at = &line[at_pos + 4..];
-            if let Some(mac) = after_at.split_whitespace().next()
-                && mac.contains(':')
-                && mac != "(incomplete)"
-            {
-                return Some(mac.to_owned());
-            }
-        }
-    }
-    None
-}
 
 fn locate_ffmpeg_binary() -> Option<PathBuf> {
     let exe_name = if cfg!(target_os = "windows") {
@@ -5994,7 +5242,7 @@ fn main() -> Result<()> {
     // Auto-detect ROV network interface at startup (passive ifconfig scan).
     {
         let mut s = state.borrow_mut();
-        refresh_rov_network(&mut s, false);
+        refresh_rov_network(&mut s);
         persist_config(&s, &store);
         s.start_update_check(false);
     }
@@ -6216,23 +5464,6 @@ fn main() -> Result<()> {
             ui.set_nmea_gps_running(state.nmea_gps.is_running());
             let stale_ms = parse_stale_timeout_ms(&state.config.nmea_stale_timeout);
             ui.set_nmea_has_fix(state.nmea_gps.has_recent_fix(stale_ms));
-            // Poll background recalibration result.
-            if let Ok(result) = state.recalibrate_rx.try_recv() {
-                state.recalibrate_in_progress = false;
-                state.config.rov_status_udp_bind_host = default_rov_udp_bind_host();
-                state.config.rov_network_interface = result.interface;
-                state.rov_info = result.rov_info;
-                persist_config(&state, &poll_store);
-                // Video that was stopped by a link change was waiting for this
-                // route to be prepared; resume it now.
-                if state.video_restart_pending
-                    && let Some(link) = state.rov_link.clone()
-                    && video_route_ready(&state.config.rov_http_base, &link)
-                {
-                    start_stream_and_telemetry(&mut state, &ui);
-                }
-                apply_state_to_ui(&ui, &state);
-            }
             apply_stream_and_rov_runtime_to_ui(&ui, &state);
             let auto_update_started = state.poll_auto_update_check();
             let media_changed = poll_media_events(&mut state, &poll_store);
@@ -6286,23 +5517,83 @@ fn spawn_ip_location_lookup() -> mpsc::Receiver<Result<(f64, f64), String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkKind, RovLink, needs_host_route};
+    use super::{
+        RovLink, ZOOM_SETTLE_TIMEOUT_MS, awaiting_address_hint, awaiting_address_setup,
+        host_header_args, pinch_zoom_step_from_scale, scroll_zoom_allowed,
+        stream_status_for_display, suggested_client_address,
+    };
+    use third_eye_client::network::LinkKind;
 
     #[test]
-    fn host_route_is_needed_for_cables_everywhere_and_for_wifi_off_macos() {
-        let link = |kind| RovLink {
-            interface: "if0".to_owned(),
-            kind,
-            local_ip: None,
-        };
-        assert!(needs_host_route(&link(LinkKind::Wired)));
+    fn forwarder_errors_replace_the_status_only_until_video_arrives() {
+        let error = Some("failed to connect to ROV at 192.168.1.88:8554");
         assert_eq!(
-            needs_host_route(&link(LinkKind::Wireless)),
-            !cfg!(target_os = "macos")
+            stream_status_for_display("Stream ended.", 0, error),
+            "Could not reach the ROV: failed to connect to ROV at 192.168.1.88:8554"
         );
+        // Once frames arrived, or with no error, the normal status stands.
+        assert_eq!(
+            stream_status_for_display("Stream ended.", 5, error),
+            "Stream ended."
+        );
+        assert_eq!(stream_status_for_display("Streaming", 0, None), "Streaming");
     }
 
-    use super::{ZOOM_SETTLE_TIMEOUT_MS, pinch_zoom_step_from_scale, scroll_zoom_allowed};
+    #[test]
+    fn host_header_args_pass_the_real_host_to_ffmpeg() {
+        assert_eq!(
+            host_header_args(Some("192.168.1.88:8080")),
+            ["-headers", "Host: 192.168.1.88:8080\r\n"]
+        );
+        assert_eq!(host_header_args(None), [] as [std::string::String; 0]);
+    }
+
+    fn waiting_link() -> RovLink {
+        RovLink {
+            interface: "if0".to_owned(),
+            kind: LinkKind::Wired,
+            local_ip: None,
+        }
+    }
+
+    #[test]
+    fn awaiting_address_hint_gives_steps_for_the_suggested_address() {
+        let link = waiting_link();
+        let hint = awaiting_address_hint(&link, "192.168.1.88");
+        assert!(hint.contains("192.168.1.103") && hint.contains("if0"));
+        // A ROV on another subnet gets a matching suggestion.
+        assert!(awaiting_address_hint(&link, "10.4.5.88").contains("10.4.5.103"));
+        // Without an IP address for the ROV there is nothing to suggest.
+        assert_eq!(awaiting_address_hint(&link, "rov.local"), "");
+    }
+
+    #[test]
+    fn suggested_client_address_needs_an_ipv4_rov_and_follows_its_subnet() {
+        let (ip, mask) = suggested_client_address("192.168.1.88").unwrap();
+        assert_eq!(
+            (ip.to_string(), mask.to_string()),
+            ("192.168.1.103".into(), "255.255.255.0".into())
+        );
+        assert_eq!(
+            suggested_client_address("10.4.5.88").unwrap().0.to_string(),
+            "10.4.5.103"
+        );
+        assert!(suggested_client_address("rov.local").is_none());
+    }
+
+    #[test]
+    fn setup_help_is_offered_only_for_a_cable_without_an_address() {
+        let waiting = waiting_link();
+        let ready = RovLink {
+            local_ip: Some(std::net::Ipv4Addr::new(192, 168, 1, 103)),
+            ..waiting.clone()
+        };
+        let (interface, setup) = awaiting_address_setup(&waiting, "192.168.1.88").unwrap();
+        assert_eq!(interface, "if0");
+        assert!(setup.command.contains("192.168.1.103"));
+        assert!(awaiting_address_setup(&ready, "192.168.1.88").is_none());
+        assert!(awaiting_address_setup(&waiting, "rov.local").is_none());
+    }
 
     #[test]
     fn scroll_zoom_allowed_when_gate_not_engaged() {

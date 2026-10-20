@@ -30,6 +30,7 @@ fn target(addr: SocketAddr) -> ForwarderTarget {
     ForwarderTarget {
         addr,
         interface: None,
+        interface_index: None,
         source_ip: None,
     }
 }
@@ -105,6 +106,36 @@ fn large_payload_survives_intact() {
     client.read_exact(&mut received).unwrap();
     sender.join().unwrap();
     assert_eq!(received, payload);
+}
+
+#[test]
+fn the_last_connect_error_is_reported_and_cleared_by_a_later_success() {
+    let addr = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let forwarder = RtspForwarder::start(target(addr)).unwrap();
+    assert!(forwarder.last_connect_error().is_none());
+
+    // Nothing listens at the ROV address yet: the failure is explained.
+    let mut client = connect(&forwarder);
+    assert_closed(&mut client);
+    wait_until("connect error", Duration::from_secs(2), || {
+        forwarder.last_connect_error().is_some()
+    });
+    let error = forwarder.last_connect_error().unwrap();
+    assert!(error.contains(&addr.to_string()), "error was: {error}");
+
+    // The ROV comes up on that address: the next connection clears the error.
+    let rov = TcpListener::bind(addr).unwrap();
+    thread::spawn(move || {
+        let _keep_open = rov.accept();
+        thread::sleep(Duration::from_secs(2));
+    });
+    let _second = connect(&forwarder);
+    wait_until("error cleared", Duration::from_secs(2), || {
+        forwarder.last_connect_error().is_none()
+    });
 }
 
 #[test]

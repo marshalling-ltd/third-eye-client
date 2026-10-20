@@ -102,10 +102,10 @@ You do **not** have to tell the app whether you used Wi‑Fi or the cable. It ch
 **What "Recalibrate" does, in plain terms:**
 
 - **Wi‑Fi comes first, on every OS.** Wi‑Fi is the primary, first‑supported way to reach the ROV, so if your laptop is on the ROV's Wi‑Fi the app uses it.
-- **Then everything else.** If you're on the USB cable instead, Recalibrate detects it and prepares the wired video route.
+- **Then everything else.** If you're on the USB cable instead, Recalibrate detects it. If the cable has no address on the ROV's network yet, the app shows a short guide with the exact steps for your computer.
 
 > [!NOTE]
-> On a Mac it may ask for your **admin password** once — this is normal and only needed to set up the video stream. Type it in.
+> The app does not ask for an administrator password. Giving the USB adapter its address (if it has none) is the only step that needs one, and you do that yourself in your system settings, following the guide the app shows.
 
 If the message says it found your ROV / interface, you're connected. 🎉
 
