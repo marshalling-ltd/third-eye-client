@@ -10,7 +10,7 @@
 //!
 //! Both modes share the same [`NmeaGpsState`] — only one can run at a time.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -50,11 +50,101 @@ pub const DEFAULT_BT_BAUD_RATE: u32 = 9600;
 /// println!("number of serial ports found: {}", ports.len());
 /// ```
 pub fn list_serial_ports() -> Vec<String> {
-    serialport::available_ports()
-        .unwrap_or_default()
+    let ports = usable_serial_port_names(serialport::available_ports().unwrap_or_default());
+    #[cfg(target_os = "macos")]
+    let ports = {
+        let shadowed = macos_shadowed_serial_nodes();
+        ports
+            .into_iter()
+            .filter(|name| !shadowed.contains(name) && !is_macos_noise_port(name))
+            .collect::<Vec<_>>()
+    };
+    ports
+}
+
+/// Port names from `ports`, minus the Linux placeholder UARTs.
+fn usable_serial_port_names(ports: Vec<serialport::SerialPortInfo>) -> Vec<String> {
+    ports
         .into_iter()
         .map(|p| p.port_name)
+        .filter(|name| !is_linux_placeholder_uart(name))
         .collect()
+}
+
+/// Names of the ports in `ports` that look like Bluetooth SPP devices.
+fn likely_bluetooth_port_names(ports: Vec<serialport::SerialPortInfo>) -> Vec<String> {
+    ports
+        .into_iter()
+        .filter(is_likely_bluetooth_port)
+        .map(|p| p.port_name)
+        .collect()
+}
+
+/// macOS exposes every serial device twice (`/dev/cu.*` for outgoing use and
+/// `/dev/tty.*`) and adds system Bluetooth ports that are never a GPS. Only the
+/// `cu.` node of a real device is useful.
+#[cfg(any(target_os = "macos", test))]
+fn is_macos_noise_port(port_name: &str) -> bool {
+    port_name.starts_with("/dev/tty.")
+        || port_name.contains(".BLTH")
+        || port_name.contains("Bluetooth-Incoming-Port")
+        || port_name.contains("debug-console")
+}
+
+/// Maps a saved raw macOS serial node (`/dev/cu.NAME` or `/dev/tty.NAME`) to
+/// the `bt://` entry for the same device in `candidates`, so selections saved
+/// before devices were offered as `bt://` keep working.
+#[must_use]
+pub fn migrate_raw_bluetooth_port(selected: &str, candidates: &[String]) -> Option<String> {
+    let node_name = selected
+        .strip_prefix("/dev/cu.")
+        .or_else(|| selected.strip_prefix("/dev/tty."))?;
+    let sanitize = |text: &str| -> String {
+        text.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    };
+    let wanted = sanitize(node_name);
+    candidates
+        .iter()
+        .find(|c| crate::bt_port::device_name(c).is_some_and(|name| sanitize(name) == wanted))
+        .cloned()
+}
+
+static BLUETOOTH_SCAN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Allows or forbids querying the OS Bluetooth stack when listing ports.
+///
+/// Enumerating Bluetooth devices can trigger the macOS permission prompt and
+/// talks to `bluetoothd` on Linux, so the UI only enables it while the
+/// Bluetooth GPS mode is selected.
+pub fn set_bluetooth_scan_enabled(enabled: bool) {
+    BLUETOOTH_SCAN_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn bluetooth_scan_enabled() -> bool {
+    BLUETOOTH_SCAN_ENABLED.load(Ordering::Relaxed)
+}
+
+/// `/dev/cu.*` nodes belonging to devices we offer as `bt://` ports instead,
+/// so the same GPS isn't listed twice.
+#[cfg(target_os = "macos")]
+fn macos_shadowed_serial_nodes() -> std::collections::HashSet<String> {
+    if !bluetooth_scan_enabled() {
+        return std::collections::HashSet::new();
+    }
+    crate::iobt::list_paired_spp_devices()
+        .into_iter()
+        .filter_map(|d| d.serial_node)
+        .collect()
+}
+
+/// `true` for the `/dev/ttyS<n>` nodes the Linux kernel pre-creates (often 32
+/// of them) whether or not a UART exists behind them. They are never a GPS;
+/// a real on-board UART can still be typed into the manual override field.
+fn is_linux_placeholder_uart(port_name: &str) -> bool {
+    cfg!(target_os = "linux") && port_name.starts_with("/dev/ttyS")
 }
 
 /// Returns only Bluetooth SPP serial port names, filtered per-platform:
@@ -82,21 +172,30 @@ pub fn list_serial_ports() -> Vec<String> {
 /// println!("number of bluetooth ports found: {}", ports.len());
 /// ```
 pub fn list_bluetooth_ports() -> Vec<String> {
-    let ports = serialport::available_ports().unwrap_or_default();
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_mut))]
+    let mut filtered =
+        likely_bluetooth_port_names(serialport::available_ports().unwrap_or_default());
+
+    // Linux: paired SPP devices reachable through BlueZ (shown as
+    // `bt://<address>`; no `rfcomm bind` needed).
+    #[cfg(target_os = "linux")]
+    if bluetooth_scan_enabled() {
+        let devices = crate::bluez::list_paired_spp_devices().unwrap_or_default();
+        filtered.extend(devices.iter().map(crate::bluez::SppDevice::port_name));
+    }
 
     #[cfg(target_os = "macos")]
-    let mut filtered: Vec<String> = ports
-        .into_iter()
-        .filter(is_likely_bluetooth_port)
-        .map(|p| p.port_name)
-        .collect();
-
-    #[cfg(not(target_os = "macos"))]
-    let filtered: Vec<String> = ports
-        .into_iter()
-        .filter(is_likely_bluetooth_port)
-        .map(|p| p.port_name)
-        .collect();
+    let mut shadowed = std::collections::HashSet::<String>::new();
+    #[cfg(target_os = "macos")]
+    if bluetooth_scan_enabled() {
+        let devices = crate::iobt::list_paired_spp_devices();
+        shadowed = devices
+            .iter()
+            .filter_map(|d| d.serial_node.clone())
+            .collect();
+        filtered.retain(|port| !shadowed.contains(port));
+        filtered.extend(devices.iter().map(crate::iobt::SppDevice::port_name));
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -107,7 +206,7 @@ pub fn list_bluetooth_ports() -> Vec<String> {
                     continue;
                 }
                 let full = format!("/dev/{name}");
-                if filtered.contains(&full) {
+                if filtered.contains(&full) || shadowed.contains(&full) {
                     continue;
                 }
                 if is_likely_bluetooth_dev_name(&name) {
@@ -207,6 +306,38 @@ pub fn find_nmea_serial_port_index(candidates: &[String], selected_port: &str) -
     candidates
         .iter()
         .position(|candidate| canonical_serial_port_name(candidate) == canonical_selected)
+}
+
+/// Returns the ports in `current` that were not present in `baseline`,
+/// comparing canonicalized names and preserving `current`'s order. Used by the
+/// "pair in OS settings" flow to spot the serial port a freshly paired device
+/// creates.
+///
+/// # Arguments
+///
+/// * `baseline` - Port names captured before the user started pairing.
+/// * `current` - Port names visible now.
+///
+/// # Returns
+///
+/// * `Vec<String>` - Ports that appeared since `baseline`.
+///
+/// # Examples
+///
+/// ```
+/// use third_eye_client::nmea::new_serial_ports;
+///
+/// let before = vec!["/dev/cu.A".to_string()];
+/// let now = vec!["/dev/cu.A".to_string(), "/dev/cu.B".to_string()];
+/// assert_eq!(new_serial_ports(&before, &now), vec!["/dev/cu.B".to_string()]);
+/// ```
+#[must_use]
+pub fn new_serial_ports(baseline: &[String], current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|port| find_nmea_serial_port_index(baseline, port).is_none())
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -442,110 +573,6 @@ impl NmeaGpsState {
         self.last_fix_at_ms = 0;
     }
 
-    /// Runs `blueutil --unpair / --pair / --connect` for the given port,
-    /// then opens System Settings so the user can click Connect.
-    /// Returns a status message for the UI.
-    ///
-    /// # Arguments
-    ///
-    /// * `port_path` - The `/dev/cu.*` Bluetooth serial port to reset.
-    ///
-    /// # Returns
-    ///
-    /// * `String` - A human-readable status message describing the outcome.
-    #[cfg(target_os = "macos")]
-    pub fn prepare_bluetooth(port_path: &str) -> String {
-        let port_path = port_path.trim();
-        let suffix = port_path.strip_prefix("/dev/cu.").unwrap_or("");
-        if suffix.is_empty() {
-            return "No Bluetooth port selected.".to_string();
-        }
-
-        if !macos_command_available("system_profiler") {
-            return "`system_profiler` not found on PATH, so the GPS Bluetooth \
-                    address can't be looked up. It ships with macOS — ensure \
-                    /usr/sbin is on your PATH."
-                .to_string();
-        }
-
-        // Find MAC address from system_profiler.
-        let Some(mac) = find_bt_mac_for_name(suffix) else {
-            return format!(
-                "Could not find MAC address for device '{suffix}'. \
-                        Make sure it is paired in System Settings."
-            );
-        };
-
-        // blueutil uses hyphens in MAC addresses.
-        let mac_hyphen = mac.replace(':', "-").to_lowercase();
-
-        let Some(blueutil) = find_blueutil() else {
-            return "blueutil not found. Install with: brew install blueutil".to_string();
-        };
-
-        let run = |args: &[&str]| -> Result<(), String> {
-            let output = std::process::Command::new(&blueutil)
-                .args(args)
-                .output()
-                .map_err(|e| format!("blueutil failed: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("blueutil {} failed: {stderr}", args.join(" ")));
-            }
-            Ok(())
-        };
-
-        // Unpair → Pair → Connect
-        if let Err(e) = run(&["--unpair", &mac_hyphen]) {
-            return format!("Unpair failed: {e}");
-        }
-        std::thread::sleep(Duration::from_secs(2));
-
-        if let Err(e) = run(&["--pair", &mac_hyphen]) {
-            return format!("Pair failed: {e}");
-        }
-        std::thread::sleep(Duration::from_secs(2));
-
-        let _ = run(&["--connect", &mac_hyphen]);
-
-        // Open System Settings to Bluetooth so user can click Connect.
-        if macos_command_available("open") {
-            let _ = std::process::Command::new("open")
-                .arg("x-apple.systempreferences:com.apple.BluetoothSettings")
-                .spawn();
-        }
-
-        format!(
-            "Bluetooth device '{suffix}' reset. Click Connect on it in System Settings, \
-             then click Start GPS."
-        )
-    }
-
-    /// Non-macOS fallback: returns written pairing instructions instead of
-    /// automating the pairing flow. Delegates to [`bluetooth_pairing_guidance`]
-    /// using the current OS.
-    ///
-    /// # Arguments
-    ///
-    /// * `port_path` - The Bluetooth serial port the user selected, if any.
-    ///
-    /// # Returns
-    ///
-    /// * `String` - Platform-specific pairing instructions.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use third_eye_client::nmea::NmeaGpsState;
-    ///
-    /// let message = NmeaGpsState::prepare_bluetooth("/dev/rfcomm0");
-    /// assert!(!message.is_empty());
-    /// ```
-    #[cfg(not(target_os = "macos"))]
-    pub fn prepare_bluetooth(port_path: &str) -> String {
-        bluetooth_pairing_guidance(std::env::consts::OS, port_path)
-    }
-
     /// Returns whether a background listener thread is currently running.
     ///
     /// # Returns
@@ -750,155 +777,10 @@ impl Drop for NmeaGpsController {
 }
 
 // ---------------------------------------------------------------------------
-// Bluetooth pairing guidance (non-macOS)
-// ---------------------------------------------------------------------------
-
-/// Builds platform-specific Bluetooth pairing guidance for platforms without
-/// the automated macOS pairing flow. `target_os` is a value like
-/// [`std::env::consts::OS`] (`"linux"`, `"windows"`, ...). Pure, so it is
-/// unit-testable on any host.
-///
-/// # Arguments
-///
-/// * `target_os` - The OS to build guidance for, e.g. `"linux"`, `"windows"`.
-/// * `port_path` - The Bluetooth serial port the user selected, if any.
-///
-/// # Returns
-///
-/// * `String` - Written pairing instructions for the given OS.
-///
-/// # Examples
-///
-/// ```
-/// use third_eye_client::nmea::bluetooth_pairing_guidance;
-///
-/// let message = bluetooth_pairing_guidance("linux", "/dev/rfcomm0");
-/// assert!(message.contains("bluetoothctl"));
-/// ```
-#[must_use]
-pub fn bluetooth_pairing_guidance(target_os: &str, port_path: &str) -> String {
-    let port = port_path.trim();
-    match target_os {
-        "linux" => {
-            let target = if port.is_empty() {
-                "/dev/rfcomm0"
-            } else {
-                port
-            };
-            format!(
-                "Linux Bluetooth setup: pair the GPS with `bluetoothctl` \
-                 (power on, scan on, pair <MAC>, trust <MAC>), then bind an \
-                 RFCOMM port with `sudo rfcomm bind {target} <MAC> 1`. Once \
-                 {target} exists, select it above and click Start GPS."
-            )
-        }
-        "windows" => "Windows Bluetooth setup: pair the GPS under Settings > \
-             Bluetooth & devices, then open 'More Bluetooth settings' > COM \
-             Ports and note the 'Outgoing' COM port. Select that COM port \
-             above and click Start GPS. If Bluetooth is unstable, connect the \
-             GPS by USB and select its USB serial COM port instead."
-            .to_string(),
-        _ => "Automated Bluetooth pairing is only available on macOS. Pair the \
-             GPS in your OS Bluetooth settings, then select its serial port \
-             above and click Start GPS."
-            .to_string(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------
 
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Locates the `blueutil` binary. Checks (in order):
-/// 1. Next to the app executable (bundled in `.app/Contents/MacOS/`)
-/// 2. Common Homebrew install paths
-#[cfg(target_os = "macos")]
-fn find_blueutil() -> Option<std::path::PathBuf> {
-    // 1. Bundled: same directory as our executable.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let bundled = dir.join("blueutil");
-        if bundled.exists() {
-            return Some(bundled);
-        }
-    }
-    // 2. Homebrew paths.
-    for path in ["/usr/local/bin/blueutil", "/opt/homebrew/bin/blueutil"] {
-        let p = std::path::PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Returns `true` if `cmd` is an absolute path that exists, or a bare command
-/// name found on `$PATH` or in the common macOS system / Homebrew binary
-/// directories. Used to surface a precise "tool not found" message instead of
-/// a misleading failure when a required CLI is missing.
-#[cfg(target_os = "macos")]
-fn macos_command_available(cmd: &str) -> bool {
-    let path = std::path::Path::new(cmd);
-    if path.is_absolute() {
-        return path.exists();
-    }
-    let mut dirs: Vec<String> =
-        std::env::var("PATH").map_or_default(|value| value.split(':').map(str::to_owned).collect());
-    for extra in [
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-        "/usr/local/bin",
-        "/opt/homebrew/bin",
-    ] {
-        dirs.push(extra.to_owned());
-    }
-    dirs.iter()
-        .any(|dir| std::path::Path::new(dir).join(cmd).exists())
-}
-
-/// Finds the Bluetooth MAC address for a device by searching
-/// `system_profiler SPBluetoothDataType` output for a matching name.
-#[cfg(target_os = "macos")]
-fn find_bt_mac_for_name(device_name: &str) -> Option<String> {
-    let output = std::process::Command::new("system_profiler")
-        .args(["SPBluetoothDataType"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    // system_profiler outputs blocks like:
-    //     BY80125B39:
-    //         Address: FC:E8:15:26:9F:7D
-    let mut found_device = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed
-            .strip_suffix(':')
-            .is_some_and(|name| name.eq_ignore_ascii_case(device_name))
-        {
-            found_device = true;
-            continue;
-        }
-        if found_device && trimmed.starts_with("Address:") {
-            return trimmed
-                .strip_prefix("Address:")
-                .map(|a| a.trim().to_string());
-        }
-        // If we hit another device block, stop.
-        if found_device
-            && !trimmed.is_empty()
-            && !trimmed.starts_with("Address")
-            && trimmed.ends_with(':')
-        {
-            break;
-        }
-    }
-    None
-}
 
 /// How many times to retry opening a Bluetooth serial port before giving up.
 /// macOS may keep the RFCOMM channel reserved for a moment after the previous
@@ -1092,6 +974,36 @@ fn nmea_tcp_client_worker(
     let _ = tx.send(NmeaGpsEvent::Ended);
 }
 
+/// Opens the byte source for `port_path`: an RFCOMM link (`BlueZ` on Linux,
+/// `IOBluetooth` on macOS) for `bt://` names, otherwise a serial port at `baud_rate`.
+fn open_nmea_link(port_path: &str, baud_rate: u32) -> Result<Box<dyn Read + Send>, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(address) = crate::bt_port::parse_port_name(port_path) {
+        return boxed_link(crate::bluez::connect(&address));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(address) = crate::bt_port::parse_port_name(port_path) {
+        return boxed_link(crate::iobt::connect(&address));
+    }
+    boxed_link(
+        serialport::new(port_path, baud_rate)
+            .timeout(Duration::from_secs(2))
+            .open(),
+    )
+}
+
+/// Turns the outcome of opening a link into a boxed reader, or its error text.
+fn boxed_link<L, E>(result: Result<L, E>) -> Result<Box<dyn Read + Send>, String>
+where
+    L: Read + Send + 'static,
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(link) => Ok(Box::new(link)),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
 /// Worker for Bluetooth / serial port NMEA. Maintains a persistent connection
 /// by automatically reconnecting when the link drops. Only exits when the
 /// stop flag is set.
@@ -1101,6 +1013,19 @@ fn nmea_serial_worker(
     stop: Arc<AtomicBool>,
     tx: mpsc::Sender<NmeaGpsEvent>,
     protocol: GpsProtocol,
+) {
+    nmea_serial_worker_with(&port_path, baud_rate, &stop, &tx, protocol, open_nmea_link);
+}
+
+/// Body of [`nmea_serial_worker`] with the link opener injected, so tests can
+/// drive it without a real serial port or Bluetooth device.
+fn nmea_serial_worker_with(
+    port_path: &str,
+    baud_rate: u32,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<NmeaGpsEvent>,
+    protocol: GpsProtocol,
+    open: impl Fn(&str, u32) -> Result<Box<dyn Read + Send>, String>,
 ) {
     let mut last_sent: Option<(f64, f64)> = None;
 
@@ -1114,16 +1039,13 @@ fn nmea_serial_worker(
                     let _ = tx.send(NmeaGpsEvent::Ended);
                     return;
                 }
-                match serialport::new(&port_path, baud_rate)
-                    .timeout(Duration::from_secs(2))
-                    .open()
-                {
+                match open(port_path, baud_rate) {
                     Ok(p) => {
                         opened = Some(p);
                         break;
                     }
                     Err(err) => {
-                        last_err = format!("{err}");
+                        last_err = err;
                         if attempt + 1 < BT_OPEN_RETRIES {
                             let _ = tx.send(NmeaGpsEvent::Status(format!(
                                 "Bluetooth port {port_path} busy, retrying ({}/{BT_OPEN_RETRIES})...",
@@ -1157,7 +1079,7 @@ fn nmea_serial_worker(
         )));
 
         let mut reader = BufReader::new(port);
-        match pump_nmea_lines(&mut reader, &stop, &tx, protocol, &mut last_sent) {
+        match pump_nmea_lines(&mut reader, stop, tx, protocol, &mut last_sent) {
             ReadLoopExit::Stopped => break,
             ReadLoopExit::Disconnected => {}
             ReadLoopExit::Error(err) => {
@@ -1832,14 +1754,6 @@ mod tests {
         assert!(state.start_bluetooth("  ", GpsProtocol::Nmea).is_err());
     }
 
-    #[test]
-    fn prepare_bluetooth_handles_empty_port() {
-        // On macOS this short-circuits before touching blueutil; elsewhere it
-        // returns the platform message. Either way it must be non-empty.
-        let msg = NmeaGpsState::prepare_bluetooth("");
-        assert_ne!(msg, "");
-    }
-
     // ---- poll_events via injected events ----------------------------------
 
     #[test]
@@ -2213,43 +2127,228 @@ mod tests {
         assert_eq!(reader.position(), 0, "must not read when already stopped");
     }
 
-    // ---- bluetooth_pairing_guidance ---------------------------------------
+    // ---- Bluetooth scan flag / port opening / serial worker ----------------
 
     #[test]
-    fn bt_guidance_linux_mentions_bluetoothctl_and_rfcomm() {
-        let msg = bluetooth_pairing_guidance("linux", "/dev/rfcomm0");
-        assert!(msg.contains("bluetoothctl"), "{msg}");
-        assert!(msg.contains("rfcomm bind /dev/rfcomm0"), "{msg}");
+    fn bluetooth_scan_flag_round_trips() {
+        set_bluetooth_scan_enabled(true);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(bluetooth_scan_enabled());
+        set_bluetooth_scan_enabled(false);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(!bluetooth_scan_enabled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listing_bluetooth_ports_with_scan_enabled_does_not_panic() {
+        // Without bluetoothd the BlueZ lookup fails and contributes nothing.
+        set_bluetooth_scan_enabled(true);
+        let _ = list_bluetooth_ports();
+        set_bluetooth_scan_enabled(false);
     }
 
     #[test]
-    fn bt_guidance_linux_defaults_port_when_empty() {
-        let msg = bluetooth_pairing_guidance("linux", "   ");
-        assert!(msg.contains("/dev/rfcomm0"), "{msg}");
+    fn usable_serial_port_names_keeps_real_ports() {
+        let info = |name: &str| serialport::SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: serialport::SerialPortType::Unknown,
+        };
+        let names = usable_serial_port_names(vec![info("/dev/ttyUSB0"), info("/dev/ttyS0")]);
+        assert!(names.contains(&"/dev/ttyUSB0".to_string()));
+        // The kernel's placeholder UARTs only disappear on Linux.
+        assert_eq!(
+            names.contains(&"/dev/ttyS0".to_string()),
+            !cfg!(target_os = "linux")
+        );
     }
 
     #[test]
-    fn bt_guidance_windows_mentions_com_port() {
-        let msg = bluetooth_pairing_guidance("windows", "COM5");
-        assert!(msg.contains("COM"), "{msg}");
-        assert!(msg.to_lowercase().contains("bluetooth"), "{msg}");
+    fn likely_bluetooth_port_names_keeps_only_bluetooth_ports() {
+        let ports = vec![
+            serialport::SerialPortInfo {
+                port_name: "COM5".to_string(),
+                port_type: serialport::SerialPortType::BluetoothPort,
+            },
+            serialport::SerialPortInfo {
+                port_name: "COM1".to_string(),
+                port_type: serialport::SerialPortType::PciPort,
+            },
+        ];
+        assert_eq!(likely_bluetooth_port_names(ports), vec!["COM5".to_string()]);
     }
 
     #[test]
-    fn bt_guidance_other_os_is_nonempty() {
-        let msg = bluetooth_pairing_guidance("freebsd", "");
-        assert_ne!(msg, "");
-        assert!(msg.to_lowercase().contains("bluetooth"), "{msg}");
+    fn boxed_link_passes_a_reader_through() {
+        let mut link = boxed_link(Ok::<_, String>(std::io::Cursor::new(b"$GPGGA".to_vec())))
+            .expect("an Ok result yields a reader");
+        let mut text = String::new();
+        link.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "$GPGGA");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_command_available_detects_known_and_missing_tools() {
-        // Found via the absolute-dir fallback even with a minimal PATH.
-        assert!(macos_command_available("ls"));
-        assert!(macos_command_available("system_profiler"));
-        assert!(macos_command_available("/bin/ls"));
-        assert!(!macos_command_available("definitely-not-a-real-binary-xyz"));
-        assert!(!macos_command_available("/nonexistent/path/to/tool"));
+    fn boxed_link_reports_the_error_text() {
+        let err = boxed_link(Err::<std::io::Cursor<Vec<u8>>, _>("device unreachable"))
+            .err()
+            .expect("an Err result yields its message");
+        assert_eq!(err, "device unreachable");
+    }
+
+    #[test]
+    fn open_nmea_link_fails_for_a_missing_serial_port() {
+        assert!(open_nmea_link("/dev/definitely-not-a-serial-port", 9600).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_nmea_link_fails_for_an_unreachable_bluetooth_device() {
+        assert!(open_nmea_link("bt://00:00:00:00:00:01 Nobody", 9600).is_err());
+    }
+
+    #[test]
+    fn serial_worker_reports_unreachable_port_and_stops_on_request() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                nmea_serial_worker_with("gps", 9600, &stop, &tx, GpsProtocol::Nmea, |_, _| {
+                    Err("device unreachable".to_string())
+                });
+            })
+        };
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a status event");
+        assert!(matches!(first, NmeaGpsEvent::Status(ref s) if s.contains("retrying")));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        let mut ended = false;
+        while let Ok(event) = rx.try_recv() {
+            ended |= matches!(event, NmeaGpsEvent::Ended);
+        }
+        assert!(ended, "worker must report that it ended");
+    }
+
+    #[test]
+    fn serial_worker_streams_a_fix_then_reconnects_after_the_link_ends() {
+        use std::io::Cursor;
+        use std::sync::atomic::AtomicUsize;
+
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let opens = AtomicUsize::new(0);
+        let sentence = b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47\n";
+        nmea_serial_worker_with("gps", 9600, &stop, &tx, GpsProtocol::Nmea, |_, _| {
+            let link: Box<dyn Read + Send> = if opens.fetch_add(1, Ordering::Relaxed) == 0 {
+                // First link: one fix, then the device goes away (EOF).
+                Box::new(Cursor::new(sentence.to_vec()))
+            } else {
+                // The worker reconnects; ask it to stop on the second link.
+                stop.store(true, Ordering::Relaxed);
+                Box::new(Cursor::new(Vec::new()))
+            };
+            Ok(link)
+        });
+
+        assert_eq!(opens.load(Ordering::Relaxed), 2, "must reconnect once");
+        let events: Vec<NmeaGpsEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(
+            |e| matches!(e, NmeaGpsEvent::Status(s) if s.contains("connected on gps (9600 baud)"))
+        ));
+        assert!(
+            events.iter().any(
+                |e| matches!(e, NmeaGpsEvent::Fix { lat, .. } if (lat - 48.1173).abs() < 0.01)
+            )
+        );
+        assert!(matches!(events.last(), Some(NmeaGpsEvent::Ended)));
+    }
+
+    #[test]
+    fn start_bluetooth_spawns_a_worker_that_stop_joins() {
+        let mut state = NmeaGpsState::default();
+        let status = state
+            .start_bluetooth("/dev/definitely-not-a-serial-port", GpsProtocol::Nmea)
+            .expect("worker starts even if the port is unreachable");
+        assert!(status.contains("Connecting to Bluetooth GPS"), "{status}");
+        assert!(state.is_running());
+        state.stop();
+        assert!(!state.is_running());
+    }
+
+    // ---- macOS noise / migration -------------------------------------------
+
+    #[test]
+    fn macos_noise_ports_are_recognised() {
+        assert!(is_macos_noise_port("/dev/tty.BY80125B39"));
+        assert!(is_macos_noise_port("/dev/cu.BLTH"));
+        assert!(is_macos_noise_port("/dev/cu.Bluetooth-Incoming-Port"));
+        assert!(!is_macos_noise_port("/dev/cu.BY80125B39"));
+        assert!(!is_macos_noise_port("/dev/cu.usbserial-1410"));
+    }
+
+    #[test]
+    fn migrate_raw_port_maps_to_matching_bt_entry() {
+        let candidates = vec![
+            "/dev/cu.usbserial-1".to_string(),
+            "bt://FC:E8:15:26:9F:7D BY80125B39".to_string(),
+        ];
+        assert_eq!(
+            migrate_raw_bluetooth_port("/dev/tty.BY80125B39", &candidates).as_deref(),
+            Some("bt://FC:E8:15:26:9F:7D BY80125B39")
+        );
+        assert_eq!(
+            migrate_raw_bluetooth_port("/dev/cu.BY80125B39", &candidates).as_deref(),
+            Some("bt://FC:E8:15:26:9F:7D BY80125B39")
+        );
+        assert_eq!(
+            migrate_raw_bluetooth_port("/dev/cu.Other", &candidates),
+            None
+        );
+        assert_eq!(migrate_raw_bluetooth_port("COM7", &candidates), None);
+    }
+
+    // ---- is_linux_placeholder_uart -----------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn placeholder_uarts_are_filtered_on_linux_only() {
+        assert!(is_linux_placeholder_uart("/dev/ttyS0"));
+        assert!(is_linux_placeholder_uart("/dev/ttyS31"));
+        assert!(!is_linux_placeholder_uart("/dev/ttyUSB0"));
+        assert!(!is_linux_placeholder_uart("/dev/rfcomm0"));
+    }
+
+    // ---- new_serial_ports --------------------------------------------------
+
+    #[test]
+    fn new_serial_ports_returns_only_added_ports() {
+        let before = vec!["/dev/cu.A".to_string(), "/dev/cu.B".to_string()];
+        let now = vec![
+            "/dev/cu.A".to_string(),
+            "/dev/cu.C".to_string(),
+            "/dev/cu.B".to_string(),
+        ];
+        assert_eq!(new_serial_ports(&before, &now), vec!["/dev/cu.C"]);
+    }
+
+    #[test]
+    fn new_serial_ports_empty_when_unchanged_or_removed() {
+        let before = vec!["/dev/cu.A".to_string(), "/dev/cu.B".to_string()];
+        assert_eq!(
+            new_serial_ports(&before, &before),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            new_serial_ports(&before, &before[..1]),
+            [] as [std::string::String; 0]
+        );
+    }
+
+    #[test]
+    fn new_serial_ports_treats_empty_baseline_as_all_new() {
+        let now = vec!["/dev/rfcomm0".to_string()];
+        assert_eq!(new_serial_ports(&[], &now), now);
     }
 }

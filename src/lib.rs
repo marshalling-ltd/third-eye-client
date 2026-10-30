@@ -14,8 +14,13 @@
     clippy::items_after_statements
 )]
 
+#[cfg(target_os = "linux")]
+pub mod bluez;
+pub mod bt_port;
 pub mod camera;
 pub mod formatting;
+#[cfg(target_os = "macos")]
+pub mod iobt;
 pub mod ip_location;
 pub mod network;
 pub mod nmea;

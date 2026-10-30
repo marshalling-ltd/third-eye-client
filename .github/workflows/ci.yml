@@ -31,7 +31,7 @@ jobs:
             libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
-            libudev-dev pkg-config build-essential
+            libudev-dev libdbus-1-dev pkg-config build-essential
 
       - uses: Swatinem/rust-cache@v2
 
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             name: macOS
           - os: windows-2025-vs2026
             name: Windows
@@ -76,7 +76,7 @@ jobs:
             libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
-            libudev-dev pkg-config build-essential
+            libudev-dev libdbus-1-dev pkg-config build-essential
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -109,7 +109,7 @@ jobs:
             libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig-dev libegl1-mesa-dev libgl1-mesa-dev \
-            libudev-dev pkg-config build-essential
+            libudev-dev libdbus-1-dev pkg-config build-essential
 
       - uses: Swatinem/rust-cache@v2
         with:
