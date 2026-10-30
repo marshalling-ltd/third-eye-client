@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use map::{
@@ -58,7 +58,7 @@ use third_eye_client::network::{
 };
 use third_eye_client::nmea::{
     GpsProtocol, NmeaGpsState, canonical_serial_port_name, find_nmea_serial_port_index,
-    pick_default_nmea_serial_port,
+    new_serial_ports, pick_default_nmea_serial_port,
 };
 use third_eye_client::rov_status::{
     ROV_STATUS_PACKET_ID, ROV_STATUS_PACKET_TYPE, ROV_STATUS_UDP_PORT, Status as RovUdpStatus,
@@ -679,6 +679,8 @@ struct ThirdEyeState {
     nmea_gps: NmeaGpsState,
     nmea_serial_port_options: Vec<String>,
     nmea_serial_port_index: i32,
+    /// When the poll timer last rescanned for serial ports / Bluetooth GPS devices.
+    nmea_serial_last_poll: Option<Instant>,
     viewport_anim: Option<ViewportAnimation>,
     auth: AuthUiState,
     attached_metadata_text: String,
@@ -822,6 +824,7 @@ impl ThirdEyeState {
             nmea_gps: NmeaGpsState::default(),
             nmea_serial_port_options: Vec::new(),
             nmea_serial_port_index: -1,
+            nmea_serial_last_poll: None,
             viewport_anim: None,
             auth,
             attached_metadata_text: String::new(),
@@ -2133,6 +2136,9 @@ fn detect_local_ip() -> Option<String> {
     })
 }
 
+/// How often the open Bluetooth GPS screen rescans for newly paired devices.
+const NMEA_PORT_RESCAN_INTERVAL: Duration = Duration::from_secs(3);
+
 fn collect_nmea_serial_candidates() -> Vec<String> {
     let mut ordered = Vec::<String>::new();
     let mut seen = std::collections::HashSet::<String>::new();
@@ -2154,8 +2160,14 @@ fn collect_nmea_serial_candidates() -> Vec<String> {
 }
 
 fn refresh_nmea_serial_candidates(state: &mut ThirdEyeState) -> bool {
+    third_eye_client::nmea::set_bluetooth_scan_enabled(state.config.nmea_gps_mode.trim() == "2");
     let candidates = collect_nmea_serial_candidates();
     let mut selected = state.config.nmea_serial_port.trim().to_owned();
+    if let Some(migrated) =
+        third_eye_client::nmea::migrate_raw_bluetooth_port(&selected, &candidates)
+    {
+        selected = migrated;
+    }
     if selected.is_empty() {
         selected = pick_default_nmea_serial_port(&candidates).unwrap_or_default();
     }
@@ -4110,43 +4122,6 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
     });
 
     let ui_weak = ui.as_weak();
-    let state_for_prepare_bt = Rc::clone(&state);
-    let store_for_prepare_bt = Rc::clone(&store);
-    ui.on_prepare_bluetooth(move || {
-        let Some(ui) = ui_weak.upgrade() else {
-            return;
-        };
-        let Ok(mut state) = state_for_prepare_bt.try_borrow_mut() else {
-            return;
-        };
-        pull_configuration_from_ui(&ui, &mut state, &store_for_prepare_bt);
-        if refresh_nmea_serial_candidates(&mut state) {
-            persist_config(&state, &store_for_prepare_bt);
-        }
-        let port_path = state.config.nmea_serial_port.trim().to_owned();
-        apply_state_to_ui(&ui, &state);
-        if port_path.is_empty() {
-            ui.set_nmea_gps_status(
-                "No serial ports detected. Pair the Bluetooth GPS or connect it via USB first."
-                    .into(),
-            );
-            return;
-        }
-        ui.set_nmea_gps_status("Preparing Bluetooth device...".into());
-        // Run blueutil on a background thread to avoid blocking the UI.
-        let ui_weak_inner = ui.as_weak();
-        let port = port_path.clone();
-        thread::spawn(move || {
-            let msg = NmeaGpsState::prepare_bluetooth(&port);
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_weak_inner.upgrade() {
-                    ui.set_nmea_gps_status(msg.into());
-                }
-            });
-        });
-    });
-
-    let ui_weak = ui.as_weak();
     let state_for_start_nmea = Rc::clone(&state);
     let store_for_start_nmea = Rc::clone(&store);
     ui.on_start_nmea_gps(move || {
@@ -5186,6 +5161,17 @@ fn locate_ffmpeg_binary() -> Option<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // The macOS Bluetooth link runs in a child process of this executable;
+    // handle that before any UI setup.
+    #[cfg(target_os = "macos")]
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some(third_eye_client::iobt::HELPER_FLAG) {
+            let code = third_eye_client::iobt::run_helper(&args.next().unwrap_or_default());
+            std::process::exit(code);
+        }
+    }
+
     let ui = AppWindow::new().context("failed to initialize Slint window")?;
     ui.window().set_maximized(true);
     let store = Rc::new(match AppStore::open() {
@@ -5385,6 +5371,34 @@ fn main() -> Result<()> {
                 apply_map_runtime_to_ui(&ui, &state);
             }
             state.rov_status.poll_events();
+            // While the Bluetooth GPS mode is open, notice devices that get
+            // paired or plugged in and select the new one, so the user never
+            // has to hunt for the port.
+            if state.active_screen == Screen::Nmea
+                && state.config.nmea_gps_mode.trim() == "2"
+                && !state.nmea_gps.is_running()
+                && state
+                    .nmea_serial_last_poll
+                    .is_none_or(|t| t.elapsed() >= NMEA_PORT_RESCAN_INTERVAL)
+            {
+                state.nmea_serial_last_poll = Some(Instant::now());
+                let current = collect_nmea_serial_candidates();
+                if current != state.nmea_serial_port_options {
+                    let added = new_serial_ports(&state.nmea_serial_port_options, &current);
+                    if let Some(port) = added.first() {
+                        state.config.nmea_serial_port.clone_from(port);
+                        ui.set_nmea_gps_status(format!("Detected {port}. Click Start GPS.").into());
+                    }
+                    state.nmea_serial_port_index =
+                        find_nmea_serial_port_index(&current, &state.config.nmea_serial_port)
+                            .map_or(-1, |i| i as i32);
+                    state.nmea_serial_port_options = current;
+                    if !added.is_empty() {
+                        persist_config(&state, &poll_store);
+                    }
+                    apply_state_to_ui(&ui, &state);
+                }
+            }
             // Poll NMEA GPS: update map location when a fix arrives.
             if state.nmea_gps.poll_events()
                 && let Some((lat, lon)) = state.nmea_gps.latest_location()

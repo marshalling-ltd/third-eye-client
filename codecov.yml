@@ -2,5 +2,13 @@
 # loop) that can only be meaningfully exercised by a running GUI, not unit
 # tests. Its ~6,000 largely-unexercised lines otherwise swamp the coverage
 # number for the rest of the codebase, which sits in the high 80s/90s%.
+#
+# src/bluez.rs and src/iobt.rs drive the OS Bluetooth stacks (BlueZ over D-Bus
+# on Linux, IOBluetooth on macOS). Their remaining lines need a running
+# bluetoothd / a paired device and cannot run on CI; the logic that can be
+# tested without hardware has unit tests, which keep running. Exclusion only
+# affects the Codecov report, not `cargo test`.
 ignore:
   - "src/main.rs"
+  - "src/bluez.rs"
+  - "src/iobt.rs"

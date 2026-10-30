@@ -27,7 +27,7 @@ fi
 # ---------------------------------------------------------------------------
 
 MISSING_PKGS=()
-for pkg in libwayland-dev libxkbcommon-dev libx11-dev libfontconfig-dev pkg-config; do
+for pkg in libwayland-dev libxkbcommon-dev libx11-dev libfontconfig-dev libdbus-1-dev pkg-config; do
   if ! dpkg -s "$pkg" >/dev/null 2>&1; then
     MISSING_PKGS+=("$pkg")
   fi
@@ -45,6 +45,7 @@ if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
     libxcb-shape0-dev \
     libxcb-xfixes0-dev \
     libfontconfig-dev \
+    libdbus-1-dev \
     libegl1-mesa-dev \
     libgl1-mesa-dev \
     pkg-config \

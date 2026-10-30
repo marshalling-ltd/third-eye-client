@@ -12,7 +12,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # macOS x86_64 ffmpeg bundle — built natively on Intel hardware.
   #
-  # macos-14 runners are Apple Silicon. Homebrew's installer now refuses to
+  # macos-15 runners are Apple Silicon. Homebrew's installer now refuses to
   # bootstrap an x86_64 install under Rosetta ("Homebrew on macOS is only
   # supported on Apple Silicon processors!"), and even after working around
   # that, several ffmpeg dependencies no longer have x86_64 bottles published
@@ -45,7 +45,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     needs: build-macos-ffmpeg-x86_64
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
 
@@ -66,7 +66,7 @@ jobs:
 
       - name: Bundle ffmpeg (arm64)
         run: |
-          # macos-14 runners are arm64 (Apple Silicon) natively, so plain
+          # macos-15 runners are arm64 (Apple Silicon) natively, so plain
           # `brew install` only gives us an arm64 binary. The x86_64 slice is
           # built natively on an Intel runner by the build-macos-ffmpeg-x86_64
           # job and downloaded below.
@@ -239,7 +239,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev libdbus-1-dev
 
       - name: Build
         env:
