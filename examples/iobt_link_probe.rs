@@ -50,7 +50,7 @@ fn probe() {
     };
 
     let started = Instant::now();
-    let link = match iobt::connect(&device.address) {
+    let link = match iobt::connect(&device.address, &std::sync::atomic::AtomicBool::new(false)) {
         Ok(link) => link,
         Err(err) => {
             eprintln!("connect failed after {:?}: {err:#}", started.elapsed());

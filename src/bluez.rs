@@ -1,20 +1,32 @@
-//! Linux Bluetooth SPP support through `BlueZ` (D-Bus).
+//! Linux Bluetooth SPP support through `BlueZ`.
 //!
 //! Paired devices that advertise the Serial Port Profile are exposed to the
 //! rest of the app as pseudo-ports (see [`crate::bt_port`]), so no
-//! `/dev/rfcomm*` node (and no `sudo rfcomm bind`) is required. Pairing itself
-//! is still done by the desktop's Bluetooth settings, which own the pairing
-//! agent.
+//! `/dev/rfcomm*` node (and no `sudo rfcomm bind`) is required.
+//!
+//! Connecting does not use `BlueZ`'s profile machinery, which pages the device
+//! and looks up its channel in one step and times out on some devices.
+//! Instead the app:
+//!
+//! 1. brings the radio link up through `BlueZ` (as `bluetoothctl connect` does),
+//! 2. asks the device for its serial channel with a small SDP query, and
+//! 3. opens that RFCOMM channel with a plain socket.
+//!
+//! Pairing itself is done in the desktop's Bluetooth settings, which own the
+//! pairing agent.
 
 use std::collections::HashSet;
 use std::io::{self, Read};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use bluer::rfcomm::{Profile, Role, Stream};
-use bluer::{Address, Session, Uuid};
-use futures::StreamExt;
+use bluer::l2cap::SeqPacket;
+use bluer::rfcomm::{SocketAddr, Stream};
+use bluer::{Address, AddressType, Session, Uuid};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::runtime::{Builder, Runtime};
 
@@ -30,6 +42,18 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound for establishing the RFCOMM connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// L2CAP channel (PSM) of the Service Discovery Protocol.
+const SDP_PSM: u16 = 1;
+
+/// Upper bound for the SDP lookup of the serial channel.
+const SDP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How often a connect attempt checks whether it was cancelled.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// How long a background device scan stays fresh.
+const SCAN_TTL: Duration = Duration::from_secs(2);
 
 /// A paired device that offers the Serial Port Profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,22 +94,48 @@ pub fn list_paired_spp_devices() -> Result<Vec<SppDevice>> {
     })
 }
 
+struct ScanCache {
+    devices: Vec<SppDevice>,
+    fetched: Option<Instant>,
+    in_flight: bool,
+}
+
+static SCAN: Mutex<ScanCache> = Mutex::new(ScanCache {
+    devices: Vec::new(),
+    fetched: None,
+    in_flight: false,
+});
+
+/// Returns the paired SPP devices from the last background scan and starts a
+/// new scan when that result is stale.
+///
+/// Unlike [`list_paired_spp_devices`] this never waits on D-Bus, so it is safe
+/// to call from the UI thread. The first call returns an empty list; callers
+/// that poll pick the devices up once the scan has finished.
+#[must_use]
+pub fn cached_paired_spp_devices() -> Vec<SppDevice> {
+    let mut cache = SCAN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stale = cache.fetched.is_none_or(|t| t.elapsed() >= SCAN_TTL);
+    if stale && !cache.in_flight {
+        cache.in_flight = true;
+        thread::spawn(|| {
+            let devices = list_paired_spp_devices().unwrap_or_default();
+            let mut cache = SCAN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.devices = devices;
+            cache.fetched = Some(Instant::now());
+            cache.in_flight = false;
+        });
+    }
+    cache.devices.clone()
+}
+
 /// `true` if a device's advertised service UUIDs include the Serial Port Profile.
 fn offers_spp(uuids: Option<&HashSet<Uuid>>) -> bool {
     uuids.is_some_and(|uuids| uuids.contains(&SPP_UUID))
-}
-
-/// The profile we register so `BlueZ` hands us the connected RFCOMM socket.
-fn spp_profile() -> Profile {
-    Profile {
-        uuid: SPP_UUID,
-        name: Some("Third Eye GPS".to_string()),
-        role: Some(Role::Client),
-        require_authentication: Some(false),
-        require_authorization: Some(false),
-        auto_connect: Some(false),
-        ..Profile::default()
-    }
 }
 
 async fn list_async() -> Result<Vec<SppDevice>> {
@@ -125,18 +175,22 @@ pub struct BluezLink {
 /// # Arguments
 ///
 /// * `address` - Bluetooth address, e.g. `AA:BB:CC:DD:EE:FF`.
+/// * `stop` - Set to abandon the attempt promptly (within about 100 ms).
 ///
 /// # Returns
 ///
 /// * `Result<BluezLink>` - A readable link, or an error describing why the
-///   connection failed (device off, out of range, not paired, ...).
-pub fn connect(address: &str) -> Result<BluezLink> {
+///   connection failed (device off, out of range, not paired, cancelled, ...).
+pub fn connect(address: &str, stop: &AtomicBool) -> Result<BluezLink> {
     let address = Address::from_str(address).map_err(|e| anyhow!("invalid address: {e}"))?;
     let rt = runtime()?;
     let (session, stream) = rt.block_on(async {
-        tokio::time::timeout(CONNECT_TIMEOUT, connect_async(address))
-            .await
-            .map_err(|_| anyhow!("timed out connecting to {address}"))?
+        tokio::select! {
+            result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(address)) => {
+                result.map_err(|_| anyhow!("timed out connecting to {address}"))?
+            }
+            () = wait_for_stop(stop) => Err(anyhow!("connection attempt cancelled")),
+        }
     })?;
     Ok(BluezLink {
         stream,
@@ -145,21 +199,109 @@ pub fn connect(address: &str) -> Result<BluezLink> {
     })
 }
 
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(CANCEL_POLL).await;
+    }
+}
+
 async fn connect_async(address: Address) -> Result<(Session, Stream)> {
-    let session = Session::new().await?;
-    let adapter = session.default_adapter().await?;
-    adapter.set_powered(true).await?;
+    let session = Session::new().await.context("connecting to bluetoothd")?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .context("finding the Bluetooth adapter")?;
+    // Only power the adapter on when it is off; redundant mode changes can
+    // fail on some controllers and would abort an otherwise good connect.
+    if !adapter.is_powered().await? {
+        adapter
+            .set_powered(true)
+            .await
+            .context("powering on the adapter")?;
+    }
     let device = adapter.device(address)?;
 
-    let mut handle = session.register_profile(spp_profile()).await?;
+    ensure_link(&device).await?;
 
-    // BlueZ only completes ConnectProfile once we accept the incoming
-    // NewConnection, so both futures must make progress together.
-    let (connected, request) = tokio::join!(device.connect_profile(&SPP_UUID), handle.next());
-    connected?;
-    let request = request.ok_or_else(|| anyhow!("BlueZ closed the profile before connecting"))?;
-    let stream = request.accept()?;
+    let channel = tokio::time::timeout(SDP_TIMEOUT, find_spp_channel(address))
+        .await
+        .map_err(|_| anyhow!("timed out asking {address} for its serial channel"))??;
+    let stream = Stream::connect(SocketAddr::new(address, channel))
+        .await
+        .with_context(|| format!("opening serial channel {channel} on {address}"))?;
     Ok((session, stream))
+}
+
+/// Asks the device, over SDP, which RFCOMM channel carries its Serial Port
+/// Profile. `BlueZ`'s own profile machinery does this too, but it pages the
+/// device in the same step and times out on some devices.
+async fn find_spp_channel(address: Address) -> Result<u8> {
+    let sdp = SeqPacket::connect(bluer::l2cap::SocketAddr::new(
+        address,
+        AddressType::BrEdr,
+        SDP_PSM,
+    ))
+    .await
+    .context("opening an SDP connection")?;
+    sdp.send(&sdp_serial_channel_request(1))
+        .await
+        .context("sending the SDP request")?;
+    let mut buf = vec![0u8; sdp.recv_mtu().unwrap_or(4096).max(512)];
+    let n = sdp.recv(&mut buf).await.context("reading the SDP answer")?;
+    parse_rfcomm_channel(&buf[..n])
+        .ok_or_else(|| anyhow!("{address} does not offer a serial port service"))
+}
+
+/// Builds an SDP `ServiceSearchAttributeRequest` for the Serial Port Profile,
+/// asking for its `ProtocolDescriptorList` (which holds the RFCOMM channel).
+fn sdp_serial_channel_request(transaction_id: u16) -> Vec<u8> {
+    let mut pdu = vec![0x06];
+    pdu.extend_from_slice(&transaction_id.to_be_bytes());
+    let params: [u8; 13] = [
+        0x35, 0x03, 0x19, 0x11, 0x01, // service search pattern: UUID16 0x1101
+        0xff, 0xff, // maximum attribute byte count
+        0x35, 0x03, 0x09, 0x00, 0x04, // attribute list: ProtocolDescriptorList (0x0004)
+        0x00, // no continuation
+    ];
+    pdu.extend_from_slice(&u16::try_from(params.len()).unwrap_or(0).to_be_bytes());
+    pdu.extend_from_slice(&params);
+    pdu
+}
+
+/// Extracts the RFCOMM channel from an SDP `ServiceSearchAttributeResponse`.
+///
+/// The channel sits in the `ProtocolDescriptorList` as `UUID16 0x0003`
+/// (RFCOMM) followed by a one-byte unsigned integer.
+fn parse_rfcomm_channel(response: &[u8]) -> Option<u8> {
+    // PDU id 0x07, transaction id, parameter length, attribute lists byte count.
+    if response.len() < 7 || response[0] != 0x07 {
+        return None;
+    }
+    response[7..]
+        .windows(5)
+        .find(|w| w[..4] == [0x19, 0x00, 0x03, 0x08])
+        .map(|w| w[4])
+}
+
+/// Brings the radio link to `device` up the way `bluetoothctl connect` does.
+///
+/// Starting our profile on a cold link makes `BlueZ` page the device and look
+/// up its serial channel in one step, which times out on some devices. Opening
+/// the link first (and letting `BlueZ` resolve the services) does not. The
+/// "no profile to connect to" error that `Device.Connect` returns for a
+/// serial-only device is expected: the link still comes up.
+async fn ensure_link(device: &bluer::Device) -> Result<()> {
+    if device.is_connected().await? {
+        return Ok(());
+    }
+    let _ = device.connect().await;
+    if device.is_connected().await? {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "could not reach the device; is it powered on, in range and not connected to another computer?"
+        ))
+    }
 }
 
 /// Reads from `stream` on `rt`, reporting [`io::ErrorKind::TimedOut`] if
@@ -214,12 +356,39 @@ mod tests {
     }
 
     #[test]
-    fn spp_profile_is_an_unauthenticated_client() {
-        let profile = spp_profile();
-        assert_eq!(profile.uuid, SPP_UUID);
-        assert_eq!(profile.role, Some(Role::Client));
-        assert_eq!(profile.require_authentication, Some(false));
-        assert_eq!(profile.auto_connect, Some(false));
+    fn sdp_request_asks_for_the_serial_port_protocol_list() {
+        assert_eq!(
+            sdp_serial_channel_request(1),
+            [
+                0x06, 0x00, 0x01, 0x00, 0x0d, 0x35, 0x03, 0x19, 0x11, 0x01, 0xff, 0xff, 0x35, 0x03,
+                0x09, 0x00, 0x04, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn rfcomm_channel_is_read_from_the_protocol_list() {
+        // ServiceSearchAttributeResponse with L2CAP, then RFCOMM channel 2.
+        let response = [
+            0x07, 0x00, 0x01, 0x00, 0x18, 0x00, 0x15, 0x35, 0x13, 0x35, 0x11, 0x09, 0x00, 0x04,
+            0x35, 0x0c, 0x35, 0x03, 0x19, 0x01, 0x00, 0x35, 0x05, 0x19, 0x00, 0x03, 0x08, 0x02,
+            0x00,
+        ];
+        assert_eq!(parse_rfcomm_channel(&response), Some(2));
+    }
+
+    #[test]
+    fn rfcomm_channel_is_absent_from_errors_and_other_records() {
+        // An SDP error response.
+        assert_eq!(parse_rfcomm_channel(&[0x01, 0, 1, 0, 2, 0, 3]), None);
+        // Truncated.
+        assert_eq!(parse_rfcomm_channel(&[0x07, 0, 1]), None);
+        // A record without an RFCOMM entry (L2CAP only).
+        let l2cap_only = [
+            0x07, 0x00, 0x01, 0x00, 0x11, 0x00, 0x0e, 0x35, 0x0c, 0x35, 0x0a, 0x09, 0x00, 0x04,
+            0x35, 0x03, 0x19, 0x01, 0x00, 0x00,
+        ];
+        assert_eq!(parse_rfcomm_channel(&l2cap_only), None);
     }
 
     #[test]
@@ -253,7 +422,9 @@ mod tests {
 
     #[test]
     fn connect_rejects_invalid_addresses() {
-        let err = connect("not-an-address").err().expect("must fail");
+        let err = connect("not-an-address", &AtomicBool::new(false))
+            .err()
+            .expect("must fail");
         assert!(err.to_string().contains("invalid address"), "{err}");
     }
 
@@ -261,7 +432,31 @@ mod tests {
     fn connect_to_an_unreachable_device_fails_instead_of_hanging() {
         // Without bluetoothd this fails at the D-Bus session; with it, BlueZ
         // rejects the unknown device. Either way: an error, not a hang.
-        assert!(connect("00:00:00:00:00:01").is_err());
+        assert!(connect("00:00:00:00:00:01", &AtomicBool::new(false)).is_err());
+    }
+
+    #[test]
+    fn a_cancelled_connect_returns_promptly() {
+        let started = Instant::now();
+        assert!(connect("00:00:00:00:00:01", &AtomicBool::new(true)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn wait_for_stop_returns_once_the_flag_is_set() {
+        let rt = runtime().unwrap();
+        let stop = AtomicBool::new(true);
+        rt.block_on(wait_for_stop(&stop));
+    }
+
+    #[test]
+    fn cached_listing_never_blocks_and_fills_in_later() {
+        let started = Instant::now();
+        let _ = cached_paired_spp_devices();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // Let the background scan finish; a later call must not panic or block.
+        thread::sleep(Duration::from_millis(300));
+        let _ = cached_paired_spp_devices();
     }
 
     #[test]

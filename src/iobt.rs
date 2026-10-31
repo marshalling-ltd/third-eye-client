@@ -44,6 +44,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a stopped helper gets to close the link before it is killed.
 const HELPER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Same, when the user cancels a connect attempt: the UI is waiting on it.
+const CANCEL_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How often a connect attempt checks whether it was cancelled.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
 /// How long the helper waits for an SDP answer when none is cached.
 const SDP_WAIT_SECS: f64 = 3.0;
 
@@ -387,12 +393,13 @@ pub struct IobtLink {
 /// # Arguments
 ///
 /// * `address` - Bluetooth address, e.g. `AA:BB:CC:DD:EE:FF`.
+/// * `stop` - Set to abandon the attempt promptly.
 ///
 /// # Returns
 ///
 /// * `Result<IobtLink>` - A readable link, or an error saying why the device
 ///   could not be reached.
-pub fn connect(address: &str) -> Result<IobtLink> {
+pub fn connect(address: &str, stop: &AtomicBool) -> Result<IobtLink> {
     let address = normalize_address(address).ok_or_else(|| anyhow!("invalid Bluetooth address"))?;
     let mut child = Command::new(std::env::current_exe()?)
         .arg(HELPER_FLAG)
@@ -443,15 +450,28 @@ pub fn connect(address: &str) -> Result<IobtLink> {
         child,
         stdin,
     };
-    match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(Ok(())) => Ok(link),
-        Ok(Err(message)) => {
-            link.shutdown();
-            Err(anyhow!(message))
-        }
-        Err(_) => {
-            link.shutdown();
-            Err(anyhow!("timed out connecting to the Bluetooth device"))
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match ready_rx.recv_timeout(CANCEL_POLL) {
+            Ok(Ok(())) => return Ok(link),
+            Ok(Err(message)) => {
+                link.shutdown(HELPER_STOP_TIMEOUT);
+                return Err(anyhow!(message));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    link.shutdown(CANCEL_STOP_TIMEOUT);
+                    return Err(anyhow!("connection attempt cancelled"));
+                }
+                if Instant::now() >= deadline {
+                    link.shutdown(HELPER_STOP_TIMEOUT);
+                    return Err(anyhow!("timed out connecting to the Bluetooth device"));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                link.shutdown(HELPER_STOP_TIMEOUT);
+                return Err(anyhow!("the Bluetooth helper exited unexpectedly"));
+            }
         }
     }
 }
@@ -459,9 +479,9 @@ pub fn connect(address: &str) -> Result<IobtLink> {
 impl IobtLink {
     /// Asks the helper to stop (by closing its stdin) and reaps it, killing it
     /// if it does not exit in time.
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, timeout: Duration) {
         self.stdin = None;
-        let deadline = Instant::now() + HELPER_STOP_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
@@ -497,6 +517,6 @@ impl Read for IobtLink {
 
 impl Drop for IobtLink {
     fn drop(&mut self) {
-        self.shutdown();
+        self.shutdown(HELPER_STOP_TIMEOUT);
     }
 }
