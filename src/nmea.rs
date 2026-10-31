@@ -180,7 +180,7 @@ pub fn list_bluetooth_ports() -> Vec<String> {
     // `bt://<address>`; no `rfcomm bind` needed).
     #[cfg(target_os = "linux")]
     if bluetooth_scan_enabled() {
-        let devices = crate::bluez::list_paired_spp_devices().unwrap_or_default();
+        let devices = crate::bluez::cached_paired_spp_devices();
         filtered.extend(devices.iter().map(crate::bluez::SppDevice::port_name));
     }
 
@@ -976,14 +976,22 @@ fn nmea_tcp_client_worker(
 
 /// Opens the byte source for `port_path`: an RFCOMM link (`BlueZ` on Linux,
 /// `IOBluetooth` on macOS) for `bt://` names, otherwise a serial port at `baud_rate`.
-fn open_nmea_link(port_path: &str, baud_rate: u32) -> Result<Box<dyn Read + Send>, String> {
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
+fn open_nmea_link(
+    port_path: &str,
+    baud_rate: u32,
+    stop: &AtomicBool,
+) -> Result<Box<dyn Read + Send>, String> {
     #[cfg(target_os = "linux")]
     if let Some(address) = crate::bt_port::parse_port_name(port_path) {
-        return boxed_link(crate::bluez::connect(&address));
+        return boxed_link(crate::bluez::connect(&address, stop));
     }
     #[cfg(target_os = "macos")]
     if let Some(address) = crate::bt_port::parse_port_name(port_path) {
-        return boxed_link(crate::iobt::connect(&address));
+        return boxed_link(crate::iobt::connect(&address, stop));
     }
     boxed_link(
         serialport::new(port_path, baud_rate)
@@ -1014,7 +1022,9 @@ fn nmea_serial_worker(
     tx: mpsc::Sender<NmeaGpsEvent>,
     protocol: GpsProtocol,
 ) {
-    nmea_serial_worker_with(&port_path, baud_rate, &stop, &tx, protocol, open_nmea_link);
+    nmea_serial_worker_with(&port_path, baud_rate, &stop, &tx, protocol, |path, baud| {
+        open_nmea_link(path, baud, &stop)
+    });
 }
 
 /// Body of [`nmea_serial_worker`] with the link opener injected, so tests can
@@ -1046,9 +1056,10 @@ fn nmea_serial_worker_with(
                     }
                     Err(err) => {
                         last_err = err;
+                        eprintln!("third-eye-client: opening {port_path} failed: {last_err}");
                         if attempt + 1 < BT_OPEN_RETRIES {
                             let _ = tx.send(NmeaGpsEvent::Status(format!(
-                                "Bluetooth port {port_path} busy, retrying ({}/{BT_OPEN_RETRIES})...",
+                                "Could not open {port_path}: {last_err}. Retrying ({}/{BT_OPEN_RETRIES})...",
                                 attempt + 1
                             )));
                             thread::sleep(BT_OPEN_RETRY_DELAY);
@@ -2197,13 +2208,27 @@ mod tests {
 
     #[test]
     fn open_nmea_link_fails_for_a_missing_serial_port() {
-        assert!(open_nmea_link("/dev/definitely-not-a-serial-port", 9600).is_err());
+        assert!(
+            open_nmea_link(
+                "/dev/definitely-not-a-serial-port",
+                9600,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn open_nmea_link_fails_for_an_unreachable_bluetooth_device() {
-        assert!(open_nmea_link("bt://00:00:00:00:00:01 Nobody", 9600).is_err());
+        assert!(
+            open_nmea_link(
+                "bt://00:00:00:00:00:01 Nobody",
+                9600,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2221,7 +2246,10 @@ mod tests {
         let first = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("a status event");
-        assert!(matches!(first, NmeaGpsEvent::Status(ref s) if s.contains("retrying")));
+        assert!(
+            matches!(first, NmeaGpsEvent::Status(ref s) if s.contains("Retrying") && s.contains("device unreachable")),
+            "status must carry the failure reason"
+        );
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
         let mut ended = false;
@@ -2273,6 +2301,20 @@ mod tests {
             .expect("worker starts even if the port is unreachable");
         assert!(status.contains("Connecting to Bluetooth GPS"), "{status}");
         assert!(state.is_running());
+        // Wait until the worker really tried to open the port and reported why
+        // it failed; stopping earlier would race with its first attempt.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.status_text().contains("Could not open")
+            && std::time::Instant::now() < deadline
+        {
+            state.poll_events();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            state.status_text().contains("Could not open"),
+            "{}",
+            state.status_text()
+        );
         state.stop();
         assert!(!state.is_running());
     }
