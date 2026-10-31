@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -50,7 +50,13 @@ pub const DEFAULT_BT_BAUD_RATE: u32 = 9600;
 /// println!("number of serial ports found: {}", ports.len());
 /// ```
 pub fn list_serial_ports() -> Vec<String> {
-    let ports = usable_serial_port_names(serialport::available_ports().unwrap_or_default());
+    let ports = serialport::available_ports().unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let ports: Vec<_> = ports
+        .into_iter()
+        .filter(|p| !is_macos_silent_usb_port(p))
+        .collect();
+    let ports = usable_serial_port_names(ports);
     #[cfg(target_os = "macos")]
     let ports = {
         let shadowed = macos_shadowed_serial_nodes();
@@ -60,6 +66,26 @@ pub fn list_serial_ports() -> Vec<String> {
             .collect::<Vec<_>>()
     };
     ports
+}
+
+/// USB devices (vendor id, product id) whose serial ports never deliver GPS
+/// sentences on macOS, so listing them there only misleads.
+///
+/// `19d1:0001` is the AirM2M composite inside the Geoastra X8-M1 receiver. Its
+/// NMEA port streams on Linux but stays silent under macOS's built-in CDC ACM
+/// driver, and its other ports are a diagnostic log and an idle port. On macOS
+/// the receiver is used over Bluetooth instead.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SILENT_USB_DEVICES: &[(u16, u16)] = &[(0x19d1, 0x0001)];
+
+/// `true` if `port` belongs to a USB device listed in [`MACOS_SILENT_USB_DEVICES`].
+#[cfg(any(target_os = "macos", test))]
+fn is_macos_silent_usb_port(port: &serialport::SerialPortInfo) -> bool {
+    matches!(
+        &port.port_type,
+        serialport::SerialPortType::UsbPort(usb)
+            if MACOS_SILENT_USB_DEVICES.contains(&(usb.vid, usb.pid))
+    )
 }
 
 /// Port names from `ports`, minus the Linux placeholder UARTs.
@@ -1086,11 +1112,12 @@ fn nmea_serial_worker_with(
         };
 
         let _ = tx.send(NmeaGpsEvent::Status(format!(
-            "Bluetooth GPS connected on {port_path} ({baud_rate} baud). Waiting for fix..."
+            "GPS connected on {port_path} ({baud_rate} baud). Waiting for fix..."
         )));
 
         let mut reader = BufReader::new(port);
-        match pump_nmea_lines(&mut reader, stop, tx, protocol, &mut last_sent) {
+        let mut watch = GpsDataWatch::new(port_path, Instant::now(), NO_GPS_DATA_HINT_AFTER);
+        match pump_nmea_lines(&mut reader, stop, tx, protocol, &mut last_sent, &mut watch) {
             ReadLoopExit::Stopped => break,
             ReadLoopExit::Disconnected => {}
             ReadLoopExit::Error(err) => {
@@ -1105,6 +1132,62 @@ fn nmea_serial_worker_with(
     }
 
     let _ = tx.send(NmeaGpsEvent::Ended);
+}
+
+/// How long a freshly opened link may send nothing, or nothing that looks like
+/// GPS sentences, before the status suggests trying another port.
+const NO_GPS_DATA_HINT_AFTER: Duration = Duration::from_secs(10);
+
+/// Watches a freshly opened link and produces a one-off hint when it stays
+/// silent, or only sends data that isn't GPS sentences, for a while. Without
+/// it the status keeps saying "Waiting for fix...", which looks like a missing
+/// satellite fix rather than the wrong port.
+struct GpsDataWatch {
+    port: String,
+    started: Instant,
+    after: Duration,
+    saw_line: bool,
+    saw_sentence: bool,
+    hinted: bool,
+}
+
+impl GpsDataWatch {
+    fn new(port: &str, started: Instant, after: Duration) -> Self {
+        Self {
+            port: port.to_owned(),
+            started,
+            after,
+            saw_line: false,
+            saw_sentence: false,
+            hinted: false,
+        }
+    }
+
+    /// Records a received line; NMEA (`$`), TAIP (`>`) and NovAtel-style
+    /// (`#`) lines count as GPS sentences.
+    fn record_line(&mut self, line: &str) {
+        self.saw_line = true;
+        if line.trim_start().starts_with(['$', '>', '#']) {
+            self.saw_sentence = true;
+        }
+    }
+
+    /// Returns the hint once, when `after` has passed without a GPS sentence.
+    fn hint(&mut self, now: Instant) -> Option<String> {
+        if self.hinted || self.saw_sentence || now.duration_since(self.started) < self.after {
+            return None;
+        }
+        self.hinted = true;
+        let port = &self.port;
+        Some(if self.saw_line {
+            format!("{port} is sending data, but no GPS sentences. Try another port, or Bluetooth.")
+        } else {
+            format!(
+                "Connected to {port}, but it has sent no data for {} s. Try another port, or Bluetooth.",
+                self.after.as_secs()
+            )
+        })
+    }
 }
 
 /// Why [`pump_nmea_lines`] stopped reading.
@@ -1132,6 +1215,7 @@ fn pump_nmea_lines<R: BufRead>(
     tx: &mpsc::Sender<NmeaGpsEvent>,
     protocol: GpsProtocol,
     last_sent: &mut Option<(f64, f64)>,
+    watch: &mut GpsDataWatch,
 ) -> ReadLoopExit {
     let mut line_buf = String::new();
     loop {
@@ -1142,6 +1226,7 @@ fn pump_nmea_lines<R: BufRead>(
         match reader.read_line(&mut line_buf) {
             Ok(0) => return ReadLoopExit::Disconnected,
             Ok(_) => {
+                watch.record_line(&line_buf);
                 if let Some((lat, lon)) = parse_gps_location(&line_buf, protocol)
                     && position_changed(last_sent.as_ref(), lat, lon)
                 {
@@ -1155,6 +1240,10 @@ fn pump_nmea_lines<R: BufRead>(
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => return ReadLoopExit::Error(err),
+        }
+        // After the read, so data that just arrived counts.
+        if let Some(hint) = watch.hint(Instant::now()) {
+            let _ = tx.send(NmeaGpsEvent::Status(hint));
         }
     }
 }
@@ -2086,7 +2175,14 @@ mod tests {
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
         let mut last_sent = None;
-        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        let exit = pump_nmea_lines(
+            &mut reader,
+            &stop,
+            &tx,
+            GpsProtocol::Nmea,
+            &mut last_sent,
+            &mut quiet_watch(),
+        );
         assert!(matches!(exit, ReadLoopExit::Disconnected));
         let NmeaGpsEvent::Fix { lat, lon } = rx.try_recv().expect("a fix event") else {
             panic!("expected a Fix event");
@@ -2105,7 +2201,14 @@ mod tests {
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
         let mut last_sent = None;
-        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        let exit = pump_nmea_lines(
+            &mut reader,
+            &stop,
+            &tx,
+            GpsProtocol::Nmea,
+            &mut last_sent,
+            &mut quiet_watch(),
+        );
         assert!(matches!(exit, ReadLoopExit::Disconnected));
         // Three identical sentences collapse to a single Fix event.
         assert!(matches!(rx.try_recv(), Ok(NmeaGpsEvent::Fix { .. })));
@@ -2119,7 +2222,14 @@ mod tests {
         let stop = AtomicBool::new(false);
         let (tx, _rx) = mpsc::channel();
         let mut last_sent = None;
-        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        let exit = pump_nmea_lines(
+            &mut reader,
+            &stop,
+            &tx,
+            GpsProtocol::Nmea,
+            &mut last_sent,
+            &mut quiet_watch(),
+        );
         assert!(matches!(exit, ReadLoopExit::Disconnected));
     }
 
@@ -2131,7 +2241,14 @@ mod tests {
         let stop = AtomicBool::new(true); // already stopped
         let (tx, rx) = mpsc::channel();
         let mut last_sent = None;
-        let exit = pump_nmea_lines(&mut reader, &stop, &tx, GpsProtocol::Nmea, &mut last_sent);
+        let exit = pump_nmea_lines(
+            &mut reader,
+            &stop,
+            &tx,
+            GpsProtocol::Nmea,
+            &mut last_sent,
+            &mut quiet_watch(),
+        );
         assert!(matches!(exit, ReadLoopExit::Stopped));
         assert!(rx.try_recv().is_err());
         assert!(last_sent.is_none());
@@ -2317,6 +2434,97 @@ mod tests {
         );
         state.stop();
         assert!(!state.is_running());
+    }
+
+    // ---- GpsDataWatch / macOS USB filter ---------------------------------
+
+    /// A watch that never hints, for tests about something else.
+    fn quiet_watch() -> GpsDataWatch {
+        GpsDataWatch::new("test", Instant::now(), Duration::MAX)
+    }
+
+    #[test]
+    fn data_watch_hints_once_when_a_port_stays_silent() {
+        let start = Instant::now();
+        let mut watch = GpsDataWatch::new("/dev/cu.x", start, Duration::from_secs(10));
+        assert_eq!(watch.hint(start + Duration::from_secs(9)), None);
+        let hint = watch
+            .hint(start + Duration::from_secs(10))
+            .expect("a hint after 10 s");
+        assert!(hint.contains("has sent no data for 10 s"), "{hint}");
+        assert!(hint.contains("/dev/cu.x"), "{hint}");
+        assert_eq!(
+            watch.hint(start + Duration::from_secs(30)),
+            None,
+            "only once"
+        );
+    }
+
+    #[test]
+    fn data_watch_hints_when_data_is_not_gps_sentences() {
+        let start = Instant::now();
+        let mut watch = GpsDataWatch::new("COM4", start, Duration::from_secs(10));
+        watch.record_line("binary-ish log line\n");
+        let hint = watch.hint(start + Duration::from_secs(11)).expect("a hint");
+        assert!(hint.contains("no GPS sentences"), "{hint}");
+    }
+
+    #[test]
+    fn data_watch_stays_quiet_once_gps_sentences_arrive() {
+        let start = Instant::now();
+        for line in ["$GNGGA,1,2,3\n", ">RPV15714+37<\n", "#BESTPOSA,COM1\n"] {
+            let mut watch = GpsDataWatch::new("p", start, Duration::from_secs(10));
+            watch.record_line(line);
+            assert_eq!(watch.hint(start + Duration::from_secs(60)), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn pump_reports_a_port_that_sends_no_gps_sentences() {
+        use std::io::Cursor;
+        let mut reader = Cursor::new(b"diagnostic output\nmore\n".to_vec());
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut last_sent = None;
+        let mut watch = GpsDataWatch::new("p", Instant::now(), Duration::ZERO);
+        let exit = pump_nmea_lines(
+            &mut reader,
+            &stop,
+            &tx,
+            GpsProtocol::Nmea,
+            &mut last_sent,
+            &mut watch,
+        );
+        assert!(matches!(exit, ReadLoopExit::Disconnected));
+        let events: Vec<NmeaGpsEvent> = rx.try_iter().collect();
+        assert!(
+            matches!(&events[..], [NmeaGpsEvent::Status(s)] if s.contains("no GPS sentences")),
+            "expected exactly one 'no GPS sentences' hint"
+        );
+    }
+
+    #[test]
+    fn macos_silent_usb_filter_matches_only_listed_devices() {
+        use serialport::{SerialPortInfo, SerialPortType, UsbPortInfo};
+        let usb = |vid, pid| SerialPortInfo {
+            port_name: "/dev/cu.usbmodem1".to_string(),
+            port_type: SerialPortType::UsbPort(UsbPortInfo {
+                vid,
+                pid,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+            }),
+        };
+        assert!(is_macos_silent_usb_port(&usb(0x19d1, 0x0001)));
+        assert!(
+            !is_macos_silent_usb_port(&usb(0x1546, 0x01a8)),
+            "u-blox must stay visible"
+        );
+        assert!(!is_macos_silent_usb_port(&SerialPortInfo {
+            port_name: "/dev/cu.BLTH".to_string(),
+            port_type: SerialPortType::PciPort,
+        }));
     }
 
     // ---- macOS noise / migration -------------------------------------------

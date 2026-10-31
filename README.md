@@ -98,9 +98,26 @@ Built with Rust 🦀 and [Slint](https://slint.dev/) — native GUI on macOS, Wi
 |---|---|---|
 | **TCP Listen** | The app listens on a TCP port; a phone app or network GPS device connects as a client | GPS2IP, GPSd Forwarder, ShareGPS |
 | **TCP Client** | The app dials an NMEA server running on a phone or remote host | Phone / remote host |
-| **Serial / Bluetooth** | Reads from any serial port (`/dev/cu.*`, `/dev/rfcomm*`, `COM*`) | Bluetooth GPS receivers, USB GPS dongles, phone apps exposing an SPP channel |
+| **Serial / Bluetooth** | Reads from a paired Bluetooth GPS (listed as `bt://<address> <name>`) or any serial port (`COM*`, `/dev/cu.usbmodem*`, `/dev/ttyACM*`, `/dev/ttyUSB*`) | Bluetooth GPS receivers, USB GPS dongles, phone apps exposing an SPP channel |
 
-The stale-timeout is configurable per session; the map auto-centers on the latest fix.
+The stale-timeout is configurable per session; the map auto-centers on the latest fix. The app accepts both NMEA and TAIP lines whichever protocol is selected (the selection only sets which is tried first); it never sends commands to the receiver.
+
+**Serial / Bluetooth setup**
+
+| Platform | Bluetooth GPS | USB GPS |
+|---|---|---|
+| 🍎 **macOS** | Pair it once in System Settings → Bluetooth. It then appears in the list as `bt://…`; the app opens the connection itself, so there is no need to click *Connect* in System Settings. The first use asks for Bluetooth permission. | Shows up as `/dev/cu.usbmodem*`; no setup. |
+| 🐧 **Linux** | Pair it once in the desktop's Bluetooth settings (BlueZ / `bluetoothd` must be running). It appears as `bt://…`; no `rfcomm bind` is needed. Building needs `libdbus-1-dev`. | `/dev/ttyACM*` / `/dev/ttyUSB*` belong to the `dialout` group. Add yourself once with `sudo usermod -aG dialout $USER`, then **log out and back in**; without it the port fails with *Permission denied*. |
+| 🪟 **Windows** | Pair it in Settings → Bluetooth; the app lists the *Outgoing* COM port. | Shows up as a `COM*` port. |
+
+Good to know:
+
+- New paired or plugged-in devices appear in the list within a few seconds while the Bluetooth GPS screen is open and GPS is stopped.
+- Many receivers expose several USB serial ports and only one carries the position data. If a port connects but never reports a fix, try the others.
+- If a freshly opened port sends nothing, or sends data that isn't GPS sentences, for 10 s, the status says so and suggests another port or Bluetooth.
+- On macOS the USB ports of the Geoastra X8-M1 (USB ID `19d1:0001`) are hidden: its position port stays silent under macOS's built-in USB serial driver, while it works on Linux. Use it over Bluetooth on a Mac.
+- A Bluetooth receiver talks to one computer at a time: disconnect or switch off Bluetooth on other machines before connecting.
+- Satellite reception is separate from the connection: a receiver indoors can be connected and still report no fix.
 
 ### 🔌 ROV network interface binding
 
@@ -255,6 +272,9 @@ Project layout:
 | `src/camera.rs` | ROV camera HTTP client (capture, lamp, media list / download / delete) |
 | `src/rov_status.rs` | UDP status receiver and packet decoding |
 | `src/nmea.rs` | NMEA-0183 GPS over TCP listen, TCP client and serial / Bluetooth |
+| `src/bt_port.rs` | Naming of Bluetooth GPS devices as `bt://<address> <name>` ports |
+| `src/bluez.rs` | Linux Bluetooth link: brings the device up through BlueZ, finds its serial channel over SDP, opens it as an RFCOMM socket |
+| `src/iobt.rs` | macOS Bluetooth link: runs IOBluetooth in a helper process (`--bluetooth-helper`) because it only opens channels from a process's main thread |
 | `src/map.rs` | Slippy-map viewport, tile loading, native location (CoreLocation / Windows) |
 | `src/network.rs` | ROV interface detection and recalibration |
 | `src/ip_location.rs`, `src/update_check.rs`, `src/formatting.rs` | IP geolocation fallback, release-version selection, display helpers |
