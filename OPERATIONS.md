@@ -171,10 +171,19 @@ Install a free GPS app on your phone, keep the phone at the surface (e.g. in a d
 |---|---|---|
 | **TCP Listen** | The app *waits* and your phone app *connects to the laptop*. The app shows you the address/port to type into the phone app. | GPS2IP, GPSd Forwarder |
 | **Connect to TCP Server** | The *opposite*: your phone app runs a server and the app *dials into it*. You type the phone's IP address and port into the app. | ShareGPS, GPS Tether Server |
-| **Bluetooth** | Pair a Bluetooth GPS device (or a phone GPS app that offers Bluetooth) with your laptop first, then pick it from the list. | Bluetooth GPS receivers, phone apps with Bluetooth |
+| **Bluetooth** | Pair a Bluetooth GPS device (or a phone GPS app that offers Bluetooth) with your laptop first, in your computer's own Bluetooth settings. It then shows up in the list (as `bt://…` on Mac and Linux); pick it and press **Start GPS**. A USB GPS receiver is listed here too. | Bluetooth GPS receivers, USB GPS receivers, phone apps with Bluetooth |
 
 > [!TIP]
 > Leave **GPS protocol** on **NMEA** unless your device specifically needs **TAIP**.
+
+> [!TIP]
+> A USB GPS receiver is a good fallback when its battery is low. Many of them show several USB ports in the list and only one gives the position, so if one connects but never gets a position, try the others. The app tells you after about 10 seconds if a port sends nothing useful.
+
+> [!NOTE]
+> **Mac + Geoastra X8-M1:** use it over **Bluetooth**. Over USB it doesn't send its position to a Mac, so the app doesn't list its USB ports there.
+
+> [!NOTE]
+> **Linux, USB GPS:** the first time you may see **Permission denied**. Your account needs to be in the `dialout` group. Run `sudo usermod -aG dialout $USER` once, then **log out and back in**.
 
 ### How to know it's working
 
