@@ -4,7 +4,7 @@ site_url: https://marshalling-ltd.github.io/third-eye-client/
 repo_url: https://github.com/marshalling-ltd/third-eye-client
 repo_name: marshalling-ltd/third-eye-client
 edit_uri: edit/master/docs/
-copyright: Copyright &copy; 2024-2026 Marshalling Ltd. Licensed under GPL-3.0-only.
+copyright: Copyright &copy; 2026 Marshalling Ltd. Licensed under GPL-3.0-only.
 
 theme:
   name: material

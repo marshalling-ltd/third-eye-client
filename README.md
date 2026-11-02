@@ -86,4 +86,4 @@ uv run --with-requirements docs/requirements.txt mkdocs serve
 
 ## 📄 License
 
-Copyright (c) 2024-2026 Marshalling Ltd. Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).
+Copyright (c) 2026 Marshalling Ltd. Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).

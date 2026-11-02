@@ -79,6 +79,8 @@ Bluetooth and USB support is generic: it works with any GPS receiver that sends 
 
 ## Good to know
 
+- The list shows what is behind each port, for example `COM6  —  BY80125B39 (Bluetooth)` or `/dev/ttyACM2  —  AirM2M Compo (USB)`, so a GPS is easy to tell from other serial devices.
+- On Windows, pairing creates an *outgoing* and an *incoming* Bluetooth COM port. The incoming one only waits for a device to connect, is marked `incoming, not for GPS` and is never preselected.
 - New paired or plugged-in devices appear in the list within a few seconds while the Bluetooth GPS screen is open and GPS is stopped.
 - Many receivers expose several USB serial ports and only one carries the position data. If a port connects but never reports a fix, try the others. The app says so after about 10 seconds if a port sends nothing, or sends data that is not GPS sentences.
 - A USB GPS receiver is a good fallback when a Bluetooth receiver's battery is low.
