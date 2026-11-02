@@ -1,0 +1,68 @@
+site_name: third-eye-client
+site_description: Cross-platform desktop client for Chasing underwater ROVs
+site_url: https://marshalling-ltd.github.io/third-eye-client/
+repo_url: https://github.com/marshalling-ltd/third-eye-client
+repo_name: marshalling-ltd/third-eye-client
+edit_uri: edit/master/docs/
+copyright: Copyright &copy; 2024-2026 Marshalling Ltd. Licensed under GPL-3.0-only.
+
+theme:
+  name: material
+  logo: assets/logo.png
+  favicon: assets/logo.png
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+  palette:
+    scheme: default
+    primary: white
+    accent: indigo
+
+validation:
+  links:
+    anchors: warn
+    not_found: warn
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.keys
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Using the app:
+      - Install: guide/install.md
+      - Connect to the ROV: guide/connect.md
+      - Video and photos: guide/video-and-capture.md
+      - GPS on the map: guide/gps.md
+      - Troubleshooting: guide/troubleshooting.md
+  - Reference:
+      - Features: reference/features.md
+      - Architecture: reference/architecture.md
+  - Explanation:
+      - How the app finds the ROV: explanation/finding-the-rov.md
+      - How position gets onto the map: explanation/gps-and-position.md
+      - Working offline: explanation/offline-and-storage.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Building and testing: development/building.md
+      - ROV simulator: development/simulator.md
+      - Release process: development/release.md
+  - Release notes: release-notes.md

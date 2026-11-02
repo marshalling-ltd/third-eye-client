@@ -43,9 +43,9 @@ export component StreamPage inherits Rectangle {
 
     callback capture_photo();
     callback navigate_profile();
-    // Re-runs ROV network auto-detection + OS route setup, *and* restarts
-    // the ffmpeg pipeline from scratch (fresh process, fresh RTSP session,
-    // fresh keyframe) — so this recovers both a bad route and on-screen
+    // Re-runs ROV network auto-detection, *and* restarts the ffmpeg
+    // pipeline from scratch (fresh process, fresh RTSP session, fresh
+    // keyframe) — so this recovers both a wrong link and on-screen
     // decode corruption (garbled/blocky video) in one action.
     callback recalibrate_rov_network();
 

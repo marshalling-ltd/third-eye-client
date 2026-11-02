@@ -26,3 +26,6 @@ lcov.info
 # mediamtx auto-generated TLS files (chasing-simulator)
 auto.crt
 auto.key
+
+# MkDocs build output
+/site/

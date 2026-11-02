@@ -457,7 +457,7 @@ export component ProfilePage inherits VerticalBox {
                 clicked => { root.recalibrate_rov_network(); }
             }
             Text {
-                text: "Auto-detects the wired USB-ethernet interface for the ROV (192.168.1.88) and sets up the OS route for ffmpeg. If no cable is connected, falls back to OS routing (ROV WiFi). May prompt for admin password.";
+                text: "Re-detects whether the ROV (192.168.1.88) is reached over its WiFi or a USB-ethernet cable, and moves telemetry and video onto that link. Nothing is changed on this computer and no admin password is needed.";
                 wrap: word-wrap;
                 color: #8f96a3;
                 font-size: 11px;
