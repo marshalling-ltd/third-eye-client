@@ -137,6 +137,136 @@ pub fn migrate_raw_bluetooth_port(selected: &str, candidates: &[String]) -> Opti
         .cloned()
 }
 
+/// Short description of the kind of device behind a serial port, shown next
+/// to the port name so a user can tell a GPS from a printer or a speaker.
+///
+/// # Returns
+///
+/// * `Option<String>` - E.g. `"AirM2M Compo (USB)"` or `"Bluetooth"`; `None`
+///   when the OS reports nothing useful.
+///
+/// # Examples
+///
+/// ```
+/// use serialport::SerialPortType;
+/// use third_eye_client::nmea::describe_port_type;
+///
+/// assert_eq!(
+///     describe_port_type(&SerialPortType::BluetoothPort).as_deref(),
+///     Some("Bluetooth")
+/// );
+/// assert_eq!(describe_port_type(&SerialPortType::Unknown), None);
+/// ```
+#[must_use]
+pub fn describe_port_type(port_type: &serialport::SerialPortType) -> Option<String> {
+    use serialport::SerialPortType;
+    match port_type {
+        SerialPortType::UsbPort(usb) => {
+            let name = [usb.product.as_deref(), usb.manufacturer.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .unwrap_or("USB device");
+            Some(format!("{name} (USB)"))
+        }
+        SerialPortType::BluetoothPort => Some("Bluetooth".to_string()),
+        SerialPortType::PciPort => Some("built-in".to_string()),
+        SerialPortType::Unknown => None,
+    }
+}
+
+/// Descriptions of the serial ports the OS currently lists, keyed by the
+/// canonical port name (see [`canonical_serial_port_name`]).
+#[must_use]
+pub fn serial_port_descriptions() -> std::collections::HashMap<String, String> {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut descriptions = port_descriptions(serialport::available_ports().unwrap_or_default());
+    // Windows only knows its Bluetooth ports as "Bluetooth"; its device entries
+    // add the remote device's name and tell outgoing ports from incoming ones.
+    #[cfg(target_os = "windows")]
+    descriptions.extend(crate::bt_com::describe_bluetooth_ports(
+        &crate::winports::bluetooth_pnp_entries(),
+    ));
+    descriptions
+}
+
+/// Descriptions for the ports in `ports`, keyed by canonical port name; ports
+/// the OS says nothing about are left out.
+fn port_descriptions(
+    ports: Vec<serialport::SerialPortInfo>,
+) -> std::collections::HashMap<String, String> {
+    ports
+        .into_iter()
+        .filter_map(|p| {
+            describe_port_type(&p.port_type)
+                .map(|description| (canonical_serial_port_name(&p.port_name), description))
+        })
+        .collect()
+}
+
+/// The ports in `ports` that make sense to pick automatically: everything
+/// except Bluetooth *incoming* ports, which only wait for a device to connect
+/// and never carry a GPS stream to us. They stay listed, just not preselected.
+#[must_use]
+pub fn auto_selectable_ports<S: std::hash::BuildHasher>(
+    ports: &[String],
+    descriptions: &std::collections::HashMap<String, String, S>,
+) -> Vec<String> {
+    ports
+        .iter()
+        .filter(|port| {
+            descriptions
+                .get(&canonical_serial_port_name(port))
+                .is_none_or(|d| d != crate::bt_com::INCOMING_DESCRIPTION)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Dropdown text for `port`: the port name, followed by what is known about the
+/// device behind it. The saved and opened value stays the plain port name.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use third_eye_client::nmea::serial_port_label;
+///
+/// let mut descriptions = HashMap::new();
+/// descriptions.insert("COM7".to_string(), "AirM2M Compo (USB)".to_string());
+/// assert_eq!(
+///     serial_port_label("COM7", &descriptions),
+///     "COM7  \u{2014}  AirM2M Compo (USB)"
+/// );
+/// assert_eq!(serial_port_label("COM9", &descriptions), "COM9");
+/// ```
+#[must_use]
+pub fn serial_port_label<S: std::hash::BuildHasher>(
+    port: &str,
+    descriptions: &std::collections::HashMap<String, String, S>,
+) -> String {
+    match descriptions.get(&canonical_serial_port_name(port)) {
+        Some(description) => format!("{port}  \u{2014}  {description}"),
+        None => port.to_string(),
+    }
+}
+
+/// Maps the text chosen in the dropdown back to the port name it was built
+/// from. Falls back to `chosen` itself, so a plain port name also works.
+#[must_use]
+pub fn resolve_serial_port_label<S: std::hash::BuildHasher>(
+    chosen: &str,
+    ports: &[String],
+    descriptions: &std::collections::HashMap<String, String, S>,
+) -> String {
+    ports
+        .iter()
+        .find(|port| serial_port_label(port, descriptions) == chosen)
+        .cloned()
+        .unwrap_or_else(|| chosen.to_string())
+}
+
 static BLUETOOTH_SCAN_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Allows or forbids querying the OS Bluetooth stack when listing ports.
@@ -2510,6 +2640,138 @@ mod tests {
         );
         state.stop();
         assert!(!state.is_running());
+    }
+
+    // ---- serial port labels -------------------------------------------------
+
+    fn usb_type(product: Option<&str>, manufacturer: Option<&str>) -> serialport::SerialPortType {
+        serialport::SerialPortType::UsbPort(serialport::UsbPortInfo {
+            vid: 1,
+            pid: 2,
+            serial_number: None,
+            manufacturer: manufacturer.map(str::to_string),
+            product: product.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn describe_port_type_names_usb_devices() {
+        assert_eq!(
+            describe_port_type(&usb_type(Some("AirM2M Compo"), Some("AirM2M"))).as_deref(),
+            Some("AirM2M Compo (USB)")
+        );
+        assert_eq!(
+            describe_port_type(&usb_type(None, Some("FTDI"))).as_deref(),
+            Some("FTDI (USB)")
+        );
+        assert_eq!(
+            describe_port_type(&usb_type(Some("  "), None)).as_deref(),
+            Some("USB device (USB)")
+        );
+    }
+
+    #[test]
+    fn describe_port_type_covers_the_other_kinds() {
+        use serialport::SerialPortType;
+        assert_eq!(
+            describe_port_type(&SerialPortType::BluetoothPort).as_deref(),
+            Some("Bluetooth")
+        );
+        assert_eq!(
+            describe_port_type(&SerialPortType::PciPort).as_deref(),
+            Some("built-in")
+        );
+        assert_eq!(describe_port_type(&SerialPortType::Unknown), None);
+    }
+
+    #[test]
+    fn labels_round_trip_to_the_plain_port_name() {
+        let mut descriptions = std::collections::HashMap::new();
+        descriptions.insert(
+            canonical_serial_port_name("COM7"),
+            "Printer (USB)".to_string(),
+        );
+        let ports = vec!["COM5".to_string(), "COM7".to_string()];
+        let label = serial_port_label("COM7", &descriptions);
+        assert_eq!(label, "COM7  \u{2014}  Printer (USB)");
+        assert_eq!(serial_port_label("COM5", &descriptions), "COM5");
+        assert_eq!(
+            resolve_serial_port_label(&label, &ports, &descriptions),
+            "COM7"
+        );
+        assert_eq!(
+            resolve_serial_port_label("COM5", &ports, &descriptions),
+            "COM5"
+        );
+        // Something typed by hand that matches nothing is passed through.
+        assert_eq!(
+            resolve_serial_port_label("COM99", &ports, &descriptions),
+            "COM99"
+        );
+    }
+
+    #[test]
+    fn serial_port_descriptions_does_not_panic() {
+        let _ = serial_port_descriptions();
+    }
+
+    #[test]
+    fn port_descriptions_covers_described_ports_only() {
+        let ports = vec![
+            serialport::SerialPortInfo {
+                port_name: "COM4".to_string(),
+                port_type: usb_type(Some("AirM2M Compo"), None),
+            },
+            serialport::SerialPortInfo {
+                port_name: "COM9".to_string(),
+                port_type: serialport::SerialPortType::Unknown,
+            },
+        ];
+        let descriptions = port_descriptions(ports);
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(
+            descriptions[&canonical_serial_port_name("COM4")],
+            "AirM2M Compo (USB)"
+        );
+    }
+
+    #[test]
+    fn auto_selectable_ports_skip_bluetooth_incoming_ports() {
+        let mut descriptions = std::collections::HashMap::new();
+        descriptions.insert(
+            canonical_serial_port_name("COM7"),
+            "Bluetooth (incoming, not for GPS)".to_string(),
+        );
+        descriptions.insert(
+            canonical_serial_port_name("COM6"),
+            "BY80125B39 (Bluetooth)".to_string(),
+        );
+        let ports = vec!["COM4".to_string(), "COM6".to_string(), "COM7".to_string()];
+        let selectable = auto_selectable_ports(&ports, &descriptions);
+        assert_eq!(selectable, vec!["COM4".to_string(), "COM6".to_string()]);
+        // On Windows the highest-numbered port wins; that must not be COM7 here.
+        assert_ne!(
+            pick_default_nmea_serial_port(&selectable).as_deref(),
+            Some("COM7")
+        );
+    }
+
+    #[test]
+    fn a_device_named_incoming_is_still_selected_automatically() {
+        let mut descriptions = std::collections::HashMap::new();
+        descriptions.insert(
+            canonical_serial_port_name("COM6"),
+            "incoming GPS (Bluetooth)".to_string(),
+        );
+        descriptions.insert(
+            canonical_serial_port_name("COM7"),
+            crate::bt_com::INCOMING_DESCRIPTION.to_string(),
+        );
+        let ports = vec!["COM6".to_string(), "COM7".to_string()];
+        assert_eq!(
+            auto_selectable_ports(&ports, &descriptions),
+            vec!["COM6".to_string()]
+        );
     }
 
     // ---- GpsDataWatch / macOS USB filter ---------------------------------

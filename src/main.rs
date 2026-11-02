@@ -681,6 +681,9 @@ struct ThirdEyeState {
     nmea_gps: NmeaGpsState,
     nmea_serial_port_options: Vec<String>,
     nmea_serial_port_index: i32,
+    /// What the OS knows about each listed serial port (device name, kind),
+    /// keyed by canonical port name; shown next to the port in the dropdown.
+    nmea_serial_descriptions: std::collections::HashMap<String, String>,
     /// When the poll timer last rescanned for serial ports / Bluetooth GPS devices.
     nmea_serial_last_poll: Option<Instant>,
     viewport_anim: Option<ViewportAnimation>,
@@ -839,6 +842,7 @@ impl ThirdEyeState {
             nmea_gps: NmeaGpsState::default(),
             nmea_serial_port_options: Vec::new(),
             nmea_serial_port_index: -1,
+            nmea_serial_descriptions: std::collections::HashMap::new(),
             nmea_serial_last_poll: None,
             viewport_anim: None,
             auth,
@@ -1137,16 +1141,22 @@ fn apply_state_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
     ui.set_nmea_gps_port(state.config.nmea_gps_port.clone().into());
     ui.set_nmea_gps_mode(state.config.nmea_gps_mode.trim().parse().unwrap_or(0));
     ui.set_nmea_gps_protocol(state.config.nmea_gps_protocol.trim().parse().unwrap_or(0));
+    let serial_port_labels: Vec<String> = state
+        .nmea_serial_port_options
+        .iter()
+        .map(|port| {
+            third_eye_client::nmea::serial_port_label(port, &state.nmea_serial_descriptions)
+        })
+        .collect();
     let serial_port_model = VecModel::from(
-        state
-            .nmea_serial_port_options
+        serial_port_labels
             .iter()
-            .map(|port| slint::SharedString::from(port.as_str()))
+            .map(|label| slint::SharedString::from(label.as_str()))
             .collect::<Vec<_>>(),
     );
     ui.set_nmea_serial_port_options(ModelRc::new(serial_port_model));
     ui.set_nmea_serial_port_index(state.nmea_serial_port_index);
-    ui.set_nmea_serial_ports(state.nmea_serial_port_options.join(", ").into());
+    ui.set_nmea_serial_ports(serial_port_labels.join(", ").into());
     ui.set_nmea_serial_port(state.config.nmea_serial_port.clone().into());
     ui.set_nmea_server_host(state.config.nmea_server_host.clone().into());
     ui.set_nmea_server_port(state.config.nmea_server_port.clone().into());
@@ -2211,6 +2221,7 @@ fn collect_nmea_serial_candidates() -> Vec<String> {
 fn refresh_nmea_serial_candidates(state: &mut ThirdEyeState) -> bool {
     third_eye_client::nmea::set_bluetooth_scan_enabled(state.config.nmea_gps_mode.trim() == "2");
     let candidates = collect_nmea_serial_candidates();
+    state.nmea_serial_descriptions = third_eye_client::nmea::serial_port_descriptions();
     let mut selected = state.config.nmea_serial_port.trim().to_owned();
     if let Some(migrated) =
         third_eye_client::nmea::migrate_raw_bluetooth_port(&selected, &candidates)
@@ -2218,7 +2229,11 @@ fn refresh_nmea_serial_candidates(state: &mut ThirdEyeState) -> bool {
         selected = migrated;
     }
     if selected.is_empty() {
-        selected = pick_default_nmea_serial_port(&candidates).unwrap_or_default();
+        let selectable = third_eye_client::nmea::auto_selectable_ports(
+            &candidates,
+            &state.nmea_serial_descriptions,
+        );
+        selected = pick_default_nmea_serial_port(&selectable).unwrap_or_default();
     }
     let selected_index = find_nmea_serial_port_index(&candidates, &selected);
     if let Some(index) = selected_index {
@@ -4150,7 +4165,12 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         let Ok(mut state) = state_for_select_nmea_serial_port.try_borrow_mut() else {
             return;
         };
-        state.config.nmea_serial_port = port.to_string();
+        // The dropdown shows labels ("COM7 — Printer (USB)"); keep the plain port.
+        state.config.nmea_serial_port = third_eye_client::nmea::resolve_serial_port_label(
+            port.as_str(),
+            &state.nmea_serial_port_options,
+            &state.nmea_serial_descriptions,
+        );
         state.nmea_serial_port_index = find_nmea_serial_port_index(
             &state.nmea_serial_port_options,
             &state.config.nmea_serial_port,
@@ -4158,6 +4178,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         .map_or(-1, |index| index as i32);
         persist_config(&state, &store_for_select_nmea_serial_port);
         ui.set_nmea_serial_port_index(state.nmea_serial_port_index);
+        ui.set_nmea_serial_port(state.config.nmea_serial_port.clone().into());
     });
 
     let ui_weak = ui.as_weak();
@@ -5416,17 +5437,28 @@ fn main() -> Result<()> {
             {
                 state.nmea_serial_last_poll = Some(Instant::now());
                 let current = collect_nmea_serial_candidates();
-                if current != state.nmea_serial_port_options {
+                let descriptions = third_eye_client::nmea::serial_port_descriptions();
+                // A device name can turn up after its port did. The dropdown
+                // labels and the map that resolves them back to a port name
+                // must change together, so a new description refreshes the
+                // dropdown too.
+                let descriptions_changed = descriptions != state.nmea_serial_descriptions;
+                state.nmea_serial_descriptions = descriptions;
+                if current != state.nmea_serial_port_options || descriptions_changed {
                     let added = new_serial_ports(&state.nmea_serial_port_options, &current);
-                    if let Some(port) = added.first() {
-                        state.config.nmea_serial_port.clone_from(port);
+                    let selectable = third_eye_client::nmea::auto_selectable_ports(
+                        &added,
+                        &state.nmea_serial_descriptions,
+                    );
+                    if let Some(port) = pick_default_nmea_serial_port(&selectable) {
+                        state.config.nmea_serial_port.clone_from(&port);
                         ui.set_nmea_gps_status(format!("Detected {port}. Click Start GPS.").into());
                     }
                     state.nmea_serial_port_index =
                         find_nmea_serial_port_index(&current, &state.config.nmea_serial_port)
                             .map_or(-1, |i| i as i32);
                     state.nmea_serial_port_options = current;
-                    if !added.is_empty() {
+                    if !selectable.is_empty() {
                         persist_config(&state, &poll_store);
                     }
                     apply_state_to_ui(&ui, &state);

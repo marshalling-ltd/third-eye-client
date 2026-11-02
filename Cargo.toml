@@ -60,7 +60,7 @@ bluer = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm"] }
 tokio = { version = "1", features = ["rt", "time", "io-util", "macros"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Devices_Geolocation", "Foundation", "Win32_Networking_WinSock"] }
+windows = { version = "0.62", features = ["Devices_Geolocation", "Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 slint-build = "1.18.1"

@@ -16,6 +16,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod bluez;
+pub mod bt_com;
 pub mod bt_port;
 pub mod camera;
 pub mod formatting;
@@ -31,3 +32,5 @@ pub mod rtsp_forwarder;
 pub mod simulator;
 pub mod storage;
 pub mod update_check;
+#[cfg(target_os = "windows")]
+pub mod winports;

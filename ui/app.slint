@@ -477,7 +477,6 @@ export component AppWindow inherits Window {
                             height: 36px;
                             vertical-stretch: 0;
                             selected(current-value) => {
-                                root.nmea_serial_port = current-value;
                                 root.select_nmea_serial_port(current-value);
                             }
                         }
