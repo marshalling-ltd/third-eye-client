@@ -54,9 +54,11 @@ nav:
       - GPS on the map: guide/gps.md
       - Troubleshooting: guide/troubleshooting.md
   - Reference:
+      - Supported ROVs: reference/supported-rovs.md
       - Features: reference/features.md
       - Architecture: reference/architecture.md
   - Explanation:
+      - Why this project exists: explanation/why-this-project.md
       - How the app finds the ROV: explanation/finding-the-rov.md
       - How position gets onto the map: explanation/gps-and-position.md
       - Working offline: explanation/offline-and-storage.md

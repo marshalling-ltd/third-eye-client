@@ -16,7 +16,7 @@ Changes since `v0.1.12`.
 
 - Paired Bluetooth GPS receivers are listed as `bt://…` on macOS and Linux and connect without extra setup (`rfcomm bind` is not needed).
 - USB GPS receivers are listed alongside them, with a hint when a port sends nothing useful.
-- The Geoastra X8-M1 should be used over Bluetooth on macOS.
+- Bluetooth and USB GPS support is generic for NMEA receivers and has been tested on hardware with one receiver, the Geoastra X8-M1.
 
 ### Tooling
 

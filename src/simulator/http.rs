@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +17,9 @@ pub const DEFAULT_HTTP_PORT: u16 = 8080;
 
 struct State {
     dir: PathBuf,
+    /// Photos created by `POST /v1/capture`; kept out of the samples directory.
+    captured_dir: PathBuf,
+    captures: AtomicU32,
     brightness: Mutex<i64>,
     /// Names "deleted" via the API. Files on disk are never touched.
     deleted: Mutex<HashSet<String>>,
@@ -75,8 +78,9 @@ fn is_video(name: &str) -> bool {
 
 fn list_files(state: &State) -> Vec<(String, u64)> {
     let deleted = state.deleted.lock().expect("lock");
-    let mut files: Vec<(String, u64)> = std::fs::read_dir(&state.dir)
+    let mut files: Vec<(String, u64)> = [&state.dir, &state.captured_dir]
         .into_iter()
+        .flat_map(std::fs::read_dir)
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|e| {
@@ -129,6 +133,56 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
+/// Renders a synthetic 1920x1080 JPEG; `seed` shifts the colours so shots differ.
+fn synthetic_jpeg(seed: u32) -> Result<Vec<u8>> {
+    let img = image::RgbImage::from_fn(1920, 1080, |x, y| {
+        let s = seed.wrapping_mul(53);
+        image::Rgb([
+            ((x / 8 + s) % 256) as u8,
+            ((y / 5 + s * 2) % 256) as u8,
+            (((x + y) / 12 + s * 3) % 256) as u8,
+        ])
+    });
+    let mut out = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut out),
+        image::ImageFormat::Jpeg,
+    )?;
+    Ok(out)
+}
+
+/// Stores `burst` new photos in the format the client asked for.
+fn capture(state: &State, body: &Value) -> Result<()> {
+    let format = body.get("format").and_then(Value::as_str).unwrap_or("JPEG");
+    let burst = body
+        .get("burst")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 5);
+    // Real ROV names are timestamps. Time-based names also stay unique across
+    // simulator restarts, which the client relies on to spot the new photo.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for _ in 0..burst {
+        let n = state.captures.fetch_add(1, Ordering::Relaxed) + 1;
+        if format.contains("JPEG") {
+            std::fs::write(
+                state.captured_dir.join(format!("sim-{stamp}-{n:02}.jpeg")),
+                synthetic_jpeg(n)?,
+            )?;
+        }
+        if format.contains("DNG") {
+            // Placeholder bytes: the simulator cannot produce a real raw file.
+            std::fs::write(
+                state.captured_dir.join(format!("sim-{stamp}-{n:02}.dng")),
+                [0u8; 1024],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Parses `bytes=start-end` into an inclusive range clamped to `len`.
 fn parse_range(value: &str, len: u64) -> Option<(u64, u64)> {
     let spec = value.strip_prefix("bytes=")?;
@@ -152,7 +206,11 @@ fn download(state: &State, name: &str, range: Option<&str>) -> Response<Body> {
     if !list_files(state).iter().any(|(n, _)| n == name) {
         return error(404, "media not found");
     }
-    let Ok(mut file) = File::open(state.dir.join(name)) else {
+    let path = [&state.dir, &state.captured_dir]
+        .into_iter()
+        .map(|d| d.join(name))
+        .find(|p| p.is_file());
+    let Some(Ok(mut file)) = path.map(File::open) else {
         return error(500, "cannot open media");
     };
     let len = file.metadata().map_or(0, |m| m.len());
@@ -208,8 +266,11 @@ fn route(state: &State, req: &mut Request) -> Response<Body> {
 
     match (req.method().clone(), segs.as_slice()) {
         (Method::Post, ["v1", "capture"]) => {
-            let _ = read_json(req);
-            json_response(201, &json!({"status": 0, "msg": "success", "data": null}))
+            let body = read_json(req);
+            match capture(state, &body) {
+                Ok(()) => json_response(201, &json!({"status": 0, "msg": "success", "data": null})),
+                Err(e) => error(500, &format!("capture failed: {e}")),
+            }
         }
         (Method::Get, ["v1", "lamp"]) => {
             let b = *state.brightness.lock().expect("lock");
@@ -274,8 +335,13 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("failed to bind HTTP server on {bind_host}:{port}"))?,
     );
+    let captured_dir =
+        std::env::temp_dir().join(format!("chasing-simulator-captures-{}", std::process::id()));
+    std::fs::create_dir_all(&captured_dir).context("failed to create captures directory")?;
     let state = Arc::new(State {
         dir: samples_dir.to_owned(),
+        captured_dir: captured_dir.clone(),
+        captures: AtomicU32::new(0),
         brightness: Mutex::new(50),
         deleted: Mutex::new(HashSet::new()),
     });
@@ -296,5 +362,6 @@ pub fn run(
             let _ = req.respond(resp);
         });
     }
+    let _ = std::fs::remove_dir_all(&captured_dir);
     Ok(())
 }

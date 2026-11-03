@@ -6,10 +6,13 @@
 |---|---|---|
 | 📡 **UDP telemetry** | `127.0.0.1:8500` | Synthetic status packets (same generator as `test-udp-server`) |
 | 🎥 **RTSP video** | `rtsp://admin:admin@127.0.0.1:8554/stream/0/0` | Loops the first `.mp4` in `samples/` (credentials are not checked) |
-| 🌐 **Camera HTTP API** | `http://127.0.0.1:8080` | `/v1/capture`, `/v1/lamp`, `/v1/medias` (list, info, download with Range support, delete), backed by the files in `samples/` |
+| 🌐 **Camera HTTP API** | `http://127.0.0.1:8080` | `/v1/capture` (creates synthetic 1920x1080 JPEGs, honouring `burst`; a `DNG` request adds a placeholder file that is not a real raw image), `/v1/lamp`, `/v1/medias` (list, info, download with Range support, delete), backed by the files in `samples/` |
 
 !!! note
-    Deleting only hides a file for the session; nothing is removed from disk.
+    Deleting only hides a file for the session; nothing is removed from disk. Captured photos live in a temporary directory that is removed when the simulator stops.
+
+!!! warning
+    The simulator is not a real ROV. It does not reproduce real camera timing, multi-camera errors or real DNG files, so it cannot prove that photo and video download work on a real ROV.
 
 **Prerequisites:** `ffmpeg` and [`mediamtx`](https://github.com/bluenviron/mediamtx) on `PATH` (mediamtx is the RTSP server, since ffmpeg cannot serve RTSP on its own).
 

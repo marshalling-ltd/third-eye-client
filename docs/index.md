@@ -22,6 +22,10 @@ It shows the **live camera** from the ROV, lets you **take photos and videos**, 
 
 </div>
 
+![BioProtect](assets/bioprotect-logo.webp){ width="120" align="right" }
+
+Built as a helper for [BioProtect](https://bioprotect-project.eu/about/), with the goal of making ROVs of any make work for free. See [why this project exists](explanation/why-this-project.md).
+
 ## Where to start
 
 !!! tip "New here?"

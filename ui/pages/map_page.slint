@@ -19,7 +19,7 @@ export struct NearbyPin {
     kind: int,
 }
 
-// Full-bleed device map screen (OpenStreetMap tiles + ROV/phone GPS pin).
+// Full-bleed device map screen (OpenStreetMap tiles + ROV/GPS pin).
 //
 // Extracted verbatim from the original monolithic app.slint (Phase 2 of the
 // native desktop UI/UX blueprint). Every property/callback below already
@@ -60,7 +60,7 @@ export component MapPage inherits Rectangle {
     callback map_pinch_zoom_update(float, length, length, length, length, length, length);
     callback map_pinch_zoom_end();
     callback center_map_on_pin(length, length, length, length);
-    // Jumps to the Phone GPS screen, fired by tapping the NMEA status badge so
+    // Jumps to the GPS screen, fired by tapping the GPS status badge so
     // the GPS source can be configured from where its status is shown.
     callback navigate_nmea();
 
@@ -441,7 +441,7 @@ export component MapPage inherits Rectangle {
             }
         }
 
-        // NMEA status badge – bottom-left. Tappable: it's the place the user
+        // GPS status badge – bottom-left. Tappable: it's the place the user
         // looks to see whether GPS is working, so it's also the most useful
         // place to start fixing it from.
         Rectangle {
@@ -458,7 +458,7 @@ export component MapPage inherits Rectangle {
             animate background { duration: 120ms; }
 
             Text {
-                text: "NMEA";
+                text: "GPS";
                 color: #8f96a3;
                 font-size: 9px;
                 x: 8px;

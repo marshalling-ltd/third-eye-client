@@ -68,7 +68,7 @@ sequenceDiagram
     S->>DB: save auth_session + http_cookies
 
     Note over UI,P: Authenticated call (devices, nearby search)
-    UI->>W: refresh devices / open Device Map
+    UI->>W: refresh devices / open Map
     W->>S: call(endpoint)
     opt token expired or unknown
         S->>P: POST /api/v1/account/refresh-access-token (cookie)
@@ -101,7 +101,7 @@ sequenceDiagram
 |---|---|---|
 | Account | `POST /api/v1/account/login`, `POST /api/v1/account/refresh-access-token`, `GET /api/v1/account/logout` | Refresh token lives only in the `HttpOnly` cookie |
 | Devices | `GET` / `POST /api/v1/devices`, `GET` / `PATCH` / `DELETE /api/v1/devices/{id}`, `GET /api/v1/profile/info` | Typed client from `generated/`; edits are optimistic-locked via `concurrency` |
-| Nearby | `POST /api/v1/search` (`aoi`, `poi`, `intermagnet_analysis`) | Hand-written client; re-fetched while the Device Map is open |
+| Nearby | `POST /api/v1/search` (`aoi`, `poi`, `intermagnet_analysis`) | Hand-written client; re-fetched while the Map is open |
 
 The `rest_outbox` table and its retry worker are in place for writes that must survive a crash or restart, but no feature enqueues into it yet.
 

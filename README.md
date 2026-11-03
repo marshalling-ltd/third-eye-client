@@ -21,11 +21,31 @@ Built with Rust 🦀 and [Slint](https://slint.dev/) — native GUI on macOS, Wi
 
 It shows the live camera from the ROV, lets you take photos and videos, and puts your position on a map from a GPS at the surface.
 
+## 🌊 Why this exists: BioProtect
+
+<img src="assets/bioprotect-logo.webp" alt="BioProtect logo" width="160" align="right">
+
+third-eye-client is a helper for [BioProtect](https://bioprotect-project.eu/about/), a Horizon Europe project under the EU Mission Ocean and Waters. BioProtect develops ecosystem-based tools to speed up the protection and restoration of marine biodiversity in European seas, and looking at what is on the seabed is part of that work.
+
+The idea behind this repository is to bring **ROVs of any make into one public project and make them work for free, all the time**. The app is open source (GPL-3.0), so anyone monitoring the sea can use it, and anyone can add support for another ROV.
+
+It has been used in BioProtect's [Croatian associated region](https://bioprotect-project.eu/associated-regions/croatia-2/) (Lumbarda, on the island of Korčula). More on the [why](https://marshalling-ltd.github.io/third-eye-client/explanation/why-this-project/) and on [supported ROVs](https://marshalling-ltd.github.io/third-eye-client/reference/supported-rovs/) is in the docs.
+
+### Supported ROVs
+
+| ROV | Status |
+|---|---|
+| **Chasing M2S** | Supported. Tested with a real ROV on macOS; Linux and Windows are tested against the simulator only so far. |
+| Other Chasing models and firmware | Expected to work, not verified. |
+| Other makes | Wanted. [Open an issue](https://github.com/marshalling-ltd/third-eye-client/issues/new) with your ROV's documentation and we will support it; we build a simulator for it first. See [how](https://marshalling-ltd.github.io/third-eye-client/reference/supported-rovs/#request-support-for-your-rov). |
+
+For development without hardware there is a [`chasing-simulator`](https://marshalling-ltd.github.io/third-eye-client/development/simulator/) that stands in for a Chasing ROV (telemetry, video, camera API). It is not a real ROV, so it cannot prove everything works on one.
+
 | | Where to look |
 |---|---|
 | 🧭 **Using the app** | [Install](https://marshalling-ltd.github.io/third-eye-client/guide/install/), [connect to the ROV](https://marshalling-ltd.github.io/third-eye-client/guide/connect/), [GPS](https://marshalling-ltd.github.io/third-eye-client/guide/gps/), [troubleshooting](https://marshalling-ltd.github.io/third-eye-client/guide/troubleshooting/) |
-| 🧱 **Reference** | [Features](https://marshalling-ltd.github.io/third-eye-client/reference/features/), [architecture](https://marshalling-ltd.github.io/third-eye-client/reference/architecture/) |
-| 💡 **Explanation** | [How the app finds the ROV](https://marshalling-ltd.github.io/third-eye-client/explanation/finding-the-rov/), [how position gets onto the map](https://marshalling-ltd.github.io/third-eye-client/explanation/gps-and-position/), [working offline](https://marshalling-ltd.github.io/third-eye-client/explanation/offline-and-storage/) |
+| 🧱 **Reference** | [Supported ROVs](https://marshalling-ltd.github.io/third-eye-client/reference/supported-rovs/), [features](https://marshalling-ltd.github.io/third-eye-client/reference/features/), [architecture](https://marshalling-ltd.github.io/third-eye-client/reference/architecture/) |
+| 💡 **Explanation** | [Why this project exists](https://marshalling-ltd.github.io/third-eye-client/explanation/why-this-project/), [how the app finds the ROV](https://marshalling-ltd.github.io/third-eye-client/explanation/finding-the-rov/), [how position gets onto the map](https://marshalling-ltd.github.io/third-eye-client/explanation/gps-and-position/), [working offline](https://marshalling-ltd.github.io/third-eye-client/explanation/offline-and-storage/) |
 | 🛠️ **Development** | [Contributing](https://marshalling-ltd.github.io/third-eye-client/development/contributing/), [building and testing](https://marshalling-ltd.github.io/third-eye-client/development/building/), [ROV simulator](https://marshalling-ltd.github.io/third-eye-client/development/simulator/), [release process](https://marshalling-ltd.github.io/third-eye-client/development/release/) |
 
 ## 📥 Installing

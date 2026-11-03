@@ -66,7 +66,7 @@ export component TopBar inherits Rectangle {
     callback navigate_nmea();
 
     // Draws the bar directly over the page content instead of above it, used by
-    // the full-bleed Device Map so the map runs edge to edge and the logo sits
+    // the full-bleed Map so the map runs edge to edge and the logo sits
     // on the tiles. Drops the bar's own background and separator; the icon
     // buttons gain their own backdrops so they stay legible over light tiles.
     in property <bool> overlay: false;
@@ -186,7 +186,7 @@ export component TopBar inherits Rectangle {
                 spacing: 2px;
 
                 NavMenuItem {
-                    label: "Device Map";
+                    label: "Map";
                     active: root.active_screen == 0;
                     activated => { root.navigate_map(); nav_popup.close(); }
                 }
@@ -201,7 +201,7 @@ export component TopBar inherits Rectangle {
                     activated => { root.navigate_media(); nav_popup.close(); }
                 }
                 NavMenuItem {
-                    label: "Phone GPS";
+                    label: "GPS";
                     active: root.active_screen == 3;
                     activated => { root.navigate_nmea(); nav_popup.close(); }
                 }
