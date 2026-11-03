@@ -1,8 +1,10 @@
 # third-eye-client
 
-**Cross-platform desktop client for Chasing underwater ROVs.**
+**Cross-platform desktop client for underwater ROVs.**
 
 Built with Rust and [Slint](https://slint.dev/), as a native app on macOS, Windows and Linux.
+
+Chasing ROVs are supported today, and the goal is to support ROVs of any make. See [Supported ROVs](reference/supported-rovs.md).
 
 It shows the **live camera** from the ROV, lets you **take photos and videos**, and puts your position on a **map**, even though the ROV itself is underwater and cannot see GPS satellites.
 

@@ -4,7 +4,7 @@
 
 # third-eye-client
 
-**Cross-platform desktop client for Chasing underwater ROVs**
+**Cross-platform desktop client for underwater ROVs**
 
 Built with Rust 🦀 and [Slint](https://slint.dev/) — native GUI on macOS, Windows and Linux.
 
