@@ -511,7 +511,7 @@ impl NmeaGpsState {
         self.latest_fix = None;
         self.fixes_received = 0;
         self.last_fix_at_ms = 0;
-        self.status = format!("Connecting to phone GPS server at {addr}...");
+        self.status = format!("Connecting to GPS server at {addr}...");
         Ok(self.status.clone())
     }
 
@@ -569,7 +569,7 @@ impl NmeaGpsState {
         self.latest_fix = None;
         self.fixes_received = 0;
         self.last_fix_at_ms = 0;
-        self.status = format!("Listening for phone GPS on {bind_addr}...");
+        self.status = format!("Listening for GPS on {bind_addr}...");
 
         Ok(self.status.clone())
     }
@@ -857,15 +857,13 @@ fn nmea_tcp_worker(
     // Non-blocking accept so we can check the stop flag periodically.
     let _ = listener.set_nonblocking(true);
     let _ = tx.send(NmeaGpsEvent::Status(format!(
-        "Listening for phone GPS on {addr}. Configure GPS2IP as TCP client pointing here."
+        "Listening for GPS on {addr}. Configure GPS2IP as TCP client pointing here."
     )));
 
     while !stop.load(Ordering::Relaxed) {
         let stream = match listener.accept() {
             Ok((stream, peer)) => {
-                let _ = tx.send(NmeaGpsEvent::Status(format!(
-                    "Phone GPS connected from {peer}."
-                )));
+                let _ = tx.send(NmeaGpsEvent::Status(format!("GPS connected from {peer}.")));
                 stream
             }
             Err(err)
@@ -910,7 +908,7 @@ fn nmea_tcp_worker(
                 }
                 Err(err) => {
                     let _ = tx.send(NmeaGpsEvent::Status(format!(
-                        "Phone GPS disconnected ({err}). Waiting for reconnect on {addr}..."
+                        "GPS disconnected ({err}). Waiting for reconnect on {addr}..."
                     )));
                     break;
                 }
@@ -943,13 +941,13 @@ fn nmea_tcp_client_worker(
         ) {
             Ok(s) => {
                 let _ = tx.send(NmeaGpsEvent::Status(format!(
-                    "Connected to phone GPS server at {addr}."
+                    "Connected to GPS server at {addr}."
                 )));
                 s
             }
             Err(err) => {
                 let _ = tx.send(NmeaGpsEvent::Status(format!(
-                    "Cannot reach phone GPS server at {addr}: {err}. Retrying in 3s..."
+                    "Cannot reach GPS server at {addr}: {err}. Retrying in 3s..."
                 )));
                 // Sleep in small increments so we can check the stop flag.
                 for _ in 0..15 {
@@ -989,7 +987,7 @@ fn nmea_tcp_client_worker(
                 }
                 Err(err) => {
                     let _ = tx.send(NmeaGpsEvent::Status(format!(
-                        "Phone GPS server disconnected ({err}). Reconnecting to {addr}..."
+                        "GPS server disconnected ({err}). Reconnecting to {addr}..."
                     )));
                     break;
                 }
@@ -2163,6 +2161,84 @@ mod tests {
             state.latest_location().is_some(),
             "client worker should read at least one fix"
         );
+    }
+
+    /// Closes `stream` with a reset (RST) instead of a clean FIN, which makes
+    /// the peer's next read fail with a connection error.
+    fn reset_and_close(stream: std::net::TcpStream) {
+        let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+        drop(stream);
+    }
+
+    fn wait_for_status(rx: &mpsc::Receiver<NmeaGpsEvent>, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        std::iter::from_fn(|| {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            rx.recv_timeout(left).ok()
+        })
+        .any(|event| matches!(event, NmeaGpsEvent::Status(text) if text.contains(needle)))
+    }
+
+    #[test]
+    fn tcp_server_worker_reports_a_dropped_connection() {
+        use std::net::{TcpListener, TcpStream};
+
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let (addr, stop) = (addr.clone(), Arc::clone(&stop));
+            thread::spawn(move || nmea_tcp_worker(addr, stop, tx, GpsProtocol::Nmea))
+        };
+        assert!(wait_for_status(&rx, "Listening for GPS"));
+        reset_and_close(TcpStream::connect(&addr).unwrap());
+        assert!(wait_for_status(&rx, "GPS connected from"));
+        assert!(wait_for_status(&rx, "GPS disconnected"));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_client_worker_reports_an_unreachable_server() {
+        use std::net::TcpListener;
+
+        // A port with nothing listening on it.
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || nmea_tcp_client_worker(addr, stop, tx, GpsProtocol::Nmea))
+        };
+        assert!(wait_for_status(&rx, "Cannot reach GPS server"));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_client_worker_reports_a_dropped_server() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let (addr, stop) = (addr.clone(), Arc::clone(&stop));
+            thread::spawn(move || nmea_tcp_client_worker(addr, stop, tx, GpsProtocol::Nmea))
+        };
+        let (peer, _) = listener.accept().unwrap();
+        assert!(wait_for_status(&rx, "Connected to GPS server"));
+        reset_and_close(peer);
+        assert!(wait_for_status(&rx, "GPS server disconnected"));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
     }
 
     // ---- pump_nmea_lines (serial read-loop seam) --------------------------

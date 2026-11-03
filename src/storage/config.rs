@@ -28,6 +28,8 @@ pub mod keys {
     pub const NMEA_GPS_PROTOCOL: &str = "client.nmea_gps_protocol";
     pub const USE_SAVED_MAP_TILES: &str = "client.use_saved_map_tiles";
     pub const MAX_TILE_STORAGE_MB: &str = "client.max_tile_storage_mb";
+    pub const ROV_HTTP_CONNECT_TIMEOUT_MS: &str = "client.rov_http_connect_timeout_ms";
+    pub const ROV_HTTP_REQUEST_TIMEOUT_MS: &str = "client.rov_http_request_timeout_ms";
 }
 
 /// Persisted configuration accessor.
@@ -166,9 +168,9 @@ pub struct ClientConfig {
     /// connections to. Uses `IP_BOUND_IF` on macOS and `SO_BINDTODEVICE` on
     /// Linux. Empty means the OS chooses the interface.
     pub rov_network_interface: String,
-    /// Phone GPS (NMEA) TCP listen port as string. Default `"11123"`.
+    /// GPS (NMEA) TCP listen port as string. Default `"11123"`.
     pub nmea_gps_port: String,
-    /// Phone GPS mode: `"0"` = Auto (BT/TCP listen), `"1"` = Connect to server.
+    /// GPS mode: `"0"` = Auto (BT/TCP listen), `"1"` = Connect to server.
     pub nmea_gps_mode: String,
     /// Serial port for Bluetooth/USB GPS mode (e.g. `COM7`, `/dev/cu.usbserial-1420`).
     pub nmea_serial_port: String,

@@ -25,7 +25,7 @@ Three separate things have to work, and they fail independently:
 2. **Data** arriving over it. Some receivers expose several USB ports and only one carries position sentences; the app warns after about 10 seconds if a port sends nothing useful.
 3. **A fix**. A receiver indoors can be connected, sending data, and still have no position because it cannot see the satellites.
 
-The **NMEA** badge on the map shows the result: amber `..` means running without a position yet, green **OK** means a fix, red `--` means off. Positions that stop updating are treated as stale after a timeout (default 10 s).
+The **GPS** badge on the map shows the result: amber `..` means running without a position yet, green **OK** means a fix, red `--` means off. Positions that stop updating are treated as stale after a timeout (default 10 s).
 
 ## Fresh coordinates for photos
 

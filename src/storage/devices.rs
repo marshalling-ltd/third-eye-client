@@ -222,7 +222,7 @@ impl DevicesClient {
 /// (`device_handler_api`) is the source of truth for the device list, but
 /// the local cache (a) lets Profile > Devices show something before the
 /// first network refresh completes and (b) durably remembers the user's
-/// active-device choice, which the Live Stream / Device Map screens depend
+/// active-device choice, which the Live Stream / Map screens depend
 /// on even if the server is briefly unreachable.
 #[derive(Clone)]
 pub struct DeviceCacheStore {

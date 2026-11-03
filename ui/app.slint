@@ -20,7 +20,7 @@ export component AppWindow inherits Window {
     in-out property <int> active_screen: 0;
     // Read-only mirror of content_panel's actual laid-out size, polled from
     // Rust at startup to kick off an initial navigate_map() call when
-    // Device Map is the default screen (see fn main()'s timer). A `changed`
+    // Map is the default screen (see fn main()'s timer). A `changed`
     // callback on content_panel's width doesn't work for this: it only
     // fires on subsequent changes, not for the first layout pass's value.
     out property <length> content_panel_width: content_panel.width;
@@ -36,7 +36,7 @@ export component AppWindow inherits Window {
     in-out property <string> rov_info;
     in-out property <string> local_network_info;
 
-    // Phone GPS (NMEA/TAIP — auto-detects Bluetooth or TCP).
+    // GPS (NMEA/TAIP — auto-detects Bluetooth or TCP).
     in-out property <string> nmea_gps_port;
     in-out property <string> nmea_gps_status;
     in-out property <bool> nmea_gps_running: false;
@@ -84,7 +84,7 @@ export component AppWindow inherits Window {
     in-out property <string> devices_status;
     in-out property <bool> device_action_in_progress: false;
     // Id of the locally-persisted active device (see storage::devices::DeviceCacheStore).
-    // Drives Device Map / Live Stream RTSP settings and keeps working offshore
+    // Drives Map / Live Stream RTSP settings and keeps working offshore
     // with no internet access to the third-eye server.
     in-out property <string> device_active_id;
     // Display name of the active device (empty when none is set). Shown as
@@ -153,7 +153,7 @@ export component AppWindow inherits Window {
     in-out property <string> lat_lon_text;
     in-out property <string> zoom_text;
     in property <[MapTile]> map_tiles;
-    // Live "what's around you" overlay for Device Map (AOI/POI/Intermagnet
+    // Live "what's around you" overlay for Map (AOI/POI/Intermagnet
     // analysis pins pulled from `/api/v1/search`).
     in property <[NearbyPin]> nearby_pins;
     in-out property <length> map_pin_world_x: 0px;
@@ -288,7 +288,7 @@ export component AppWindow inherits Window {
             height: parent.height - self.y;
             background: #202328;
 
-            // Phone GPS screen
+            // GPS screen
             if root.active_screen == 3 : ScrollView {
                 content-width: self.visible-width;
 
@@ -300,7 +300,7 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     vertical-stretch: 0;
                     Text {
-                        text: "Phone GPS";
+                        text: "GPS";
                         font-size: 24px;
                     }
                     Text {
@@ -534,13 +534,13 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         Button {
                             horizontal-stretch: 1;
-                            text: "Start Phone GPS";
+                            text: "Start GPS";
                             enabled: !root.nmea_gps_running;
                             clicked => { root.start_nmea_gps(); }
                         }
                         Button {
                             horizontal-stretch: 1;
-                            text: "Stop Phone GPS";
+                            text: "Stop GPS";
                             enabled: root.nmea_gps_running;
                             clicked => { root.stop_nmea_gps(); }
                         }
@@ -741,7 +741,7 @@ export component AppWindow inherits Window {
             x: 0;
             y: 0;
             width: parent.width;
-            // Transparent and floating over the Device Map / Live Stream;
+            // Transparent and floating over the Map / Live Stream;
             // a solid bar everywhere else.
             overlay: root.active_screen == 0 || root.active_screen == 1;
             auth_is_signed_in: root.auth_is_signed_in;

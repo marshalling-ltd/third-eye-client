@@ -5,7 +5,7 @@
 -- Profile > Devices screen has something to show before the first refresh
 -- completes) and, more importantly, a durable record of which device the
 -- user has chosen as their *active* device. The active device drives the
--- Live Stream / Device Map screens (its `configuration_json`, when present,
+-- Live Stream / Map screens (its `configuration_json`, when present,
 -- seeds the RTSP/ROV HTTP settings), so this choice must survive restarts
 -- even if the server is briefly unreachable.
 

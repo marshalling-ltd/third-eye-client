@@ -6,6 +6,19 @@ use std::fmt::Write;
 use std::net::IpAddr;
 use std::time::Duration;
 
+/// `true` when `base_url` points at this machine.
+fn is_loopback_base(base_url: &str) -> bool {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .is_some_and(|h| {
+            h.eq_ignore_ascii_case("localhost")
+                || h.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// Request timeout for `CameraApiClient`. Without this, a `reqwest` blocking
 /// client has no timeout at all: an unreachable ROV (interface not yet
 /// routed, ARP not resolved, wrong subnet) leaves the request hanging
@@ -13,6 +26,44 @@ use std::time::Duration;
 /// `main.rs` before starting the live stream) call this synchronously on the
 /// UI thread, so an unbounded hang there freezes the whole app.
 const CAMERA_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A media download streams a whole photo or video, so it gets far longer than
+/// a control call. The connect timeout still applies, so an unreachable ROV
+/// fails fast.
+const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Connect and request timeouts for [`CameraApiClient`], from the device's
+/// `http.connectTimeoutMs` / `http.requestTimeoutMs` configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CameraTimeouts {
+    pub connect: Duration,
+    pub request: Duration,
+}
+
+impl Default for CameraTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: CAMERA_HTTP_TIMEOUT,
+            request: CAMERA_HTTP_TIMEOUT,
+        }
+    }
+}
+
+impl CameraTimeouts {
+    /// Builds timeouts from millisecond settings; unset or zero values keep
+    /// the default.
+    #[must_use]
+    pub fn from_millis(connect_ms: Option<u64>, request_ms: Option<u64>) -> Self {
+        let pick = |ms: Option<u64>| {
+            ms.filter(|&v| v > 0)
+                .map_or(CAMERA_HTTP_TIMEOUT, Duration::from_millis)
+        };
+        Self {
+            connect: pick(connect_ms),
+            request: pick(request_ms),
+        }
+    }
+}
 
 /// Photo format accepted by the camera's `/v1/capture` endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -311,7 +362,23 @@ impl CameraApiClient {
     #[must_use]
     #[allow(unused_variables)]
     pub fn new_bound(base_url: String, interface: Option<&str>) -> Self {
-        let mut builder = Client::builder().timeout(CAMERA_HTTP_TIMEOUT);
+        Self::new_bound_with(base_url, interface, CameraTimeouts::default())
+    }
+
+    /// Like [`Self::new_bound`], with explicit timeouts.
+    #[must_use]
+    #[allow(unused_variables)]
+    pub fn new_bound_with(
+        base_url: String,
+        interface: Option<&str>,
+        timeouts: CameraTimeouts,
+    ) -> Self {
+        // A loopback camera (the simulator) is not behind the ROV link, and a
+        // socket bound to a physical interface cannot reach it.
+        let interface = interface.filter(|_| !is_loopback_base(&base_url));
+        let mut builder = Client::builder()
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.request);
         #[cfg(unix)]
         if let Some(iface) = interface {
             builder = builder.interface(iface);
@@ -445,6 +512,7 @@ impl CameraApiClient {
         let response = self
             .http
             .get(url)
+            .timeout(MEDIA_DOWNLOAD_TIMEOUT)
             .send()
             .context("download media request failed")?;
         let status = response.status();
@@ -624,6 +692,31 @@ fn local_ipv4_for_interface(name: &str) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timeouts_fall_back_to_the_default_when_unset_or_zero() {
+        let t = super::CameraTimeouts::from_millis(Some(5000), Some(0));
+        assert_eq!(t.connect, std::time::Duration::from_millis(5000));
+        assert_eq!(t.request, super::CAMERA_HTTP_TIMEOUT);
+        assert_eq!(
+            super::CameraTimeouts::from_millis(None, None),
+            super::CameraTimeouts::default()
+        );
+    }
+
+    #[test]
+    fn loopback_bases_are_detected() {
+        for base in [
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://[::1]:8080",
+        ] {
+            assert!(super::is_loopback_base(base), "{base}");
+        }
+        for base in ["http://192.168.1.88", "http://rov.local", "not a url"] {
+            assert!(!super::is_loopback_base(base), "{base}");
+        }
+    }
+
     use reqwest::StatusCode;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

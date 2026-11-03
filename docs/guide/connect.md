@@ -7,7 +7,7 @@
 
 ## Step 0: Read the ROV's own manual first
 
-Before touching the app, read the **operation manual that came with your Chasing M2S**. Learn how to:
+Before touching the app, read the **operation manual that came with your Chasing ROV**. Learn how to:
 
 - charge and power the ROV on and off,
 - attach the tether cable safely,

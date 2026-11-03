@@ -1,6 +1,6 @@
 //! Nearby-resources search against the third-eye server's `POST
 //! /api/v1/search` endpoint (`aoi`/`poi`/`intermagnet_analysis`), used to
-//! surface situational context ("what's around you") on the Device Map
+//! surface situational context ("what's around you") on the Map
 //! screen.
 //!
 //! This deliberately does **not** use the generated OpenAPI client
@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::api::{ApiError, ApiSession, BACKEND_HTTP_TIMEOUT};
 
 /// Default search radius, in meters, used when pulling nearby resources for
-/// the Device Map screen. The OpenAPI schema doesn't document units for `r`;
+/// the Map screen. The OpenAPI schema doesn't document units for `r`;
 /// this is an assumption, easy to tune once confirmed against the web app.
 pub const DEFAULT_SEARCH_RADIUS_M: f64 = 5000.0;
 

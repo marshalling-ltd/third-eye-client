@@ -45,7 +45,9 @@ use map::{
 use reqwest::Url;
 use serde::Deserialize;
 use slint::{ComponentHandle, ModelRc, VecModel};
-use third_eye_client::camera::{CameraApiClient, MediaInfo, MediaScene, PhotoFormat};
+use third_eye_client::camera::{
+    CameraApiClient, CameraTimeouts, MediaInfo, MediaScene, PhotoFormat,
+};
 use third_eye_client::formatting::{
     build_media_download_url, format_bytes, format_epoch_ms_datetime, format_relative_age,
     is_image_name, is_video_name, parse_stale_timeout_ms,
@@ -67,7 +69,7 @@ use third_eye_client::rov_status::{
 use third_eye_client::rtsp_forwarder::{RtspForwarder, http_host_header, start_url_forwarder};
 use third_eye_client::storage::AppStore;
 use third_eye_client::storage::api::ApiError;
-use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults};
+use third_eye_client::storage::config::{ClientConfig, ClientConfigDefaults, keys as config_keys};
 use third_eye_client::storage::devices::DeviceSummary;
 use third_eye_client::storage::media::{
     CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, build_capture_text,
@@ -95,7 +97,7 @@ const GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/marshalling-ltd/third-eye-client/releases?per_page=30";
 const UPDATE_CHECK_USER_AGENT: &str = "third-eye-client-update-check";
 const AUTO_UPDATE_CHECK_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
-// How often the Device Map screen re-fetches nearby AOI/POI/Intermagnet
+// How often the Map screen re-fetches nearby AOI/POI/Intermagnet
 // resources from the server while it stays open (see `maybe_start_nearby_fetch`).
 const NEARBY_REFRESH_INTERVAL_MS: i64 = 60_000;
 // How often a signed-in but idle app exercises its refresh cookie to keep the
@@ -252,9 +254,9 @@ impl AppConfig {
         let port_text = self.nmea_gps_port.trim();
         let port = port_text
             .parse::<u16>()
-            .context("NMEA GPS port must be a number between 1 and 65535")?;
+            .context("GPS port must be a number between 1 and 65535")?;
         if port == 0 {
-            anyhow::bail!("NMEA GPS port must be between 1 and 65535");
+            anyhow::bail!("GPS port must be between 1 and 65535");
         }
         Ok(port)
     }
@@ -453,7 +455,7 @@ struct DevicesUiState {
     /// Which row is focused/shown in the detail pane (a UI-only concept).
     selected_id: Option<String>,
     /// Which device the user has picked as their *active* device: this is
-    /// what Device Map / Live Stream use, persisted in `devices_cache` (see
+    /// what Map / Live Stream use, persisted in `devices_cache` (see
     /// `storage::devices::DeviceCacheStore`) so it and the ROV connection
     /// itself keep working offshore even with no internet access to the
     /// third-eye server.
@@ -494,7 +496,7 @@ impl DevicesUiState {
     }
 
     /// The device currently marked active (used to label the Live Stream /
-    /// Device Map connection).
+    /// Map connection).
     fn active(&self) -> Option<&DeviceSummary> {
         let id = self.active_device_id.as_deref()?;
         self.rows.iter().find(|row| row.id == id)
@@ -564,7 +566,7 @@ struct UpdateCheckResult {
     download_url: String,
 }
 
-/// View-model backing the Device Map screen's "nearby resources" overlay
+/// View-model backing the Map screen's "nearby resources" overlay
 /// (AOI/POI/Intermagnet analysis pins pulled live from `/api/v1/search`).
 /// Session-only: never persisted to `AppStore`/SQLite, so it naturally
 /// resets whenever the app restarts.
@@ -574,9 +576,9 @@ struct NearbyResourcesState {
     /// overlapping requests if the server is slow to respond).
     fetch_in_progress: bool,
     /// Unix-ms deadline before which another fetch won't be started, even if
-    /// the user re-enters the Device Map screen (see `NEARBY_REFRESH_INTERVAL_MS`).
+    /// the user re-enters the Map screen (see `NEARBY_REFRESH_INTERVAL_MS`).
     next_fetch_at_ms: i64,
-    /// Human-readable status shown in a small Device Map badge, so it's
+    /// Human-readable status shown in a small Map badge, so it's
     /// visible from the running app (not just stderr) whether/why the
     /// `/api/v1/search` call did or didn't fire (e.g. not signed in yet, no
     /// location fix yet, in flight, last result, or last error).
@@ -655,7 +657,7 @@ struct ThirdEyeState {
     last_screen: Screen,
     // Guards the one-time startup tile load kicked off from the timer loop
     // in `fn main()`: true once we've invoked `navigate_map()` with
-    // `content_panel`'s real, laid-out size (needed because Device Map is
+    // `content_panel`'s real, laid-out size (needed because Map is
     // the default screen and no explicit navigation click supplies that
     // size at cold start).
     map_initial_load_done: bool,
@@ -718,7 +720,7 @@ struct ThirdEyeState {
     link_watcher: LinkWatcher,
     /// In-app updater state (GitHub release checks and download CTA).
     update: UpdateUiState,
-    /// Live "what's around you" overlay for Device Map (AOI/POI/Intermagnet
+    /// Live "what's around you" overlay for Map (AOI/POI/Intermagnet
     /// analysis pins pulled from `/api/v1/search`). Session-only.
     nearby: NearbyResourcesState,
     /// Background refresh-cookie keepalive, so an idle-but-signed-in app keeps
@@ -729,9 +731,22 @@ struct ThirdEyeState {
     /// loop picks it up and applies it without blocking the UI.
     #[cfg(not(target_os = "macos"))]
     startup_location_rx: Option<mpsc::Receiver<Result<(f64, f64), String>>>,
+    /// HTTP timeouts from the active device's configuration. Persisted next
+    /// to the client config so they apply before a device is re-selected.
+    camera_timeouts: CameraTimeouts,
 }
 
 impl ThirdEyeState {
+    /// Camera HTTP client for the configured ROV address, pinned to the ROV
+    /// interface and using the device's timeouts.
+    fn camera_client(&self) -> CameraApiClient {
+        CameraApiClient::new_bound_with(
+            self.config.rov_http_base.clone(),
+            self.config.rov_interface(),
+            self.camera_timeouts,
+        )
+    }
+
     fn new(store: &AppStore) -> Self {
         let (_bind_owned, defaults) = client_config_defaults();
         let client_config = store.config().load_client(&defaults).unwrap_or_else(|err| {
@@ -802,7 +817,7 @@ impl ThirdEyeState {
         }
 
         let mut state = Self {
-            // Device Map is the most useful "what's going on right now" view
+            // Map is the most useful "what's going on right now" view
             // for an ROV operator, so it's the default screen on launch
             // rather than Settings (now a tab inside Profile).
             active_screen: Screen::Map,
@@ -847,6 +862,7 @@ impl ThirdEyeState {
             session_keepalive: SessionKeepaliveState::new(),
             #[cfg(not(target_os = "macos"))]
             startup_location_rx: None,
+            camera_timeouts: load_camera_timeouts(store),
         };
         let _ = refresh_nmea_serial_candidates(&mut state);
         state
@@ -1346,10 +1362,10 @@ fn refresh_devices_blocking(state: &mut ThirdEyeState, store: &AppStore) {
 }
 
 /// Kicks off a background fetch of nearby AOI/POI/Intermagnet-analysis
-/// resources (for the Device Map screen's "what's around you" overlay) if
+/// resources (for the Map screen's "what's around you" overlay) if
 /// none is already in flight, the user is signed in, and a current location
 /// is known. A no-op otherwise (e.g. signed out, or no GPS fix yet). Called
-/// once when entering Device Map and then polled every timer tick
+/// once when entering Map and then polled every timer tick
 /// thereafter, so it naturally re-fires every `NEARBY_REFRESH_INTERVAL_MS`
 /// while the screen stays open (see `poll_nearby_events`).
 fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
@@ -1742,7 +1758,7 @@ fn read_device_config_draft_from_ui(ui: &AppWindow) -> DeviceConfigDraft {
 /// `ChasingM2SConfiguration`) and applies its `network.host`,
 /// `rtsp.credentials`/`port`/`channel`/`profile`, `http.port`, and
 /// `udp_status.port` to the client configuration (persisting the change),
-/// so Device Map / Live Stream connect using that device's own settings.
+/// so Map / Live Stream connect using that device's own settings.
 /// Missing/malformed configuration is not an error — most devices won't
 /// have this populated yet.
 fn apply_device_configuration_to_client_config(
@@ -1834,9 +1850,42 @@ fn apply_device_configuration_to_client_config(
         changed = true;
     }
 
+    if let Some(http) = configuration.http.as_deref() {
+        let connect_ms = http.connect_timeout_ms.and_then(|v| u64::try_from(v).ok());
+        let request_ms = http.request_timeout_ms.and_then(|v| u64::try_from(v).ok());
+        state.camera_timeouts = CameraTimeouts::from_millis(connect_ms, request_ms);
+        for (key, ms) in [
+            (config_keys::ROV_HTTP_CONNECT_TIMEOUT_MS, connect_ms),
+            (config_keys::ROV_HTTP_REQUEST_TIMEOUT_MS, request_ms),
+        ] {
+            if let Err(err) = store
+                .config()
+                .set(key, &ms.map_or_else(String::new, |v| v.to_string()))
+            {
+                eprintln!("failed to persist {key}: {err:#}");
+            }
+        }
+    }
+
     if changed {
         persist_config(state, store);
     }
+}
+
+/// Reads the HTTP timeouts saved by `apply_device_configuration_to_client_config`.
+fn load_camera_timeouts(store: &AppStore) -> CameraTimeouts {
+    let read = |key| {
+        store
+            .config()
+            .get(key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    CameraTimeouts::from_millis(
+        read(config_keys::ROV_HTTP_CONNECT_TIMEOUT_MS),
+        read(config_keys::ROV_HTTP_REQUEST_TIMEOUT_MS),
+    )
 }
 
 fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
@@ -2478,10 +2527,7 @@ fn start_media_download(
     status_text: String,
 ) {
     let data_root = app_data_root_dir(store);
-    let camera = CameraApiClient::new_bound(
-        state.config.rov_http_base.clone(),
-        state.config.rov_interface(),
-    );
+    let camera = state.camera_client();
     let tx = state.media.event_tx.clone();
     state.media.download_in_progress = true;
     state.media.status_text = status_text;
@@ -3074,9 +3120,8 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                     .iter()
                     .find(|device| device.id == id)
                     .map_or_default(|device| device.name.clone());
-                state.devices.status_text = format!(
-                    "\"{device_name}\" is now your active device for Device Map / Live Stream."
-                );
+                state.devices.status_text =
+                    format!("\"{device_name}\" is now your active device for Map / Live Stream.");
             }
             Err(err) => {
                 state.devices.status_text = format!("Failed to set active device: {err:#}");
@@ -3343,7 +3388,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             // Non-blocking: try NMEA GPS, then CoreLocation cached fix.
             // Never call the blocking detect_location() from an event handler.
             let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
-                Some((lat, lon, "Phone GPS (NMEA/TCP)".to_string()))
+                Some((lat, lon, "GPS (NMEA/TCP)".to_string()))
             } else {
                 #[cfg(target_os = "macos")]
                 {
@@ -3665,10 +3710,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         pull_configuration_from_ui(&ui, &mut state, &store_for_list_medias);
-        let client = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
-        );
+        let client = state.camera_client();
         let media_store = store_for_list_medias.media().clone();
         let tx = state.media.event_tx.clone();
         state.rov_info = "Listing media on ROV...".to_string();
@@ -3757,10 +3799,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         }
         let captured_at_ms = current_unix_ms();
 
-        let client = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
-        );
+        let client = state.camera_client();
         let media_store = store_for_capture.media().clone();
         let tx = state.media.event_tx.clone();
         let data_root = app_data_root_dir(&store_for_capture);
@@ -3849,7 +3888,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 state.auth.password.clear();
                 // Immediately sync the device list from the server now that
                 // we have a valid session, and reset the nearby-search timer
-                // so the Device Map fetches fresh pins on the next tick.
+                // so the Map fetches fresh pins on the next tick.
                 refresh_devices_blocking(&mut state, &store_for_sign_in);
                 state.nearby.next_fetch_at_ms = 0;
             }
@@ -3907,7 +3946,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         #[cfg(target_os = "macos")]
         prime_corelocation_at_startup(&mut state.map);
         let fresh = if let Some((lat, lon)) = state.nmea_gps.latest_location() {
-            Some((lat, lon, "Phone GPS (NMEA/TCP)".to_string()))
+            Some((lat, lon, "GPS (NMEA/TCP)".to_string()))
         } else {
             #[cfg(target_os = "macos")]
             {
@@ -4153,7 +4192,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 Ok(_msg) => {}
                 Err(err) => {
                     ui.set_nmea_gps_status(
-                        format!("Failed to connect to phone GPS server: {err:#}").into(),
+                        format!("Failed to connect to GPS server: {err:#}").into(),
                     );
                 }
             }
@@ -4211,7 +4250,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             Err(err) => {
                 state.nmea_gps = NmeaGpsState::default();
                 apply_state_to_ui(&ui, &state);
-                ui.set_nmea_gps_status(format!("Invalid NMEA GPS port: {err:#}").into());
+                ui.set_nmea_gps_status(format!("Invalid GPS port: {err:#}").into());
                 return;
             }
         };
@@ -4224,7 +4263,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         match state.nmea_gps.start(&host, port, protocol) {
             Ok(_msg) => {}
             Err(err) => {
-                ui.set_nmea_gps_status(format!("Failed to start NMEA GPS: {err:#}").into());
+                ui.set_nmea_gps_status(format!("Failed to start GPS: {err:#}").into());
             }
         }
         apply_state_to_ui(&ui, &state);
@@ -4289,10 +4328,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
         pull_configuration_from_ui(&ui, &mut state, &store_for_refresh_media);
-        let client = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
-        );
+        let client = state.camera_client();
         let media_store = store_for_refresh_media.media().clone();
         let tx = state.media.event_tx.clone();
         state.media.refresh_in_progress = true;
@@ -4495,10 +4531,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
         state.media.status_text = format!("Deleting {name} from ROV...");
         refresh_media_rows(&mut state, &store_for_delete_media);
         // ROV HTTP delete in background.
-        let client = CameraApiClient::new_bound(
-            state.config.rov_http_base.clone(),
-            state.config.rov_interface(),
-        );
+        let client = state.camera_client();
         let tx = state.media.event_tx.clone();
         let name_thread = name.clone();
         thread::spawn(move || {
@@ -5325,7 +5358,7 @@ fn main() -> Result<()> {
                     }
                 }
                 // Periodically re-fetch nearby AOI/POI/Intermagnet resources
-                // while Device Map stays open (no-op if signed out, no fix
+                // while Map stays open (no-op if signed out, no fix
                 // yet, or a fetch is already in flight - see the doc comment
                 // on `maybe_start_nearby_fetch`).
                 maybe_start_nearby_fetch(&mut state, &poll_store);
@@ -5409,7 +5442,7 @@ fn main() -> Result<()> {
                 // Update pin position without re-centering the viewport;
                 // the user can press the center-on-pin button manually.
                 if state.active_screen == Screen::Map {
-                    state.map.status = format!("NMEA GPS fix: {lat:.6}, {lon:.6}");
+                    state.map.status = format!("GPS fix: {lat:.6}, {lon:.6}");
                     apply_map_runtime_to_ui(&ui, &state);
                 }
             }

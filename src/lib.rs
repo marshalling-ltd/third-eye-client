@@ -24,6 +24,7 @@ pub mod iobt;
 pub mod ip_location;
 pub mod network;
 pub mod nmea;
+pub mod recording;
 pub mod rov_status;
 pub mod rtsp_forwarder;
 #[cfg(feature = "test-tools")]
