@@ -30,6 +30,8 @@ pub mod rov_status;
 pub mod rtsp_forwarder;
 #[cfg(feature = "test-tools")]
 pub mod simulator;
+#[cfg(feature = "test-tools")]
+pub mod startup_timing;
 pub mod storage;
 pub mod update_check;
 #[cfg(target_os = "windows")]

@@ -62,3 +62,26 @@ Pass `--input-args "-probesize 32768 -analyzeduration 0"` to try other ffmpeg in
 Run it on each OS and connection scenario and attach the output to the TE-2 ticket. `--mode direct` measures the baseline only; credentials are redacted in the report.
 
 Video goes through the interface-bound RTSP forwarder by default on every OS (on Windows it forces the outgoing adapter with `IP_UNICAST_IF`), so no host route, ARP entry or administrator prompt is needed.
+
+## Stream startup baseline
+
+`forwarder-probe` also times the steps of starting the live stream, from the moment it starts ffmpeg: **spawn** (ffmpeg process started), **1st byte** (first bytes on ffmpeg's output, which is the first JPEG, so it is within a millisecond or two of the first frame) and **ttff** (time to first frame). These measure the ffmpeg pipeline only. They do not include the app's own work before ffmpeg starts or the UI drawing the frame, which is at most one 16 ms UI tick after the frame arrives.
+
+**Proposed target:** median under 2 s from connect to first frame.
+
+Median / worst case over 5 runs, simulator, `-probesize 500000 -analyzeduration 500000`, source with a 1 s keyframe interval:
+
+| Platform | Connection | Spawn | 1st byte | Time to first frame |
+|---|---|---|---|---|
+| macOS (Intel) | Simulator on loopback | 2 ms / 3 ms | 988 ms / 1172 ms | 989 ms / 1172 ms |
+| macOS | ROV Wi-Fi, real ROV | not measured | not measured | not measured |
+| macOS | USB Ethernet, real ROV | not measured | not measured | not measured |
+| Linux | Wi-Fi / USB Ethernet | not measured | not measured | not measured |
+| Windows | Wi-Fi / USB Ethernet | not measured | not measured | not measured |
+
+Almost all of the time is ffmpeg connecting, probing and waiting for the first keyframe, so the keyframe interval of the source sets the floor. The bundled `samples/sample-3.mp4` has a keyframe only every 10 s and is not suitable for this; see the clip command above. To fill in a row, run the probe on that platform and connection and add the numbers:
+
+```sh
+cargo run --release --features test-tools --bin forwarder-probe -- \
+  --url rtsp://admin:admin@192.168.1.88:8554/stream/0/0 --interface en0 --mode forwarded --runs 5
+```
