@@ -57,6 +57,8 @@ cargo run --release --features test-tools --bin forwarder-probe -- \
   --url rtsp://admin:admin@192.168.1.88:8554/stream/0/0 --interface en0 --json-out probe.json
 ```
 
+Pass `--input-args "-probesize 32768 -analyzeduration 0"` to try other ffmpeg input options on top of the app's own (`RTSP_INPUT_ARGS`); later options win. The sample video has a keyframe only every 10 s and ffmpeg cannot show a frame before one arrives, so for startup measurements run the simulator with `--video` pointing at a clip with a 1 s keyframe interval (`ffmpeg -i in.mp4 -c:v libx264 -g 25 -keyint_min 25 -sc_threshold 0 out.mp4`).
+
 Run it on each OS and connection scenario and attach the output to the TE-2 ticket. `--mode direct` measures the baseline only; credentials are redacted in the report.
 
 Video goes through the interface-bound RTSP forwarder by default on every OS (on Windows it forces the outgoing adapter with `IP_UNICAST_IF`), so no host route, ARP entry or administrator prompt is needed.

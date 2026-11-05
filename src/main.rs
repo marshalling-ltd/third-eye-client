@@ -4921,12 +4921,7 @@ fn spawn_stream_pipeline(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
-        .arg("-rtsp_transport")
-        .arg("tcp")
-        .arg("-fflags")
-        .arg("nobuffer")
-        .arg("-flags")
-        .arg("low_delay");
+        .args(third_eye_client::rtsp_forwarder::RTSP_INPUT_ARGS);
     // Note: -localaddr is NOT a valid option for the RTSP demuxer (only for
     // SDP/RTP), so interface binding is done by the in-process forwarder that
     // `rtsp_url` points at (see `start_url_forwarder`).

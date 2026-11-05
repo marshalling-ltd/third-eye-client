@@ -689,4 +689,94 @@ mod tests {
         packet[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_status_packet(&packet).is_err());
     }
+
+    fn free_udp_port() -> u16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
+    fn poll_until(state: &mut UdpStatusState, done: impl Fn(&UdpStatusState) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done(state) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out; status: {}",
+                state.status_text()
+            );
+            state.poll_events();
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn start_rejects_an_empty_bind_host() {
+        let mut state = UdpStatusState::default();
+        let err = state.start("  ", 0, None).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn status_text_can_be_set_and_read() {
+        let mut state = UdpStatusState::default();
+        assert!(!state.is_running());
+        state.set_status_text("Waiting.".to_string());
+        assert_eq!(state.status_text(), "Waiting.");
+    }
+
+    #[test]
+    fn listener_reports_bad_packets_then_decodes_good_ones() {
+        let port = free_udp_port();
+        let mut state = UdpStatusState::default();
+        state.start("127.0.0.1", port, None).unwrap();
+        assert!(state.is_running());
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = format!("127.0.0.1:{port}");
+        sender.send_to(&[0x03, 0x00], &target).unwrap();
+        poll_until(&mut state, |s| {
+            s.status_text().starts_with("Failed to parse status packet")
+        });
+
+        sender
+            .send_to(&build_packet(&minimal_status_json()), &target)
+            .unwrap();
+        poll_until(&mut state, |s| s.packets_received() == 1);
+        assert!(state.latest_status().is_some());
+        assert_eq!(state.status_text(), "Receiving ROV status packets.");
+
+        state.stop();
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn poll_events_keeps_an_error_when_the_listener_ends() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = UdpStatusState {
+            event_rx: Some(rx),
+            ..UdpStatusState::default()
+        };
+        tx.send(UdpStatusEvent::Error("UDP receive failed".to_string()))
+            .unwrap();
+        tx.send(UdpStatusEvent::Ended).unwrap();
+
+        state.poll_events();
+        assert_eq!(state.status_text(), "UDP receive failed");
+        assert!(!state.is_running());
+        assert!(state.event_rx.is_none());
+    }
+
+    #[test]
+    fn poll_events_notes_when_the_listener_thread_disappears() {
+        let (tx, rx) = mpsc::channel::<UdpStatusEvent>();
+        let mut state = UdpStatusState {
+            event_rx: Some(rx),
+            ..UdpStatusState::default()
+        };
+        drop(tx);
+
+        state.poll_events();
+        assert_eq!(state.status_text(), "ROV status listener ended.");
+        assert!(state.event_rx.is_none());
+    }
 }

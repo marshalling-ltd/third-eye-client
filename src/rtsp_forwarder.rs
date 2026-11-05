@@ -429,6 +429,27 @@ pub fn forward_target_port(url: &Url, fallback: u16) -> u16 {
     url.port_or_known_default().unwrap_or(fallback)
 }
 
+/// ffmpeg input options for the live RTSP stream (placed before `-i`).
+///
+/// Without `-probesize` / `-analyzeduration` ffmpeg spends its default ~5 s
+/// probing the stream before it shows a frame; against the simulator that
+/// is about 2 s of pure delay on top of the wait for the first keyframe.
+/// (`-avioflags direct` and `-rtsp_flags` gave no measurable gain.) The limits are generous enough (500 kB, 0.5 s) for the codec parameters
+/// to arrive on a slow or lossy link, since probing stops early once ffmpeg
+/// has what it needs and only a stream that never delivers them hits the cap.
+pub const RTSP_INPUT_ARGS: [&str; 10] = [
+    "-rtsp_transport",
+    "tcp",
+    "-fflags",
+    "nobuffer",
+    "-flags",
+    "low_delay",
+    "-probesize",
+    "500000",
+    "-analyzeduration",
+    "500000",
+];
+
 /// Starts a forwarder for `url` (RTSP or HTTP) pinned to `rov_interface` and
 /// returns the URL ffmpeg should use instead. `default_port` applies when the
 /// URL names none. Returns `Ok(None)` when forwarding does not apply: no
