@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::Serialize;
-use third_eye_client::rtsp_forwarder::{RtspForwarder, start_url_forwarder};
+use third_eye_client::rtsp_forwarder::{RTSP_INPUT_ARGS, RtspForwarder, start_url_forwarder};
 
 const DEFAULT_RTSP_PORT: u16 = 554;
 /// A gap between frames longer than this counts as a stall.
@@ -46,6 +46,8 @@ struct Config {
     duration: Duration,
     rtt_samples: u32,
     ffmpeg: PathBuf,
+    /// Extra ffmpeg input options (placed before `-i`), to compare startup tuning.
+    input_args: Vec<String>,
     json_out: Option<PathBuf>,
 }
 
@@ -243,14 +245,8 @@ fn stream_run(config: &Config, url: &str) -> Result<StreamRun> {
     let started = Instant::now();
     let mut child = Command::new(&config.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error"])
-        .args([
-            "-rtsp_transport",
-            "tcp",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-        ])
+        .args(RTSP_INPUT_ARGS)
+        .args(&config.input_args)
         .arg("-i")
         .arg(url)
         .args([
@@ -504,6 +500,7 @@ fn parse_config() -> Result<Config> {
     let mut duration_secs = 10;
     let mut rtt_samples = 200;
     let mut ffmpeg = PathBuf::from("ffmpeg");
+    let mut input_args = Vec::new();
     let mut json_out = None;
 
     let mut args = env::args().skip(1);
@@ -535,6 +532,12 @@ fn parse_config() -> Result<Config> {
                     .context("invalid --rtt-samples")?;
             }
             "--ffmpeg" => ffmpeg = value("--ffmpeg")?.into(),
+            "--input-args" => {
+                input_args = value("--input-args")?
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+            }
             "--json-out" => json_out = Some(value("--json-out")?.into()),
             "--help" | "-h" => {
                 print_help();
@@ -558,6 +561,7 @@ fn parse_config() -> Result<Config> {
         duration: Duration::from_secs(duration_secs),
         rtt_samples,
         ffmpeg,
+        input_args,
         json_out,
     })
 }
@@ -584,6 +588,9 @@ fn print_help() {
     );
     println!("  --rtt-samples <N>       OPTIONS round trips per run (default: 200)");
     println!("  --ffmpeg <PATH>         ffmpeg binary (default: ffmpeg from PATH)");
+    println!(
+        "  --input-args <ARGS>     Extra ffmpeg input options placed before -i, space separated (e.g. \"-probesize 32768\")"
+    );
     println!("  --json-out <FILE>       Also write the full report as JSON");
     println!("  -h, --help              Show this help");
 }
@@ -746,6 +753,7 @@ mod tests {
             duration: Duration::from_secs(1),
             rtt_samples: 0,
             ffmpeg: PathBuf::from("ffmpeg"),
+            input_args: Vec::new(),
             json_out: None,
         };
         let (url, guard) = open_session(&config("rtsp://10.0.0.1/s"), Mode::Direct).unwrap();

@@ -43,7 +43,7 @@ flowchart LR
 downloads, server calls, the ffmpeg pipe) runs on its own thread and reports back over an `mpsc` channel. A 16 ms Slint timer drains those channels and pushes the results
 into the UI.
 
-**Live video.** ffmpeg is launched as a child process that pulls RTSP over TCP and writes MJPEG frames to stdout; a reader thread splits the stream into JPEGs and hands them
+**Live video.** ffmpeg is launched as a child process that pulls RTSP over TCP and writes MJPEG frames to stdout (probing is capped by `RTSP_INPUT_ARGS` so the first frame is not held back by ffmpeg's default analysis time); a reader thread splits the stream into JPEGs and hands them
 to the UI. Because ffmpeg can't bind to a network interface itself, it connects to an in-process forwarder that pins the connection to the ROV's interface (see [ROV network interface binding](../explanation/finding-the-rov.md)).
 
 **Server session.** Every backend call goes through `ApiSession`, which refreshes the access token from the persisted refresh cookie before it expires, and once more on a

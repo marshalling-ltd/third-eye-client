@@ -218,7 +218,7 @@ fn collect_coordinate_pairs(value: &Value, sum_lat: &mut f64, sum_lon: &mut f64,
 
 #[cfg(test)]
 mod tests {
-    use super::{NearbyKind, parse_items};
+    use super::{ApiError, NearbyKind, parse_items};
     use serde_json::json;
 
     #[test]
@@ -284,5 +284,141 @@ mod tests {
             ]
         });
         assert!(parse_items(&value).is_empty());
+    }
+
+    #[test]
+    fn missing_items_array_yields_nothing() {
+        assert!(parse_items(&json!({"center": null})).is_empty());
+        assert!(parse_items(&json!({"items": "nope"})).is_empty());
+    }
+
+    #[test]
+    fn skips_aoi_without_usable_geometry() {
+        let value = json!({
+            "items": [
+                {"id": "a", "data": {"name": "no area"}, "resource_type": "aoi"},
+                {"id": "b", "data": {"area": {"type": "Polygon", "coordinates": []}}, "resource_type": "aoi"}
+            ]
+        });
+        assert!(parse_items(&value).is_empty());
+    }
+
+    #[test]
+    fn parses_aoi_area_that_is_double_encoded_json() {
+        let area = json!({"type": "Point", "coordinates": [16.0, 45.0]}).to_string();
+        let value = json!({
+            "items": [{"id": "a", "data": {"area": area, "name": "Encoded"}, "resource_type": "aoi"}]
+        });
+        let items = parse_items(&value);
+        assert_eq!(items.len(), 1);
+        assert!((items[0].lon - 16.0).abs() < 1e-9);
+        assert!((items[0].lat - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ignores_area_strings_that_are_not_json() {
+        let value = json!({
+            "items": [{"id": "a", "data": {"area": "not json"}, "resource_type": "aoi"}]
+        });
+        assert!(parse_items(&value).is_empty());
+    }
+
+    // ---- SearchClient::nearby (mocked server) ------------------------------
+
+    fn signed_in_store(server: &mut mockito::Server) -> crate::storage::AppStore {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = engine.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = engine.encode(json!({"exp": 2_000_000_000_i64, "sub": "user"}).to_string());
+        let token = format!("{header}.{payload}.");
+        server
+            .mock("POST", "/api/v1/account/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"access_token": token, "refresh_token": "abc", "status": "success"})
+                    .to_string(),
+            )
+            .create();
+        let store = crate::storage::AppStore::open_in_memory().unwrap();
+        store
+            .auth()
+            .login(&server.url(), "me@example.test", "secret")
+            .expect("login succeeds");
+        store
+    }
+
+    #[test]
+    fn nearby_returns_parsed_items() {
+        let mut server = mockito::Server::new();
+        let store = signed_in_store(&mut server);
+        let mock = server
+            .mock("POST", "/api/v1/search")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"items": [
+                    {"id": "p1", "data": {"latitude": 42.6, "longitude": 18.1, "name": "Dubrovnik"}, "resource_type": "poi"}
+                ]})
+                .to_string(),
+            )
+            .create();
+
+        let items = store
+            .search()
+            .nearby(&server.url(), 42.6, 18.1, 5000.0)
+            .expect("search succeeds");
+        mock.assert();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Dubrovnik");
+        assert_eq!(items[0].kind, NearbyKind::Poi);
+    }
+
+    #[test]
+    fn nearby_surfaces_server_error() {
+        let mut server = mockito::Server::new();
+        let store = signed_in_store(&mut server);
+        server
+            .mock("POST", "/api/v1/search")
+            .with_status(500)
+            .with_body("boom")
+            .create();
+
+        let err = store
+            .search()
+            .nearby(&server.url(), 0.0, 0.0, 1.0)
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Server { status, message } if status.as_u16() == 500 && message == "boom"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nearby_reports_undecodable_response() {
+        let mut server = mockito::Server::new();
+        let store = signed_in_store(&mut server);
+        server
+            .mock("POST", "/api/v1/search")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not json")
+            .create();
+
+        let err = store
+            .search()
+            .nearby(&server.url(), 0.0, 0.0, 1.0)
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Transport(_)), "unexpected: {err}");
+    }
+
+    #[test]
+    fn nearby_rejects_an_invalid_server_url() {
+        let store = crate::storage::AppStore::open_in_memory().unwrap();
+        let err = store
+            .search()
+            .nearby("not a url", 0.0, 0.0, 1.0)
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Transport(_)), "unexpected: {err}");
     }
 }
