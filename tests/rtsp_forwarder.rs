@@ -1,5 +1,5 @@
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -145,6 +145,12 @@ fn closing_the_rov_side_closes_the_client() {
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"bye").unwrap();
+        // Close gracefully: half-close, then wait for the forwarder to finish.
+        // Dropping the socket right after the write can make Windows reset the
+        // connection, which discards "bye" before the forwarder reads it.
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
     });
 
     let forwarder = RtspForwarder::start(target(addr)).unwrap();

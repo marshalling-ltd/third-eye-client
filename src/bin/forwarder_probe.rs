@@ -8,14 +8,17 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use comfy_table::{CellAlignment, Table, presets};
 use reqwest::Url;
 use serde::Serialize;
 use third_eye_client::rtsp_forwarder::{RTSP_INPUT_ARGS, RtspForwarder, start_url_forwarder};
+use third_eye_client::startup_timing::{Stage, StartupTimings};
 
 const DEFAULT_RTSP_PORT: u16 = 554;
 /// A gap between frames longer than this counts as a stall.
@@ -55,6 +58,12 @@ struct Config {
 struct StreamRun {
     /// Process start to first decoded JPEG; `None` if no frame arrived.
     ttff_ms: Option<f64>,
+    /// Process start to the ffmpeg child being spawned.
+    #[serde(rename = "spawn_ms", serialize_with = "as_millis_opt")]
+    spawn: Option<Duration>,
+    /// Process start to the first bytes on ffmpeg's stdout.
+    #[serde(rename = "first_byte_ms", serialize_with = "as_millis_opt")]
+    first_byte: Option<Duration>,
     frames: u64,
     fps: f64,
     max_gap_ms: f64,
@@ -84,6 +93,10 @@ struct ForwarderReport {
 struct ModeReport {
     mode: &'static str,
     runs: Vec<StreamRun>,
+    #[serde(rename = "spawn_median_ms", serialize_with = "as_millis_opt")]
+    spawn_median: Option<Duration>,
+    #[serde(rename = "first_byte_median_ms", serialize_with = "as_millis_opt")]
+    first_byte_median: Option<Duration>,
     ttff_median_ms: Option<f64>,
     fps_median: Option<f64>,
     max_gap_ms: f64,
@@ -243,6 +256,7 @@ fn measure_rtt(url: &str, samples: u32) -> Result<Vec<Duration>> {
 /// Runs ffmpeg the way the app does and watches the JPEG frames it produces.
 fn stream_run(config: &Config, url: &str) -> Result<StreamRun> {
     let started = Instant::now();
+    let timings = Arc::new(StartupTimings::new());
     let mut child = Command::new(&config.ffmpeg)
         .args(["-hide_banner", "-loglevel", "error"])
         .args(RTSP_INPUT_ARGS)
@@ -263,16 +277,22 @@ fn stream_run(config: &Config, url: &str) -> Result<StreamRun> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to start {}", config.ffmpeg.display()))?;
-    let frames = spawn_frame_reader(&mut child);
+    timings.mark(Stage::Spawned);
+    let frames = spawn_frame_reader(&mut child, Arc::clone(&timings));
 
-    let result = collect_frames(&frames, started, config.duration);
+    let mut result = collect_frames(&frames, started, config.duration);
+    result.spawn = timings.elapsed(Stage::Spawned);
+    result.first_byte = timings.elapsed(Stage::FirstByte);
     let _ = child.kill();
     let _ = child.wait();
     Ok(result)
 }
 
 /// Streams `(arrival time, frame size)` for every complete JPEG on ffmpeg's stdout.
-fn spawn_frame_reader(child: &mut Child) -> Receiver<(Instant, usize)> {
+fn spawn_frame_reader(
+    child: &mut Child,
+    timings: Arc<StartupTimings>,
+) -> Receiver<(Instant, usize)> {
     let (tx, rx) = mpsc::channel();
     let mut stdout = child.stdout.take().expect("stdout is piped");
     thread::spawn(move || {
@@ -282,6 +302,7 @@ fn spawn_frame_reader(child: &mut Child) -> Receiver<(Instant, usize)> {
             if n == 0 {
                 break;
             }
+            timings.mark(Stage::FirstByte);
             pending.extend_from_slice(&chunk[..n]);
             while let Some(len) = take_jpeg(&mut pending) {
                 if tx.send((Instant::now(), len)).is_err() {
@@ -314,6 +335,8 @@ fn collect_frames(
     let Ok((first_at, first_len)) = frames.recv_timeout(FIRST_FRAME_TIMEOUT) else {
         return StreamRun {
             ttff_ms: None,
+            spawn: None,
+            first_byte: None,
             frames: 0,
             fps: 0.0,
             max_gap_ms: 0.0,
@@ -347,6 +370,8 @@ fn collect_frames(
     let span = (last - first_at).as_secs_f64();
     StreamRun {
         ttff_ms: Some((first_at - started).as_secs_f64() * 1000.0),
+        spawn: None,
+        first_byte: None,
         frames: arrivals.len() as u64,
         fps: if span > 0.0 {
             f64::from(u32::try_from(arrivals.len() - 1).unwrap_or(u32::MAX)) / span
@@ -366,6 +391,8 @@ fn summarize(
     forwarder: Option<ForwarderReport>,
 ) -> ModeReport {
     let ttffs: Vec<f64> = runs.iter().filter_map(|r| r.ttff_ms).collect();
+    let spawns: Vec<Duration> = runs.iter().filter_map(|r| r.spawn).collect();
+    let first_bytes: Vec<Duration> = runs.iter().filter_map(|r| r.first_byte).collect();
     let fps: Vec<f64> = runs
         .iter()
         .filter(|r| r.frames > 1)
@@ -373,6 +400,8 @@ fn summarize(
         .collect();
     ModeReport {
         mode: mode.label(),
+        spawn_median: median_duration(&spawns),
+        first_byte_median: median_duration(&first_bytes),
         ttff_median_ms: median(&ttffs),
         fps_median: median(&fps),
         max_gap_ms: runs.iter().map(|r| r.max_gap_ms).fold(0.0, f64::max),
@@ -397,6 +426,28 @@ fn median(values: &[f64]) -> Option<f64> {
     })
 }
 
+/// Median of durations (the mean of the middle two when the count is even).
+fn median_duration(values: &[Duration]) -> Option<Duration> {
+    let secs: Vec<f64> = values.iter().map(Duration::as_secs_f64).collect();
+    median(&secs).map(Duration::from_secs_f64)
+}
+
+/// Writes a duration as fractional milliseconds, so the JSON report keeps its
+/// `*_ms` fields while the code keeps the unit in the type.
+// serde's `serialize_with` always passes `&Field`, so the signature is fixed.
+#[allow(clippy::ref_option)]
+fn as_millis_opt<S: serde::Serializer>(
+    value: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_some(&value.map(|d| d.as_secs_f64() * 1000.0))
+}
+
+/// A duration as whole milliseconds for the printed table, or `-` if unknown.
+fn fmt_millis(value: Option<Duration>) -> String {
+    value.map_or("-".to_owned(), |d| format!("{} ms", d.as_millis()))
+}
+
 fn percentiles(samples: &[Duration]) -> Option<Percentiles> {
     if samples.is_empty() {
         return None;
@@ -415,6 +466,41 @@ fn percentiles(samples: &[Duration]) -> Option<Percentiles> {
     })
 }
 
+/// The per-mode results as a table; column widths follow the content.
+fn summary_table(modes: &[ModeReport]) -> Table {
+    let mut table = Table::new();
+    table.load_preset(presets::NOTHING).set_header([
+        "mode",
+        "spawn",
+        "1st byte",
+        "ttff median",
+        "fps",
+        "max gap",
+        "stalls",
+        "rtt p50",
+        "rtt p99",
+    ]);
+    for m in modes {
+        table.add_row([
+            m.mode.to_owned(),
+            fmt_millis(m.spawn_median),
+            fmt_millis(m.first_byte_median),
+            fmt_opt(m.ttff_median_ms, "ms", 0),
+            fmt_opt(m.fps_median, "", 1),
+            format!("{:.0} ms", m.max_gap_ms),
+            m.stalls_total.to_string(),
+            m.rtt.map_or("-".to_owned(), |r| format!("{} us", r.p50_us)),
+            m.rtt.map_or("-".to_owned(), |r| format!("{} us", r.p99_us)),
+        ]);
+    }
+    for index in 1..9 {
+        if let Some(column) = table.column_mut(index) {
+            column.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+    table
+}
+
 fn print_summary(report: &Report) {
     println!(
         "\n{} / {}  interface: {}",
@@ -422,22 +508,7 @@ fn print_summary(report: &Report) {
         report.arch,
         report.interface.as_deref().unwrap_or("-")
     );
-    println!(
-        "{:<10} {:>12} {:>7} {:>11} {:>7} {:>10} {:>10}",
-        "mode", "ttff median", "fps", "max gap", "stalls", "rtt p50", "rtt p99"
-    );
-    for m in &report.modes {
-        println!(
-            "{:<10} {:>12} {:>7} {:>11} {:>7} {:>10} {:>10}",
-            m.mode,
-            fmt_opt(m.ttff_median_ms, "ms", 0),
-            fmt_opt(m.fps_median, "", 1),
-            format!("{:.0} ms", m.max_gap_ms),
-            m.stalls_total,
-            m.rtt.map_or("-".to_owned(), |r| format!("{} us", r.p50_us)),
-            m.rtt.map_or("-".to_owned(), |r| format!("{} us", r.p99_us)),
-        );
-    }
+    println!("{}", summary_table(&report.modes));
     let direct = report.modes.iter().find(|m| m.mode == "direct");
     let forwarded = report.modes.iter().find(|m| m.mode == "forwarded");
     if let (Some(d), Some(f)) = (direct, forwarded) {
@@ -619,6 +690,42 @@ mod tests {
     }
 
     #[test]
+    fn median_duration_keeps_the_unit() {
+        assert_eq!(median_duration(&[]), None);
+        let ms = Duration::from_millis;
+        assert_eq!(median_duration(&[ms(30), ms(10), ms(20)]), Some(ms(20)));
+        assert_eq!(median_duration(&[ms(10), ms(20)]), Some(ms(15)));
+    }
+
+    #[test]
+    fn durations_are_reported_in_milliseconds() {
+        assert_eq!(fmt_millis(None), "-");
+        assert_eq!(fmt_millis(Some(Duration::from_micros(1_500))), "1 ms");
+
+        let run = StreamRun {
+            ttff_ms: Some(10.0),
+            spawn: Some(Duration::from_micros(2_500)),
+            first_byte: None,
+            frames: 0,
+            fps: 0.0,
+            max_gap_ms: 0.0,
+            stalls: 0,
+            bytes: 0,
+        };
+        let json = serde_json::to_value(&run).unwrap();
+        assert_eq!(json["spawn_ms"], 2.5);
+        assert!(json["first_byte_ms"].is_null());
+    }
+
+    #[test]
+    fn summary_table_lists_every_mode_with_a_header() {
+        let report = summarize(Mode::Direct, Vec::new(), &[], None);
+        let text = summary_table(&[report]).to_string();
+        assert!(text.contains("ttff median"), "{text}");
+        assert!(text.contains("direct"), "{text}");
+    }
+
+    #[test]
     fn median_handles_empty_odd_and_even() {
         assert_eq!(median(&[]), None);
         assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
@@ -689,6 +796,8 @@ mod tests {
     fn summarize_builds_medians_and_totals() {
         let run = |ttff: f64, fps: f64, stalls: u32| StreamRun {
             ttff_ms: Some(ttff),
+            spawn: None,
+            first_byte: None,
             frames: 10,
             fps,
             max_gap_ms: 50.0 + f64::from(stalls),
