@@ -15,8 +15,19 @@ export struct NearbyPin {
     x: length,
     y: length,
     label: string,
-    // 0 = poi, 1 = aoi, 2 = intermagnet_analysis - matches NearbyKind's order.
+    // 0 = poi, 1 = aoi, 2 = intermagnet_analysis, 3 = fire - matches NearbyKind's order.
     kind: int,
+}
+
+// An AOI boundary drawn as a translucent polygon. `commands` is an SVG path
+// relative to (x, y); width/height are the polygon's bounding box, so the
+// Path maps 1:1 onto world pixels.
+export struct AoiShape {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+    commands: string,
 }
 
 // Full-bleed device map screen (OpenStreetMap tiles + ROV/GPS pin).
@@ -48,6 +59,7 @@ export component MapPage inherits Rectangle {
     in property <string> avatar_text: "?";
     // Live "what's around you" overlay: AOI/POI/Intermagnet analysis pins.
     in property <[NearbyPin]> nearby_pins;
+    in property <[AoiShape]> aoi_shapes;
     // Index into nearby_pins whose detail card is open, or -1 for none.
     // Purely a UI concern (which pin is expanded), not synced to Rust.
     property <int> nearby_detail_index: -1;
@@ -89,15 +101,36 @@ export component MapPage inherits Rectangle {
             // Positioned in the same world-pixel space as the tiles/own pin
             // above, so every pin stays visible and correctly placed at any
             // zoom/pan, independent of which tiles happen to be loaded.
+            for shape in root.aoi_shapes : Path {
+                x: shape.x;
+                y: shape.y;
+                width: shape.width;
+                height: shape.height;
+                commands: shape.commands;
+                fill: #ff3b3033;
+                stroke: #ff6b61;
+                stroke-width: 2px;
+            }
+
+            // Pins: POI teardrop (tip on the point), magnetograph diamond,
+            // fire flame and AOI centre dot, all as PNG icons except the dot.
             for pin[i] in root.nearby_pins : Rectangle {
-                width: 14px;
-                height: 14px;
+                width: pin.kind == 1 ? 14px : (pin.kind == 0 ? 26px : 28px);
+                height: pin.kind == 1 ? 14px : (pin.kind == 0 ? 26px : 28px);
                 x: pin.x - self.width / 2;
-                y: pin.y - self.height / 2;
-                border-radius: 7px;
-                border-width: 1px;
+                y: pin.kind == 0 ? pin.y - self.height : pin.y - self.height / 2;
+                border-radius: pin.kind == 1 ? 7px : 0px;
+                border-width: pin.kind == 1 ? 1px : 0px;
                 border-color: #ffffffaa;
-                background: pin.kind == 1 ? #ff3b30 : (pin.kind == 2 ? #ff9f0a : #0a84ff);
+                background: pin.kind == 1 ? #ff3b30 : transparent;
+
+                if pin.kind != 1 : Image {
+                    width: 100%;
+                    height: 100%;
+                    source: pin.kind == 0 ? @image-url("../../assets/poi_pin.png")
+                        : (pin.kind == 2 ? @image-url("../../assets/magnetograph_pin.png") : @image-url("../../assets/fire_pin.png"));
+                    image-fit: contain;
+                }
 
                 TouchArea {
                     clicked => {
@@ -133,7 +166,7 @@ export component MapPage inherits Rectangle {
                     Text {
                         text: root.nearby_pins[root.nearby_detail_index].kind == 1
                             ? "Area of Interest"
-                            : (root.nearby_pins[root.nearby_detail_index].kind == 2 ? "Magnetograph" : "Point of Interest");
+                            : (root.nearby_pins[root.nearby_detail_index].kind == 2 ? "Magnetograph" : (root.nearby_pins[root.nearby_detail_index].kind == 3 ? "Active fire (satellite)" : "Point of Interest"));
                         font-size: 10px;
                         color: #8f96a3;
                     }

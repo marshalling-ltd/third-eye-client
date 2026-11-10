@@ -44,6 +44,9 @@ docs/DeviceModel.md
 docs/DeviceType.md
 docs/ErrorCode.md
 docs/FilterOptions.md
+docs/FirmsAreaRecord.md
+docs/FirmsAreaRecordHandlerApi.md
+docs/FirmsDataSource.md
 docs/ForgotPasswordSchema.md
 docs/GapFillParameters.md
 docs/Geometry.md
@@ -98,6 +101,8 @@ docs/PagedResponseAoiModelExtended.md
 docs/PagedResponseAoiModelExtendedItemsInner.md
 docs/PagedResponseDeviceModel.md
 docs/PagedResponseDeviceModelItemsInner.md
+docs/PagedResponseFirmsAreaRecord.md
+docs/PagedResponseFirmsAreaRecordItemsInner.md
 docs/PagedResponseIntermagnetAnalysisModel.md
 docs/PagedResponseIntermagnetAnalysisModelItemsInner.md
 docs/PagedResponseIntermagnetCatalogRestModel.md
@@ -164,6 +169,7 @@ docs/RtspConfig.md
 docs/RtspCredentials.md
 docs/ScheduledJobForCatalog.md
 docs/SearchFilterOptions.md
+docs/SearchFirmsAreaRecordsSchema.md
 docs/SearchHandlerApi.md
 docs/SearchLocationSchema.md
 docs/SearchResourceCenterPoint.md
@@ -175,6 +181,7 @@ docs/SearchResourceModel.md
 docs/SearchResourceResponseModel.md
 docs/SearchResourceType.md
 docs/SearchResourcesSchema.md
+docs/SpatialFilterSchema.md
 docs/StorageMigrationHandlerApi.md
 docs/StorageMigrationModel.md
 docs/StorageMigrationStatus.md
@@ -223,6 +230,7 @@ src/apis/aoi_image_handler_api.rs
 src/apis/aoi_interactive_map_handler_api.rs
 src/apis/configuration.rs
 src/apis/device_handler_api.rs
+src/apis/firms_area_record_handler_api.rs
 src/apis/intermagnet_analysis_handler_api.rs
 src/apis/intermagnet_catalog_handler_api.rs
 src/apis/intermagnet_data_handler_api.rs
@@ -279,6 +287,8 @@ src/models/device_model.rs
 src/models/device_type.rs
 src/models/error_code.rs
 src/models/filter_options.rs
+src/models/firms_area_record.rs
+src/models/firms_data_source.rs
 src/models/forgot_password_schema.rs
 src/models/gap_fill_parameters.rs
 src/models/geometry.rs
@@ -329,6 +339,8 @@ src/models/paged_response_aoi_model_extended.rs
 src/models/paged_response_aoi_model_extended_items_inner.rs
 src/models/paged_response_device_model.rs
 src/models/paged_response_device_model_items_inner.rs
+src/models/paged_response_firms_area_record.rs
+src/models/paged_response_firms_area_record_items_inner.rs
 src/models/paged_response_intermagnet_analysis_model.rs
 src/models/paged_response_intermagnet_analysis_model_items_inner.rs
 src/models/paged_response_intermagnet_catalog_rest_model.rs
@@ -390,6 +402,7 @@ src/models/rtsp_config.rs
 src/models/rtsp_credentials.rs
 src/models/scheduled_job_for_catalog.rs
 src/models/search_filter_options.rs
+src/models/search_firms_area_records_schema.rs
 src/models/search_location_schema.rs
 src/models/search_resource_center_point.rs
 src/models/search_resource_data.rs
@@ -400,6 +413,7 @@ src/models/search_resource_model.rs
 src/models/search_resource_response_model.rs
 src/models/search_resource_type.rs
 src/models/search_resources_schema.rs
+src/models/spatial_filter_schema.rs
 src/models/storage_migration_model.rs
 src/models/storage_migration_status.rs
 src/models/storage_retention_model.rs

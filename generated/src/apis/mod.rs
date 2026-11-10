@@ -116,6 +116,7 @@ pub mod aoi_handler_api;
 pub mod aoi_image_handler_api;
 pub mod aoi_interactive_map_handler_api;
 pub mod device_handler_api;
+pub mod firms_area_record_handler_api;
 pub mod intermagnet_analysis_handler_api;
 pub mod intermagnet_catalog_handler_api;
 pub mod intermagnet_data_handler_api;

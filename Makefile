@@ -55,6 +55,9 @@ bump-patch:
 
 open-api:
 	@openapi-generator-cli generate -i https://third-eye.marshalling.eu/api/v1/api-doc/openapi.json -g rust -o ./generated --skip-validate-spec
+	@# The generator template pins reqwest ^0.12; the client uses 0.13 and the types must match.
+	@sed -i.bak 's/^reqwest = { version = "^0.12"/reqwest = { version = "^0.13"/' ./generated/Cargo.toml && rm -f ./generated/Cargo.toml.bak
+	@grep -q 'reqwest = { version = "^0.13"' ./generated/Cargo.toml || { echo "generated/Cargo.toml: reqwest patch failed"; exit 1; }
 
 requirements:
 	@echo "third-eye-client: requirements\n"

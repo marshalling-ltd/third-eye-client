@@ -75,7 +75,9 @@ use third_eye_client::storage::media::{
     CaptureMetadata as StoredCaptureMetadata, LocalMediaRecord, MediaStore, build_capture_text,
     build_details_text, build_info_subtitle, download_to_local, origin_label, state_label,
 };
-use third_eye_client::storage::search::{DEFAULT_SEARCH_RADIUS_M, NearbyKind, NearbyResource};
+use third_eye_client::storage::search::{
+    DEFAULT_SEARCH_RADIUS_M, FIRE_LOOKBACK_HOURS, FIRE_SEARCH_RADIUS_M, NearbyKind, NearbyResource,
+};
 use third_eye_client::update_check::{
     GithubReleaseAsset, normalize_release_tag, parse_version_triplet,
     pick_download_url_for_platform,
@@ -594,7 +596,7 @@ impl NearbyResourcesState {
             items: Vec::new(),
             fetch_in_progress: false,
             next_fetch_at_ms: 0,
-            status_text: "Nearby: sign in to see AOI/POI/Magnetograph resources.".to_string(),
+            status_text: "Nearby: sign in to see AOI/POI/Magnetograph/fire resources.".to_string(),
             event_tx,
             event_rx,
         }
@@ -607,6 +609,8 @@ enum NearbyEvent {
         /// the UI thread can tell a session-ending failure apart from a
         /// transient/offline one - see `note_api_error`.
         result: Result<Vec<NearbyResource>, ApiError>,
+        /// `Some` when the (best-effort) fire lookup failed.
+        fire_error: Option<String>,
     },
 }
 
@@ -1205,9 +1209,44 @@ fn devices_row_model(state: &ThirdEyeState) -> ModelRc<DeviceRow> {
             type_text: device.device_type.clone().into(),
             created_at_text: device.created_at.clone().into(),
             selected: selected_id == Some(device.id.as_str()),
+            local_only: device.pending_sync,
         })
         .collect();
     ModelRc::new(VecModel::from(rows))
+}
+
+/// Projects an AOI outline into world pixels and builds the Slint path for it
+/// (relative to the polygon's bounding box).
+fn aoi_shape(outline: &[(f64, f64)], zoom: u32) -> AoiShape {
+    let points: Vec<(f32, f32)> = outline
+        .iter()
+        .map(|&(lat, lon)| {
+            let (x, y) = lat_lon_to_world_px(lat, lon, zoom);
+            (x, y)
+        })
+        .collect();
+    let min_x = points.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+    let min_y = points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+    let max_x = points.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+    let max_y = points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+    let mut commands = String::new();
+    for (i, (x, y)) in points.iter().enumerate() {
+        let _ = write!(
+            commands,
+            "{} {:.1} {:.1} ",
+            if i == 0 { "M" } else { "L" },
+            x - min_x,
+            y - min_y
+        );
+    }
+    commands.push('Z');
+    AoiShape {
+        x: min_x,
+        y: min_y,
+        width: (max_x - min_x).max(1.0),
+        height: (max_y - min_y).max(1.0),
+        commands: commands.into(),
+    }
 }
 
 fn apply_devices_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
@@ -1329,6 +1368,14 @@ fn refresh_devices_blocking(state: &mut ThirdEyeState, store: &AppStore) {
         };
         return;
     }
+    // Push devices created while offline/signed out before reading the
+    // server's list, so they show up as ordinary synced devices below.
+    let (synced, sync_error) = store
+        .device_cache()
+        .sync_pending(store.devices(), &server_base);
+    if let Some(error) = &sync_error {
+        eprintln!("failed to sync local devices: {error}");
+    }
     state.devices.status_text = "Loading devices...".to_string();
     match store.devices().list(&server_base) {
         Ok(rows) => {
@@ -1336,6 +1383,18 @@ fn refresh_devices_blocking(state: &mut ThirdEyeState, store: &AppStore) {
                 eprintln!("failed to update local devices cache: {err:#}");
             }
             state.devices.status_text = format!("{} device(s) loaded.", rows.len());
+            if synced > 0 {
+                let _ = write!(
+                    state.devices.status_text,
+                    " Synced {synced} local device(s) to the server."
+                );
+            }
+            if let Some(error) = sync_error {
+                let _ = write!(
+                    state.devices.status_text,
+                    " Some local devices could not be synced yet: {error}"
+                );
+            }
             // Re-read from the cache rather than trusting `rows` directly, so
             // the locally-tracked active-device flag (preserved by
             // `replace_all`) is reflected in `state.devices.rows`.
@@ -1395,7 +1454,7 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
     // this runs on every 16 ms timer tick, and `has_session` queries SQLite.
     if !state.auth.is_signed_in {
         state.nearby.status_text =
-            "Nearby: sign in to see AOI/POI/Magnetograph resources.".to_string();
+            "Nearby: sign in to see AOI/POI/Magnetograph/fire resources.".to_string();
         return;
     }
     state.nearby.fetch_in_progress = true;
@@ -1408,8 +1467,19 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
     let search_client = store.search().clone();
     let tx = state.nearby.event_tx.clone();
     thread::spawn(move || {
-        let result = search_client.nearby(&server_base, lat, lon, DEFAULT_SEARCH_RADIUS_M);
-        let _ = tx.send(NearbyEvent::Fetched { result });
+        let mut result = search_client.nearby(&server_base, lat, lon, DEFAULT_SEARCH_RADIUS_M);
+        // Fires are best-effort: a FIRMS failure must not hide AOIs/POIs.
+        let mut fire_error = None;
+        if let Ok(items) = &mut result {
+            match search_client.fires(&server_base, lat, lon, FIRE_SEARCH_RADIUS_M) {
+                Ok(fires) => items.extend(fires),
+                Err(err) => {
+                    eprintln!("failed to fetch nearby fires: {err}");
+                    fire_error = Some(err.to_string());
+                }
+            }
+        }
+        let _ = tx.send(NearbyEvent::Fetched { result, fire_error });
     });
 }
 
@@ -1417,12 +1487,24 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
 /// accordingly. Returns `true` if the UI needs a refresh.
 fn poll_nearby_events(state: &mut ThirdEyeState) -> bool {
     let mut changed = false;
-    while let Ok(NearbyEvent::Fetched { result }) = state.nearby.event_rx.try_recv() {
+    while let Ok(NearbyEvent::Fetched { result, fire_error }) = state.nearby.event_rx.try_recv() {
         state.nearby.fetch_in_progress = false;
         changed = true;
         match result {
             Ok(items) => {
-                state.nearby.status_text = format!("Nearby: {} resource(s).", items.len());
+                let fires = items.iter().filter(|i| i.kind == NearbyKind::Fire).count();
+                state.nearby.status_text = match fire_error {
+                    Some(err) => format!(
+                        "Nearby: {} resource(s); fire lookup failed ({err}).",
+                        items.len()
+                    ),
+                    None => format!(
+                        "Nearby: {} resource(s), {fires} fire(s) within {} km in the last {} h.",
+                        items.len(),
+                        (FIRE_SEARCH_RADIUS_M / 1000.0) as u32,
+                        FIRE_LOOKBACK_HOURS
+                    ),
+                };
                 state.nearby.items = items;
             }
             Err(err) => {
@@ -1966,12 +2048,21 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
                         NearbyKind::Poi => 0,
                         NearbyKind::Aoi => 1,
                         NearbyKind::IntermagnetAnalysis => 2,
+                        NearbyKind::Fire => 3,
                     },
                 }
             })
             .collect::<Vec<_>>(),
     );
     ui.set_nearby_pins(ModelRc::new(nearby_pin_model));
+    let aoi_shapes: Vec<AoiShape> = state
+        .nearby
+        .items
+        .iter()
+        .filter(|item| item.kind == NearbyKind::Aoi && item.outline.len() >= 3)
+        .map(|item| aoi_shape(&item.outline, state.map.zoom))
+        .collect();
+    ui.set_aoi_shapes(ModelRc::new(VecModel::from(aoi_shapes)));
     let scale_lat = state.map.lat.unwrap_or(45.0);
     let (bar_px, bar_text) = compute_scale_bar(state.map.zoom, scale_lat);
     ui.set_scale_bar_width(bar_px);
@@ -2965,20 +3056,39 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
         pull_configuration_from_ui(&ui, &mut state, &store_for_create_device);
-        if !store_for_create_device.api().has_session() {
-            state.devices.status_text =
-                "Sign in first to create a device (requires internet access).".to_string();
-            apply_state_to_ui(&ui, &state);
-            return;
-        }
         let server_base = state.config.server_base_url.trim().to_owned();
         // Uses whatever the user has (possibly edited) in the Configuration
         // section of the New Device form.
         let device_configuration = read_device_config_draft_from_ui(&ui).to_value();
-        match store_for_create_device
-            .devices()
-            .create(&server_base, name, device_configuration)
+        // Signed out or unreachable server (e.g. offshore): keep the device
+        // locally; it is created server-side on the next successful refresh.
+        let create_locally = |state: &mut ThirdEyeState, reason: &str| match store_for_create_device
+            .device_cache()
+            .create_local(&name, device_configuration.as_ref())
         {
+            Ok(created) => {
+                state.devices.status_text = format!(
+                    "Created device \"{}\" locally ({reason}). It will sync to the server \
+                         once you are signed in and online.",
+                    created.name
+                );
+                state.devices.selected_id = Some(created.id.clone());
+                state.devices.rows.push(created);
+            }
+            Err(err) => {
+                state.devices.status_text = format!("Failed to create device: {err:#}");
+            }
+        };
+        if !store_for_create_device.api().has_session() {
+            create_locally(&mut state, "not signed in");
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
+        match store_for_create_device.devices().create(
+            &server_base,
+            name.clone(),
+            device_configuration.clone(),
+        ) {
             Ok(created) => {
                 state.devices.status_text = format!("Created device \"{}\".", created.name);
                 if let Err(err) = store_for_create_device.device_cache().upsert(&created) {
@@ -2987,6 +3097,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 state.devices.selected_id = Some(created.id.clone());
                 state.devices.rows.push(created);
             }
+            Err(ApiError::Transport(_)) => create_locally(&mut state, "server unreachable"),
             Err(err) => {
                 let expired = note_api_error(&mut state, &err);
                 state.devices.status_text = if expired {
@@ -3021,6 +3132,34 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             apply_state_to_ui(&ui, &state);
             return;
         };
+        let device_configuration = read_device_config_draft_from_ui(&ui).to_value();
+        if store_for_save_device_name
+            .device_cache()
+            .is_pending(&id)
+            .unwrap_or(false)
+        {
+            // Local-only device: edit it in the cache; it syncs later.
+            match store_for_save_device_name.device_cache().update_local(
+                &id,
+                &name,
+                device_configuration.as_ref(),
+            ) {
+                Ok(updated) => {
+                    state.devices.status_text = format!(
+                        "Saved device \"{}\" locally (not synced yet).",
+                        updated.name
+                    );
+                    if let Some(row) = state.devices.rows.iter_mut().find(|d| d.id == id) {
+                        *row = updated;
+                    }
+                }
+                Err(err) => {
+                    state.devices.status_text = format!("Failed to save device: {err:#}");
+                }
+            }
+            apply_state_to_ui(&ui, &state);
+            return;
+        }
         if !store_for_save_device_name.api().has_session() {
             state.devices.status_text =
                 "Sign in first to rename a device (requires internet access).".to_string();
@@ -3028,7 +3167,6 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         }
         let server_base = state.config.server_base_url.trim().to_owned();
-        let device_configuration = read_device_config_draft_from_ui(&ui).to_value();
         match store_for_save_device_name.devices().update(
             &server_base,
             &id,
@@ -3068,14 +3206,23 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
             return;
         };
         let id = id.to_string();
-        if !store_for_delete_device.api().has_session() {
+        let local_only = store_for_delete_device
+            .device_cache()
+            .is_pending(&id)
+            .unwrap_or(false);
+        if !local_only && !store_for_delete_device.api().has_session() {
             state.devices.status_text =
                 "Sign in first to delete a device (requires internet access).".to_string();
             apply_state_to_ui(&ui, &state);
             return;
         }
         let server_base = state.config.server_base_url.trim().to_owned();
-        match store_for_delete_device.devices().delete(&server_base, &id) {
+        let result = if local_only {
+            Ok(())
+        } else {
+            store_for_delete_device.devices().delete(&server_base, &id)
+        };
+        match result {
             Ok(()) => {
                 state.devices.rows.retain(|device| device.id != id);
                 if let Err(err) = store_for_delete_device.device_cache().remove(&id) {

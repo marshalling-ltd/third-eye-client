@@ -17,12 +17,28 @@ use anyhow::Context;
 use reqwest::Url;
 use serde_json::{Value, json};
 
+use third_eye_openapi::apis::firms_area_record_handler_api;
+use third_eye_openapi::models::{
+    PagedResponseFirmsAreaRecordItemsInner, SearchFirmsAreaRecordsSchema, SpatialFilterSchema,
+};
+
 use super::api::{ApiError, ApiSession, BACKEND_HTTP_TIMEOUT};
 
 /// Default search radius, in meters, used when pulling nearby resources for
 /// the Map screen. The OpenAPI schema doesn't document units for `r`;
 /// this is an assumption, easy to tune once confirmed against the web app.
 pub const DEFAULT_SEARCH_RADIUS_M: f64 = 5000.0;
+
+/// Search radius, in meters, for active-fire detections (NASA FIRMS). Fires are
+/// reported by satellite and are sparse, so this is wider than the radius used
+/// for AOIs/POIs.
+pub const FIRE_SEARCH_RADIUS_M: f64 = 50_000.0;
+
+/// How far back, in hours, to look for fire detections.
+pub const FIRE_LOOKBACK_HOURS: u64 = 24;
+
+/// Maximum fire detections requested per refresh.
+const FIRE_RESULT_LIMIT: i64 = 200;
 
 /// Kind of resource returned by `/api/v1/search`, matching the
 /// `SearchResourceType` enum in the OpenAPI schema.
@@ -31,6 +47,8 @@ pub enum NearbyKind {
     Poi,
     Aoi,
     IntermagnetAnalysis,
+    /// Satellite fire detection from `/api/v1/firms/area-records/search`.
+    Fire,
 }
 
 /// A single item from `/api/v1/search`, flattened to a plottable point.
@@ -43,6 +61,8 @@ pub struct NearbyResource {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    /// AOI boundary as `(lat, lon)` vertices (first ring); empty for other kinds.
+    pub outline: Vec<(f64, f64)>,
 }
 
 /// Facade held by `AppStore`, mirroring `DevicesClient`. Cloneable (like
@@ -51,6 +71,8 @@ pub struct NearbyResource {
 #[derive(Clone)]
 pub struct SearchClient {
     http: reqwest::blocking::Client,
+    /// For the generated (async) FIRMS endpoint.
+    async_http: reqwest::Client,
     api: ApiSession,
 }
 
@@ -61,8 +83,54 @@ impl SearchClient {
                 .timeout(BACKEND_HTTP_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            async_http: reqwest::Client::builder()
+                .timeout(BACKEND_HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             api,
         }
+    }
+
+    /// Active-fire detections (NASA FIRMS) within `radius_m` meters of
+    /// `(lat, lon)` over the last [`FIRE_LOOKBACK_HOURS`], via the generated
+    /// `firms_area_record_handler_api`.
+    pub fn fires(
+        &self,
+        server_base: &str,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+    ) -> Result<Vec<NearbyResource>, ApiError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let from = now.saturating_sub(FIRE_LOOKBACK_HOURS * 3600);
+        let (acquired_from, acquired_to) = (rfc3339_utc(from), rfc3339_utc(now));
+        let page = self
+            .api
+            .call(server_base, &self.async_http, |configuration| {
+                let schema = SearchFirmsAreaRecordsSchema::new(
+                    acquired_from.clone(),
+                    acquired_to.clone(),
+                    SpatialFilterSchema::new(lat, lon, radius_m),
+                );
+                async move {
+                    firms_area_record_handler_api::search_firms_area_records_handler(
+                        &configuration,
+                        schema,
+                        None,
+                        Some(FIRE_RESULT_LIMIT),
+                        Some("acquired_at"),
+                        Some(true),
+                    )
+                    .await
+                }
+            })?;
+        Ok(page
+            .items
+            .into_iter()
+            .map(|record| fire_resource(&record))
+            .collect())
     }
 
     /// `POST /api/v1/search` for `aoi`/`poi`/`intermagnet_analysis` resources
@@ -114,6 +182,51 @@ impl SearchClient {
     }
 }
 
+/// Flattens a FIRMS record to a plottable pin. FIRMS records have no id, so
+/// one is derived from source/time/position.
+fn fire_resource(record: &PagedResponseFirmsAreaRecordItemsInner) -> NearbyResource {
+    let frp = record
+        .frp
+        .flatten()
+        .map_or_default(|frp| format!(", {frp:.1} MW"));
+    NearbyResource {
+        id: format!(
+            "fire:{}:{}:{:.5}:{:.5}",
+            record.source, record.acquired_at, record.latitude, record.longitude
+        ),
+        kind: NearbyKind::Fire,
+        name: format!(
+            "Fire ({}, {} confidence{frp})",
+            record.satellite, record.confidence
+        ),
+        lat: record.latitude,
+        lon: record.longitude,
+        outline: Vec::new(),
+    }
+}
+
+/// Unix seconds -> `YYYY-MM-DDTHH:MM:SSZ` (UTC), no date crate needed.
+fn rfc3339_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 fn parse_items(value: &Value) -> Vec<NearbyResource> {
     let Some(items) = value.get("items").and_then(Value::as_array) else {
         return Vec::new();
@@ -140,6 +253,7 @@ fn parse_item(item: &Value) -> Option<NearbyResource> {
                 name,
                 lat,
                 lon,
+                outline: Vec::new(),
             })
         }
         "intermagnet_analysis" => {
@@ -151,16 +265,19 @@ fn parse_item(item: &Value) -> Option<NearbyResource> {
                 name,
                 lat,
                 lon,
+                outline: Vec::new(),
             })
         }
         "aoi" => {
-            let (lat, lon) = geometry_centroid(data.get("area")?)?;
+            let area = data.get("area")?;
+            let (lat, lon) = geometry_centroid(area)?;
             Some(NearbyResource {
                 id,
                 kind: NearbyKind::Aoi,
                 name,
                 lat,
                 lon,
+                outline: first_ring(area).unwrap_or_default(),
             })
         }
         _ => None,
@@ -183,6 +300,35 @@ fn geometry_centroid(area: &Value) -> Option<(f64, f64)> {
         return None;
     }
     Some((sum_lat / f64::from(count), sum_lon / f64::from(count)))
+}
+
+/// First polygon ring found in a GeoJSON-style geometry (arbitrarily nested,
+/// possibly string-encoded), as `(lat, lon)` vertices. A ring is an array of at
+/// least three `[lon, lat]` pairs.
+fn first_ring(value: &Value) -> Option<Vec<(f64, f64)>> {
+    match value {
+        Value::Array(items) => {
+            let pairs: Option<Vec<(f64, f64)>> = items
+                .iter()
+                .map(|item| match item.as_array()?.as_slice() {
+                    [Value::Number(lon), Value::Number(lat), ..] => {
+                        Some((lat.as_f64()?, lon.as_f64()?))
+                    }
+                    _ => None,
+                })
+                .collect();
+            match pairs {
+                Some(ring) if ring.len() >= 3 => Some(ring),
+                _ => items.iter().find_map(first_ring),
+            }
+        }
+        Value::Object(map) => map
+            .get("coordinates")
+            .and_then(first_ring)
+            .or_else(|| map.values().find_map(first_ring)),
+        Value::String(text) => first_ring(&serde_json::from_str::<Value>(text).ok()?),
+        _ => None,
+    }
 }
 
 /// Recursively walks a JSON value looking for GeoJSON-style `[lon, lat]`
@@ -218,8 +364,14 @@ fn collect_coordinate_pairs(value: &Value, sum_lat: &mut f64, sum_lon: &mut f64,
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, NearbyKind, parse_items};
+    use super::{ApiError, FIRE_SEARCH_RADIUS_M, NearbyKind, parse_items, rfc3339_utc};
     use serde_json::json;
+
+    #[test]
+    fn rfc3339_formats_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_709_210_096), "2024-02-29T12:34:56Z");
+    }
 
     #[test]
     fn parses_poi_and_intermagnet_analysis_items() {
@@ -245,6 +397,14 @@ mod tests {
         assert!((items[0].lat - 45.1).abs() < f64::EPSILON);
         assert!((items[0].lon - 15.2).abs() < f64::EPSILON);
         assert_eq!(items[1].kind, NearbyKind::Poi);
+    }
+
+    #[test]
+    fn aoi_keeps_its_polygon_outline() {
+        let value = json!({"items": [{"id": "a1", "resource_type": "aoi", "data": {"name": "Zone", "area": {"type": "Polygon", "coordinates": [[[18.0, 42.0], [18.2, 42.0], [18.2, 42.2], [18.0, 42.0]]]}}}]});
+        let items = parse_items(&value);
+        assert_eq!(items[0].outline.len(), 4);
+        assert_eq!(items[0].outline[1], (42.0, 18.2));
     }
 
     #[test]
@@ -346,6 +506,40 @@ mod tests {
             .login(&server.url(), "me@example.test", "secret")
             .expect("login succeeds");
         store
+    }
+
+    #[test]
+    fn fires_returns_pins_from_firms_records() {
+        let mut server = mockito::Server::new();
+        let store = signed_in_store(&mut server);
+        let mock = server
+            .mock("POST", "/api/v1/firms/area-records/search")
+            .match_query(mockito::Matcher::Any)
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"spatial": {"latitude": 42.6, "longitude": 18.1, "radius_meters": 50000.0}}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"items": [{
+                    "acquired_at": "2026-11-10T01:00:00Z", "confidence": "high",
+                    "created_at": "2026-11-10T01:05:00Z", "daynight": "N", "frp": 12.5,
+                    "latitude": 42.7, "longitude": 18.2, "satellite": "N20",
+                    "scan": 0.4, "source": "VIIRS_NOAA20_NRT", "track": 0.4
+                }], "limit": 200, "page": 1, "total": 1})
+                .to_string(),
+            )
+            .create();
+
+        let fires = store
+            .search()
+            .fires(&server.url(), 42.6, 18.1, FIRE_SEARCH_RADIUS_M)
+            .expect("fires succeed");
+        mock.assert();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].kind, NearbyKind::Fire);
+        assert!(fires[0].name.contains("12.5 MW"));
+        assert_eq!((fires[0].lat, fires[0].lon), (42.7, 18.2));
     }
 
     #[test]
