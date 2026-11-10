@@ -1,5 +1,5 @@
 import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
-import { MapTile, MapPage, NearbyPin } from "pages/map_page.slint";
+import { MapTile, MapPage, NearbyPin, AoiShape } from "pages/map_page.slint";
 import { StreamPage } from "pages/stream_page.slint";
 import { MediaRow, MediaPage } from "pages/media_page.slint";
 import { DeviceRow } from "pages/devices/device_list.slint";
@@ -156,6 +156,7 @@ export component AppWindow inherits Window {
     // Live "what's around you" overlay for Map (AOI/POI/Intermagnet
     // analysis pins pulled from `/api/v1/search`).
     in property <[NearbyPin]> nearby_pins;
+    in property <[AoiShape]> aoi_shapes;
     in-out property <length> map_pin_world_x: 0px;
     in-out property <length> map_pin_world_y: 0px;
     in-out property <bool> map_has_pin: false;
@@ -710,6 +711,7 @@ export component AppWindow inherits Window {
                 height: parent.height;
                 map_tiles: root.map_tiles;
                 nearby_pins: root.nearby_pins;
+                aoi_shapes: root.aoi_shapes;
                 map_pin_world_x: root.map_pin_world_x;
                 map_pin_world_y: root.map_pin_world_y;
                 map_has_pin: root.map_has_pin;

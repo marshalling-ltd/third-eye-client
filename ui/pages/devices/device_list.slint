@@ -7,6 +7,8 @@ export struct DeviceRow {
     type_text: string,
     created_at_text: string,
     selected: bool,
+    // true: created locally and not yet synced to the third-eye platform.
+    local_only: bool,
 }
 
 // Column header for the device grid/table below. Column widths here must
@@ -47,6 +49,15 @@ component DeviceGridHeader inherits HorizontalBox {
         color: #8f96a3;
     }
     Text {
+        text: "Sync";
+        width: 70px;
+        horizontal-stretch: 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: #8f96a3;
+        horizontal-alignment: center;
+    }
+    Text {
         text: "Status";
         width: 80px;
         horizontal-stretch: 0;
@@ -66,6 +77,7 @@ component DeviceGridRow inherits Rectangle {
     in property <string> row_type;
     in property <string> row_created;
     in property <bool> is_active: false;
+    in property <bool> is_local_only: false;
     callback activated();
 
     height: 46px;
@@ -109,6 +121,27 @@ component DeviceGridRow inherits Rectangle {
             font-size: 11px;
             overflow: elide;
             vertical-alignment: center;
+        }
+        HorizontalBox {
+            width: 70px;
+            horizontal-stretch: 0;
+            alignment: center;
+            Rectangle {
+                width: 58px;
+                height: 18px;
+                border-radius: 4px;
+                background: root.is_local_only ? #e0a82e22 : #3b8eea22;
+                border-width: 1px;
+                border-color: root.is_local_only ? #e0a82e66 : #3b8eea66;
+                Text {
+                    text: root.is_local_only ? "LOCAL" : "SYNCED";
+                    color: root.is_local_only ? #e0a82e : #3b8eea;
+                    font-size: 9px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
         }
         HorizontalBox {
             width: 80px;
@@ -242,6 +275,7 @@ export component DeviceListPage inherits VerticalBox {
                             row_type: row.type_text;
                             row_created: row.created_at_text;
                             is_active: row.id == root.device_active_id;
+                            is_local_only: row.local_only;
                             activated => { root.open_device(row.id); }
                         }
                     }

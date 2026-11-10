@@ -42,6 +42,8 @@ pub struct DeviceSummary {
     /// source for RTSP/ROV HTTP settings when this device is marked active
     /// (see `apply_device_configuration_to_client_config` in `main.rs`).
     pub configuration: Option<String>,
+    /// Local-only: created in the app and not yet synced to the platform.
+    pub pending_sync: bool,
 }
 
 impl From<DeviceModel> for DeviceSummary {
@@ -55,6 +57,7 @@ impl From<DeviceModel> for DeviceSummary {
             updated_at: model.updated_at,
             concurrency: model.concurrency,
             configuration: model.configuration.map(|value| value.to_string()),
+            pending_sync: false,
         }
     }
 }
@@ -70,6 +73,7 @@ impl From<PagedResponseDeviceModelItemsInner> for DeviceSummary {
             updated_at: model.updated_at,
             concurrency: model.concurrency,
             configuration: model.configuration.map(|value| value.to_string()),
+            pending_sync: false,
         }
     }
 }
@@ -240,7 +244,7 @@ impl DeviceCacheStore {
     pub fn list_cached(&self) -> Result<Vec<DeviceSummary>> {
         let conn = self.db.lock().expect("devices_cache mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json
+            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, pending_sync
              FROM devices_cache ORDER BY name COLLATE NOCASE",
         )?;
         let rows = stmt
@@ -254,7 +258,7 @@ impl DeviceCacheStore {
     pub fn selected(&self) -> Result<Option<DeviceSummary>> {
         let conn = self.db.lock().expect("devices_cache mutex poisoned");
         conn.query_row(
-            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json
+            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, pending_sync
              FROM devices_cache WHERE is_selected = 1 LIMIT 1",
             [],
             row_to_device_summary,
@@ -267,7 +271,7 @@ impl DeviceCacheStore {
     /// existing `is_selected` flag for devices that already existed (the
     /// active-device choice is a local preference, independent of what the
     /// server returns) and drops cached rows for devices no longer present
-    /// server-side.
+    /// server-side. Local-only devices (`pending_sync = 1`) are never dropped.
     pub fn replace_all(&self, devices: &[DeviceSummary]) -> Result<()> {
         let conn = self.db.lock().expect("devices_cache mutex poisoned");
         let tx = conn
@@ -303,9 +307,11 @@ impl DeviceCacheStore {
             }
             let placeholders = devices.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             if devices.is_empty() {
-                tx.execute("DELETE FROM devices_cache", [])?;
+                tx.execute("DELETE FROM devices_cache WHERE pending_sync = 0", [])?;
             } else {
-                let sql = format!("DELETE FROM devices_cache WHERE id NOT IN ({placeholders})");
+                let sql = format!(
+                    "DELETE FROM devices_cache WHERE pending_sync = 0 AND id NOT IN ({placeholders})"
+                );
                 let ids: Vec<&str> = devices.iter().map(|device| device.id.as_str()).collect();
                 tx.execute(&sql, rusqlite::params_from_iter(ids))?;
             }
@@ -344,6 +350,181 @@ impl DeviceCacheStore {
         )
         .context("upserting cached device")?;
         Ok(())
+    }
+
+    /// Creates a device that exists only locally (no server round trip) and
+    /// marks it pending sync. See [`Self::pending`] and [`Self::promote`].
+    pub fn create_local(
+        &self,
+        name: &str,
+        configuration: Option<&serde_json::Value>,
+    ) -> Result<DeviceSummary> {
+        let conn = self.db.lock().expect("devices_cache mutex poisoned");
+        let now: String =
+            conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+                row.get(0)
+            })?;
+        let device = DeviceSummary {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            category: DeviceCategory::Underwater.to_string(),
+            device_type: DeviceType::ChasingM2S.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            concurrency: uuid::Uuid::new_v4(),
+            configuration: configuration.map(ToString::to_string),
+            pending_sync: true,
+        };
+        conn.execute(
+            "INSERT INTO devices_cache(id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, is_selected, cached_at_ms, pending_sync)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 1)",
+            params![
+                device.id,
+                device.name,
+                device.category,
+                device.device_type,
+                device.created_at,
+                device.updated_at,
+                device.concurrency.to_string(),
+                device.configuration,
+                current_unix_ms(),
+            ],
+        )
+        .context("creating local device")?;
+        Ok(device)
+    }
+
+    /// Whether `id` is a local-only device the server has not seen yet.
+    pub fn is_pending(&self, id: &str) -> Result<bool> {
+        let conn = self.db.lock().expect("devices_cache mutex poisoned");
+        let pending: Option<i64> = conn
+            .query_row(
+                "SELECT pending_sync FROM devices_cache WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading device sync state")?;
+        Ok(pending == Some(1))
+    }
+
+    /// Local-only devices waiting to be created on the server, oldest first.
+    pub fn pending(&self) -> Result<Vec<DeviceSummary>> {
+        let conn = self.db.lock().expect("devices_cache mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, pending_sync
+             FROM devices_cache WHERE pending_sync = 1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_device_summary)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading pending devices")?;
+        Ok(rows)
+    }
+
+    /// Edits a still-local device in place (name and, if given, configuration).
+    pub fn update_local(
+        &self,
+        id: &str,
+        name: &str,
+        configuration: Option<&serde_json::Value>,
+    ) -> Result<DeviceSummary> {
+        let conn = self.db.lock().expect("devices_cache mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE devices_cache
+             SET name = ?2,
+                 configuration_json = COALESCE(?3, configuration_json),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1 AND pending_sync = 1",
+            params![id, name, configuration.map(ToString::to_string)],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("device {id} is not a local-only device");
+        }
+        conn.query_row(
+            "SELECT id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, pending_sync
+             FROM devices_cache WHERE id = ?1",
+            params![id],
+            row_to_device_summary,
+        )
+        .context("reading updated local device")
+    }
+
+    /// Replaces the local-only device `local_id` with the server's copy after
+    /// a successful sync, carrying the active-device flag over.
+    pub fn promote(&self, local_id: &str, server: &DeviceSummary) -> Result<()> {
+        let conn = self.db.lock().expect("devices_cache mutex poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting device promotion")?;
+        let was_selected: i64 = tx
+            .query_row(
+                "SELECT is_selected FROM devices_cache WHERE id = ?1",
+                params![local_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        tx.execute("DELETE FROM devices_cache WHERE id = ?1", params![local_id])?;
+        tx.execute(
+            "INSERT INTO devices_cache(id, name, category, device_type, created_at, updated_at, concurrency, configuration_json, is_selected, cached_at_ms, pending_sync)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 category = excluded.category,
+                 device_type = excluded.device_type,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 concurrency = excluded.concurrency,
+                 configuration_json = excluded.configuration_json,
+                 is_selected = excluded.is_selected,
+                 cached_at_ms = excluded.cached_at_ms,
+                 pending_sync = 0",
+            params![
+                server.id,
+                server.name,
+                server.category,
+                server.device_type,
+                server.created_at,
+                server.updated_at,
+                server.concurrency.to_string(),
+                server.configuration,
+                was_selected,
+                current_unix_ms(),
+            ],
+        )?;
+        tx.commit().context("committing device promotion")?;
+        Ok(())
+    }
+
+    /// Creates every local-only device on the server. Stops at the first
+    /// failure (leaving the rest pending) and returns that error alongside how
+    /// many were synced.
+    pub fn sync_pending(
+        &self,
+        client: &DevicesClient,
+        server_base: &str,
+    ) -> (usize, Option<String>) {
+        let pending = match self.pending() {
+            Ok(rows) => rows,
+            Err(err) => return (0, Some(format!("{err:#}"))),
+        };
+        let mut synced = 0;
+        for local in pending {
+            let configuration = local
+                .configuration
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok());
+            let created = match client.create(server_base, local.name.clone(), configuration) {
+                Ok(created) => created,
+                Err(err) => return (synced, Some(err.to_string())),
+            };
+            if let Err(err) = self.promote(&local.id, &created) {
+                return (synced, Some(format!("{err:#}")));
+            }
+            synced += 1;
+        }
+        (synced, None)
     }
 
     /// Removes a device from the cache (used after a successful delete).
@@ -396,6 +577,7 @@ fn row_to_device_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceSumm
         updated_at: row.get(5)?,
         concurrency,
         configuration: row.get(7)?,
+        pending_sync: row.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -468,6 +650,7 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             concurrency: uuid::Uuid::new_v4(),
             configuration: None,
+            pending_sync: false,
         }
     }
 
@@ -588,6 +771,216 @@ mod tests {
         cache.set_selected("id-a").unwrap();
         cache.clear_selection().unwrap();
         assert!(cache.selected().unwrap().is_none());
+    }
+
+    // ---- Local-only (offline) devices --------------------------------------
+
+    #[test]
+    fn create_local_marks_device_pending_and_survives_server_refresh() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        let local = cache.create_local("Offline ROV", None).unwrap();
+        assert!(cache.is_pending(&local.id).unwrap());
+        // A refresh that doesn't know the device must not drop it.
+        cache
+            .replace_all(&[sample_summary("id-a", "Alpha")])
+            .unwrap();
+        cache.replace_all(&[]).unwrap();
+        assert_eq!(cache.pending().unwrap().len(), 1);
+        assert!(
+            cache
+                .list_cached()
+                .unwrap()
+                .iter()
+                .any(|d| d.id == local.id)
+        );
+    }
+
+    #[test]
+    fn update_local_only_touches_pending_devices() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        let local = cache.create_local("Old", None).unwrap();
+        let cfg = serde_json::json!({"k": 1});
+        let updated = cache.update_local(&local.id, "New", Some(&cfg)).unwrap();
+        assert_eq!(updated.name, "New");
+        assert_eq!(updated.configuration.as_deref(), Some(r#"{"k":1}"#));
+        cache.upsert(&sample_summary("id-a", "Synced")).unwrap();
+        assert!(cache.update_local("id-a", "X", None).is_err());
+    }
+
+    #[test]
+    fn sync_pending_creates_on_server_and_keeps_selection() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+        let cache = store.device_cache();
+        let local = cache.create_local("Offline ROV", None).unwrap();
+        cache.set_selected(&local.id).unwrap();
+
+        let user_id = uuid::Uuid::new_v4();
+        server
+            .mock("GET", "/api/v1/profile/info")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": user_id, "email": "me@example.test", "name": "Me",
+                    "surname": "Example", "role": "User", "is_active": true,
+                    "password": "hashed", "created_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2024-01-01T00:00:00Z",
+                    "concurrency": uuid::Uuid::new_v4(),
+                })
+                .to_string(),
+            )
+            .create();
+        let server_id = uuid::Uuid::new_v4();
+        let create_mock = server
+            .mock("POST", "/api/v1/devices")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"name": "Offline ROV"}),
+            ))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                device_model_json(server_id, uuid::Uuid::new_v4(), "Offline ROV").to_string(),
+            )
+            .create();
+
+        let (synced, error) = cache.sync_pending(store.devices(), &server.url());
+        create_mock.assert();
+        assert_eq!((synced, error), (1, None));
+        assert!(cache.pending().unwrap().is_empty());
+        let selected = cache.selected().unwrap().expect("selection carried over");
+        assert_eq!(selected.id, server_id.to_string());
+        assert_eq!(cache.list_cached().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_pending_failure_keeps_device_pending() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+        let cache = store.device_cache();
+        cache.create_local("Offline ROV", None).unwrap();
+        server
+            .mock("GET", "/api/v1/profile/info")
+            .with_status(500)
+            .create();
+        let (synced, error) = cache.sync_pending(store.devices(), &server.url());
+        assert_eq!(synced, 0);
+        assert!(error.is_some());
+        assert_eq!(cache.pending().unwrap().len(), 1);
+    }
+
+    fn mock_profile_info(server: &mut mockito::Server) {
+        server
+            .mock("GET", "/api/v1/profile/info")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": uuid::Uuid::new_v4(), "email": "me@example.test", "name": "Me",
+                    "surname": "Example", "role": "User", "is_active": true,
+                    "password": "hashed", "created_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2024-01-01T00:00:00Z",
+                    "concurrency": uuid::Uuid::new_v4(),
+                })
+                .to_string(),
+            )
+            .create();
+    }
+
+    #[test]
+    fn sync_pending_sends_the_stored_configuration() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+        mock_profile_info(&mut server);
+        let cache = store.device_cache();
+        let cfg = serde_json::json!({"rtsp": "rtsp://10.0.0.1/live"});
+        cache.create_local("Configured", Some(&cfg)).unwrap();
+        let create_mock = server
+            .mock("POST", "/api/v1/devices")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"configuration": cfg}),
+            ))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                device_model_json(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Configured")
+                    .to_string(),
+            )
+            .create();
+        let (synced, error) = cache.sync_pending(store.devices(), &server.url());
+        create_mock.assert();
+        assert_eq!((synced, error), (1, None));
+    }
+
+    #[test]
+    fn sync_pending_reports_a_local_database_failure() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        cache
+            .db
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE devices_cache", [])
+            .unwrap();
+        let (synced, error) = cache.sync_pending(store.devices(), "http://127.0.0.1:1");
+        assert_eq!(synced, 0);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn sync_pending_keeps_the_device_when_promotion_fails() {
+        let mut server = mockito::Server::new();
+        let store = AppStore::open_in_memory().unwrap();
+        sign_in(&store, &mut server);
+        mock_profile_info(&mut server);
+        let cache = store.device_cache();
+        let local = cache.create_local("Offline ROV", None).unwrap();
+        server
+            .mock("POST", "/api/v1/devices")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                device_model_json(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Offline ROV")
+                    .to_string(),
+            )
+            .create();
+        // Make the swap to the server's copy fail after the server accepted it.
+        cache
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER block_insert BEFORE INSERT ON devices_cache
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+        let (synced, error) = cache.sync_pending(store.devices(), &server.url());
+        assert_eq!(synced, 0);
+        assert!(error.unwrap().contains("blocked"));
+        assert!(cache.is_pending(&local.id).unwrap());
+    }
+
+    #[test]
+    fn local_device_methods_surface_database_errors() {
+        let store = AppStore::open_in_memory().unwrap();
+        let cache = store.device_cache();
+        let local = cache.create_local("Offline ROV", None).unwrap();
+        cache
+            .db
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE devices_cache", [])
+            .unwrap();
+        assert!(cache.create_local("Another", None).is_err());
+        assert!(cache.is_pending(&local.id).is_err());
+        assert!(cache.pending().is_err());
+        assert!(cache.update_local(&local.id, "Renamed", None).is_err());
+        assert!(cache.promote(&local.id, &local).is_err());
     }
 
     // ---- DevicesClient (remote calls, mocked server) -----------------------

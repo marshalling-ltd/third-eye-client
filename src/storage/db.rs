@@ -16,6 +16,7 @@ use rusqlite_migration::{M, Migrations};
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
 const MIGRATION_V2: &str = include_str!("migrations/002_map_tile_cache.sql");
 const MIGRATION_V3: &str = include_str!("migrations/003_devices_cache.sql");
+const MIGRATION_V4: &str = include_str!("migrations/004_devices_pending_sync.sql");
 
 /// Shared, thread-safe `SQLite` handle. Every storage submodule takes one of
 /// these by `Arc::clone`.
@@ -73,6 +74,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         M::up(MIGRATION_V1),
         M::up(MIGRATION_V2),
         M::up(MIGRATION_V3),
+        M::up(MIGRATION_V4),
     ]);
     migrations
         .to_latest(connection)
