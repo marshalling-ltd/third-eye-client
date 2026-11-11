@@ -28,6 +28,10 @@ export struct AoiShape {
     width: length,
     height: length,
     commands: string,
+    // Processed RGB image of the AOI, stretched over the bounding box. When
+    // absent the AOI is drawn as a translucent outline polygon instead.
+    has_image: bool,
+    image: image,
 }
 
 // Full-bleed device map screen (OpenStreetMap tiles + ROV/GPS pin).
@@ -101,28 +105,38 @@ export component MapPage inherits Rectangle {
             // Positioned in the same world-pixel space as the tiles/own pin
             // above, so every pin stays visible and correctly placed at any
             // zoom/pan, independent of which tiles happen to be loaded.
-            for shape in root.aoi_shapes : Path {
+            for shape in root.aoi_shapes : Rectangle {
                 x: shape.x;
                 y: shape.y;
                 width: shape.width;
                 height: shape.height;
-                commands: shape.commands;
-                fill: #ff3b3033;
-                stroke: #ff6b61;
-                stroke-width: 2px;
+
+                if shape.has_image : Image {
+                    width: 100%;
+                    height: 100%;
+                    source: shape.image;
+                    image-fit: fill;
+                }
+
+                Path {
+                    width: 100%;
+                    height: 100%;
+                    commands: shape.commands;
+                    fill: shape.has_image ? transparent : #ff3b3033;
+                    stroke: #ff6b61;
+                    stroke-width: 2px;
+                }
             }
 
             // Pins: POI teardrop (tip on the point), magnetograph diamond,
-            // fire flame and AOI centre dot, all as PNG icons except the dot.
+            // fire flame; AOIs have no pin (their shape/RGB image is the marker)
+            // but keep an invisible tap target at their centre for the card.
             for pin[i] in root.nearby_pins : Rectangle {
                 width: pin.kind == 1 ? 14px : (pin.kind == 0 ? 26px : 28px);
                 height: pin.kind == 1 ? 14px : (pin.kind == 0 ? 26px : 28px);
                 x: pin.x - self.width / 2;
                 y: pin.kind == 0 ? pin.y - self.height : pin.y - self.height / 2;
-                border-radius: pin.kind == 1 ? 7px : 0px;
-                border-width: pin.kind == 1 ? 1px : 0px;
-                border-color: #ffffffaa;
-                background: pin.kind == 1 ? #ff3b30 : transparent;
+                background: transparent;
 
                 if pin.kind != 1 : Image {
                     width: 100%;

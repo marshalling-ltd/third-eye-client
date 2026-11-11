@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use map::{
     DEFAULT_OSM_TILE_USER_AGENT, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, MapState, MapTilesState,
-    RgbaFrame, ViewportAnimation, compute_scale_bar, ease_out_cubic, lat_lon_to_world_px,
-    rgba_frame_to_slint_image,
+    RgbaFrame, ViewportAnimation, compute_scale_bar, ease_out_cubic, haversine_m,
+    lat_lon_to_world_px, rgba_frame_to_slint_image,
 };
 #[cfg(target_os = "macos")]
 use map::{
@@ -76,7 +76,7 @@ use third_eye_client::storage::media::{
     build_details_text, build_info_subtitle, download_to_local, origin_label, state_label,
 };
 use third_eye_client::storage::search::{
-    DEFAULT_SEARCH_RADIUS_M, FIRE_LOOKBACK_HOURS, FIRE_SEARCH_RADIUS_M, NearbyKind, NearbyResource,
+    FIRE_LOOKBACK_HOURS, MAX_SEARCH_RADIUS_M, MIN_SEARCH_RADIUS_M, NearbyKind, NearbyResource,
 };
 use third_eye_client::update_check::{
     GithubReleaseAsset, normalize_release_tag, parse_version_triplet,
@@ -102,6 +102,14 @@ const AUTO_UPDATE_CHECK_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 // How often the Map screen re-fetches nearby AOI/POI/Intermagnet
 // resources from the server while it stays open (see `maybe_start_nearby_fetch`).
 const NEARBY_REFRESH_INTERVAL_MS: i64 = 60_000;
+// The map view must stay put this long before an out-of-coverage pan/zoom
+// triggers a new nearby fetch, so a drag doesn't fire a request per frame.
+const NEARBY_VIEW_SETTLE_MS: i64 = 400;
+// Fetches cover this much more than the visible circle, so small pans and
+// zoom-outs stay inside the already-fetched area.
+const NEARBY_FETCH_MARGIN: f64 = 1.25;
+// Longest edge, in pixels, an AOI image is downscaled to before display.
+const AOI_IMAGE_MAX_EDGE_PX: u32 = 1024;
 // How often a signed-in but idle app exercises its refresh cookie to keep the
 // session alive (see `maybe_keep_session_alive`). Well under any plausible
 // refresh-token lifetime, and cheap: it only performs a network round-trip when
@@ -580,6 +588,19 @@ struct NearbyResourcesState {
     /// Unix-ms deadline before which another fetch won't be started, even if
     /// the user re-enters the Map screen (see `NEARBY_REFRESH_INTERVAL_MS`).
     next_fetch_at_ms: i64,
+    /// Circle `(lat, lon, radius_m)` covered by the last successful fetch.
+    /// Results are merged into `items` and a new fetch only happens when the
+    /// visible map area leaves this circle (or the periodic refresh is due).
+    covered: Option<(f64, f64, f64)>,
+    /// No fetch is started before this time after a failed one, so a
+    /// persistent error isn't retried on every settled pan.
+    backoff_until_ms: i64,
+    /// Last observed out-of-coverage view and when it was first seen
+    /// (settle debounce, see `NEARBY_VIEW_SETTLE_MS`).
+    settling_view: Option<((f64, f64, f64), i64)>,
+    /// Decoded RGB overlay per AOI id, tagged with the analysis id it was
+    /// decoded from so an unchanged image is not decoded again.
+    aoi_images: std::collections::HashMap<String, (String, slint::Image)>,
     /// Human-readable status shown in a small Map badge, so it's
     /// visible from the running app (not just stderr) whether/why the
     /// `/api/v1/search` call did or didn't fire (e.g. not signed in yet, no
@@ -596,6 +617,10 @@ impl NearbyResourcesState {
             items: Vec::new(),
             fetch_in_progress: false,
             next_fetch_at_ms: 0,
+            covered: None,
+            backoff_until_ms: 0,
+            aoi_images: std::collections::HashMap::new(),
+            settling_view: None,
             status_text: "Nearby: sign in to see AOI/POI/Magnetograph/fire resources.".to_string(),
             event_tx,
             event_rx,
@@ -605,10 +630,15 @@ impl NearbyResourcesState {
 
 enum NearbyEvent {
     Fetched {
+        /// The circle `(lat, lon, radius_m)` this fetch searched.
+        area: (f64, f64, f64),
         /// Carries the real `ApiError` (rather than a pre-formatted string) so
         /// the UI thread can tell a session-ending failure apart from a
         /// transient/offline one - see `note_api_error`.
         result: Result<Vec<NearbyResource>, ApiError>,
+        /// Newly decoded RGB images, by AOI id (images the client already
+        /// holds are not decoded again).
+        aoi_frames: std::collections::HashMap<String, RgbaFrame>,
         /// `Some` when the (best-effort) fire lookup failed.
         fire_error: Option<String>,
     },
@@ -1217,7 +1247,7 @@ fn devices_row_model(state: &ThirdEyeState) -> ModelRc<DeviceRow> {
 
 /// Projects an AOI outline into world pixels and builds the Slint path for it
 /// (relative to the polygon's bounding box).
-fn aoi_shape(outline: &[(f64, f64)], zoom: u32) -> AoiShape {
+fn aoi_shape(outline: &[(f64, f64)], zoom: u32, image: Option<slint::Image>) -> AoiShape {
     let points: Vec<(f32, f32)> = outline
         .iter()
         .map(|&(lat, lon)| {
@@ -1246,6 +1276,8 @@ fn aoi_shape(outline: &[(f64, f64)], zoom: u32) -> AoiShape {
         width: (max_x - min_x).max(1.0),
         height: (max_y - min_y).max(1.0),
         commands: commands.into(),
+        has_image: image.is_some(),
+        image: image.unwrap_or_default(),
     }
 }
 
@@ -1441,15 +1473,11 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
     if state.nearby.fetch_in_progress {
         return;
     }
-    let now_ms = current_unix_ms();
-    if now_ms < state.nearby.next_fetch_at_ms {
-        return;
-    }
-    let Some((lat, lon)) = state.map.lat.zip(state.map.lon) else {
+    if state.map.lat.is_none() || state.map.lon.is_none() {
         state.nearby.status_text =
             "Nearby: waiting for a location fix before searching.".to_string();
         return;
-    };
+    }
     // Deliberately the in-memory mirror rather than `store.api().has_session()`:
     // this runs on every 16 ms timer tick, and `has_session` queries SQLite.
     if !state.auth.is_signed_in {
@@ -1457,6 +1485,45 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
             "Nearby: sign in to see AOI/POI/Magnetograph/fire resources.".to_string();
         return;
     }
+    let Some((lat, lon, view_radius_m)) = state.map_tiles.view_circle(state.map.zoom) else {
+        return;
+    };
+    let now_ms = current_unix_ms();
+    if now_ms < state.nearby.backoff_until_ms {
+        return;
+    }
+    let view = (lat, lon, view_radius_m.min(MAX_SEARCH_RADIUS_M));
+    let refresh_due = now_ms >= state.nearby.next_fetch_at_ms;
+    let covered = state
+        .nearby
+        .covered
+        .is_some_and(|area| circle_contains(area, view));
+    if covered && !refresh_due {
+        state.nearby.settling_view = None;
+        return;
+    }
+    // The view left the fetched area (user panned or zoomed out): wait until
+    // it stops moving before asking the platform again. A due refresh and the
+    // very first fetch go out immediately.
+    if !covered && !refresh_due && state.nearby.covered.is_some() {
+        let moved = state
+            .nearby
+            .settling_view
+            .is_none_or(|(seen, _)| seen != view);
+        if moved {
+            state.nearby.settling_view = Some((view, now_ms));
+            return;
+        }
+        if let Some((_, since)) = state.nearby.settling_view
+            && now_ms - since < NEARBY_VIEW_SETTLE_MS
+        {
+            return;
+        }
+    }
+    state.nearby.settling_view = None;
+    let radius_m =
+        (view_radius_m * NEARBY_FETCH_MARGIN).clamp(MIN_SEARCH_RADIUS_M, MAX_SEARCH_RADIUS_M);
+    let area = (lat, lon, radius_m);
     state.nearby.fetch_in_progress = true;
     state.nearby.next_fetch_at_ms = now_ms.saturating_add(NEARBY_REFRESH_INTERVAL_MS);
     state.nearby.status_text = "Nearby: searching...".to_string();
@@ -1466,12 +1533,35 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
     // to be captured here.
     let search_client = store.search().clone();
     let tx = state.nearby.event_tx.clone();
+    // AOI id -> analysis id of the images already decoded, so unchanged ones
+    // are not decoded again.
+    let known_images: std::collections::HashMap<String, String> = state
+        .nearby
+        .aoi_images
+        .iter()
+        .map(|(id, (analysis_id, _))| (id.clone(), analysis_id.clone()))
+        .collect();
     thread::spawn(move || {
-        let mut result = search_client.nearby(&server_base, lat, lon, DEFAULT_SEARCH_RADIUS_M);
+        let mut result = search_client.nearby(&server_base, lat, lon, radius_m);
+        let mut aoi_frames = std::collections::HashMap::new();
+        if let Ok(items) = &mut result {
+            for item in items.iter_mut().filter(|item| item.kind == NearbyKind::Aoi) {
+                let Some(rgb) = item.rgb_image.as_mut() else {
+                    continue;
+                };
+                let bytes = std::mem::take(&mut rgb.bytes);
+                if known_images.get(&item.id) == Some(&rgb.analysis_id) || bytes.is_empty() {
+                    continue;
+                }
+                if let Some(frame) = decode_aoi_image(&bytes) {
+                    aoi_frames.insert(item.id.clone(), frame);
+                }
+            }
+        }
         // Fires are best-effort: a FIRMS failure must not hide AOIs/POIs.
         let mut fire_error = None;
         if let Ok(items) = &mut result {
-            match search_client.fires(&server_base, lat, lon, FIRE_SEARCH_RADIUS_M) {
+            match search_client.fires(&server_base, lat, lon, radius_m) {
                 Ok(fires) => items.extend(fires),
                 Err(err) => {
                     eprintln!("failed to fetch nearby fires: {err}");
@@ -1479,19 +1569,123 @@ fn maybe_start_nearby_fetch(state: &mut ThirdEyeState, store: &AppStore) {
                 }
             }
         }
-        let _ = tx.send(NearbyEvent::Fetched { result, fire_error });
+        let _ = tx.send(NearbyEvent::Fetched {
+            area,
+            result,
+            aoi_frames,
+            fire_error,
+        });
     });
+}
+
+/// Brings the per-AOI RGB overlays in line with `nearby.items`: newly decoded
+/// frames are installed, an image is kept while its analysis id is unchanged,
+/// and AOIs without a processed RGB image (or no longer present) lose theirs
+/// so they fall back to the outline.
+fn sync_aoi_images(
+    nearby: &mut NearbyResourcesState,
+    mut frames: std::collections::HashMap<String, RgbaFrame>,
+) {
+    let mut synced = std::collections::HashMap::new();
+    for item in nearby.items.iter().filter(|i| i.kind == NearbyKind::Aoi) {
+        let Some(rgb) = &item.rgb_image else {
+            continue;
+        };
+        if let Some(frame) = frames.remove(&item.id) {
+            synced.insert(
+                item.id.clone(),
+                (rgb.analysis_id.clone(), rgba_frame_to_slint_image(&frame)),
+            );
+        } else if let Some(existing) = nearby.aoi_images.remove(&item.id)
+            && existing.0 == rgb.analysis_id
+        {
+            synced.insert(item.id.clone(), existing);
+        }
+    }
+    nearby.aoi_images = synced;
+}
+
+/// Decodes an encoded AOI image into RGBA, downscaled to
+/// `AOI_IMAGE_MAX_EDGE_PX` so large rasters stay cheap to draw.
+fn decode_aoi_image(bytes: &[u8]) -> Option<RgbaFrame> {
+    let mut image = image::load_from_memory(bytes).ok()?;
+    if image.width().max(image.height()) > AOI_IMAGE_MAX_EDGE_PX {
+        image = image.resize(
+            AOI_IMAGE_MAX_EDGE_PX,
+            AOI_IMAGE_MAX_EDGE_PX,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    let rgba = image.to_rgba8();
+    Some(RgbaFrame {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
+}
+
+/// True if circle `inner` lies entirely within circle `outer`
+/// (both `(lat, lon, radius_m)`).
+fn circle_contains(outer: (f64, f64, f64), inner: (f64, f64, f64)) -> bool {
+    haversine_m(outer.0, outer.1, inner.0, inner.1) + inner.2 <= outer.2
+}
+
+/// True if `item` lies inside `area`. An AOI counts as inside when its centre
+/// or any outline vertex does: the platform returns AOIs that reach into the
+/// circle even when their centre is outside it.
+fn item_in_area(item: &NearbyResource, area: (f64, f64, f64)) -> bool {
+    let inside = |lat: f64, lon: f64| haversine_m(area.0, area.1, lat, lon) <= area.2;
+    inside(item.lat, item.lon) || item.outline.iter().any(|&(lat, lon)| inside(lat, lon))
+}
+
+/// Merges a fetch result for `area` into `items`. What the platform did not
+/// return this time is treated as gone (deleted AOI/POI, a fire that is no
+/// longer reported): everything previously known inside the area, or sharing
+/// an id with a fresh item, is replaced by the fresh results. Items fetched for
+/// other areas are kept.
+///
+/// `fires_refreshed` is false when the fire lookup failed; existing fires are
+/// then left alone, because their absence says nothing.
+fn merge_nearby(
+    items: &mut Vec<NearbyResource>,
+    area: (f64, f64, f64),
+    fresh: Vec<NearbyResource>,
+    fires_refreshed: bool,
+) {
+    let fresh_ids: std::collections::HashSet<(u8, &str)> = fresh
+        .iter()
+        .map(|item| (item.kind as u8, item.id.as_str()))
+        .collect();
+    items.retain(|item| {
+        if item.kind == NearbyKind::Fire && !fires_refreshed {
+            return true;
+        }
+        !item_in_area(item, area) && !fresh_ids.contains(&(item.kind as u8, item.id.as_str()))
+    });
+    items.extend(fresh);
 }
 
 /// Polls background nearby-resources fetch results and updates `state.nearby`
 /// accordingly. Returns `true` if the UI needs a refresh.
 fn poll_nearby_events(state: &mut ThirdEyeState) -> bool {
     let mut changed = false;
-    while let Ok(NearbyEvent::Fetched { result, fire_error }) = state.nearby.event_rx.try_recv() {
+    while let Ok(event) = state.nearby.event_rx.try_recv() {
+        let (area, result, aoi_frames, fire_error) = match event {
+            NearbyEvent::Fetched {
+                area,
+                result,
+                aoi_frames,
+                fire_error,
+            } => (area, result, aoi_frames, fire_error),
+        };
         state.nearby.fetch_in_progress = false;
         changed = true;
         match result {
-            Ok(items) => {
+            Ok(fresh) => {
+                merge_nearby(&mut state.nearby.items, area, fresh, fire_error.is_none());
+                sync_aoi_images(&mut state.nearby, aoi_frames);
+                state.nearby.covered = Some(area);
+                let items = &state.nearby.items;
                 let fires = items.iter().filter(|i| i.kind == NearbyKind::Fire).count();
                 state.nearby.status_text = match fire_error {
                     Some(err) => format!(
@@ -1499,16 +1693,18 @@ fn poll_nearby_events(state: &mut ThirdEyeState) -> bool {
                         items.len()
                     ),
                     None => format!(
-                        "Nearby: {} resource(s), {fires} fire(s) within {} km in the last {} h.",
+                        "Nearby: {} resource(s), {fires} fire(s) (fires: last {} h, searched {} km).",
                         items.len(),
-                        (FIRE_SEARCH_RADIUS_M / 1000.0) as u32,
-                        FIRE_LOOKBACK_HOURS
+                        FIRE_LOOKBACK_HOURS,
+                        (area.2 / 1000.0).round() as u32
                     ),
                 };
-                state.nearby.items = items;
             }
             Err(err) => {
                 eprintln!("failed to fetch nearby resources: {err}");
+                // Leave `covered` as-is and retry after the refresh interval.
+                state.nearby.backoff_until_ms =
+                    current_unix_ms().saturating_add(NEARBY_REFRESH_INTERVAL_MS);
                 state.nearby.status_text = if note_api_error(state, &err) {
                     "Nearby: session expired, sign in again.".to_string()
                 } else {
@@ -2060,7 +2256,14 @@ fn apply_map_runtime_to_ui(ui: &AppWindow, state: &ThirdEyeState) {
         .items
         .iter()
         .filter(|item| item.kind == NearbyKind::Aoi && item.outline.len() >= 3)
-        .map(|item| aoi_shape(&item.outline, state.map.zoom))
+        .map(|item| {
+            let image = state
+                .nearby
+                .aoi_images
+                .get(&item.id)
+                .map(|(_, image)| image.clone());
+            aoi_shape(&item.outline, state.map.zoom, image)
+        })
         .collect();
     ui.set_aoi_shapes(ModelRc::new(VecModel::from(aoi_shapes)));
     let scale_lat = state.map.lat.unwrap_or(45.0);
@@ -4053,6 +4256,7 @@ fn register_callbacks(ui: &AppWindow, state: Rc<RefCell<ThirdEyeState>>, store: 
                 // so the Map fetches fresh pins on the next tick.
                 refresh_devices_blocking(&mut state, &store_for_sign_in);
                 state.nearby.next_fetch_at_ms = 0;
+                state.nearby.backoff_until_ms = 0;
             }
             Err(err) => {
                 state.auth.is_signed_in = false;
@@ -5738,10 +5942,85 @@ fn spawn_ip_location_lookup() -> mpsc::Receiver<Result<(f64, f64), String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nearby_merge_replaces_inside_area_and_keeps_outside() {
+        let item = |id: &str, lat: f64| NearbyResource {
+            id: id.to_owned(),
+            kind: NearbyKind::Poi,
+            name: id.to_owned(),
+            lat,
+            lon: 0.0,
+            outline: Vec::new(),
+            rgb_image: None,
+        };
+        // ~111 km per degree: area covers lat in [-0.5, 0.5].
+        let area = (0.0, 0.0, 55_000.0);
+        let mut items = vec![item("gone", 0.1), item("far", 3.0), item("kept", 0.2)];
+        merge_nearby(
+            &mut items,
+            area,
+            vec![item("kept", 0.2), item("new", 0.3)],
+            true,
+        );
+        let mut ids: Vec<_> = items.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["far", "kept", "new"]);
+    }
+
+    #[test]
+    fn failed_fire_lookup_keeps_fires_but_still_drops_gone_pois() {
+        let item = |id: &str, kind: NearbyKind| NearbyResource {
+            id: id.to_owned(),
+            kind,
+            name: id.to_owned(),
+            lat: 0.1,
+            lon: 0.0,
+            outline: Vec::new(),
+            rgb_image: None,
+        };
+        let area = (0.0, 0.0, 55_000.0);
+        let start = || vec![item("fire", NearbyKind::Fire), item("poi", NearbyKind::Poi)];
+        let mut items = start();
+        merge_nearby(&mut items, area, Vec::new(), false);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, NearbyKind::Fire);
+        // With a successful fire lookup, a fire no longer reported is gone.
+        let mut items = start();
+        merge_nearby(&mut items, area, Vec::new(), true);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn aoi_reaching_into_area_is_dropped_when_not_returned() {
+        let aoi = NearbyResource {
+            id: "aoi".to_owned(),
+            kind: NearbyKind::Aoi,
+            name: "aoi".to_owned(),
+            lat: 2.0,
+            lon: 0.0,
+            // Centre is ~222 km away, but one vertex reaches into the area.
+            outline: vec![(0.2, 0.0), (3.0, 0.0), (3.0, 1.0)],
+            rgb_image: None,
+        };
+        let mut items = vec![aoi];
+        merge_nearby(&mut items, (0.0, 0.0, 55_000.0), Vec::new(), true);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn circle_containment() {
+        let outer = (0.0, 0.0, 10_000.0);
+        assert!(circle_contains(outer, (0.0, 0.0, 10_000.0)));
+        assert!(circle_contains(outer, (0.0, 0.05, 4_000.0)));
+        assert!(!circle_contains(outer, (0.0, 0.05, 6_000.0)));
+        assert!(!circle_contains(outer, (1.0, 0.0, 100.0)));
+    }
+
     use super::{
-        RovLink, ZOOM_SETTLE_TIMEOUT_MS, awaiting_address_hint, awaiting_address_setup,
-        host_header_args, pinch_zoom_step_from_scale, scroll_zoom_allowed,
-        stream_status_for_display, suggested_client_address,
+        NearbyKind, NearbyResource, RovLink, ZOOM_SETTLE_TIMEOUT_MS, awaiting_address_hint,
+        awaiting_address_setup, circle_contains, host_header_args, merge_nearby,
+        pinch_zoom_step_from_scale, scroll_zoom_allowed, stream_status_for_display,
+        suggested_client_address,
     };
     use third_eye_client::network::LinkKind;
 
