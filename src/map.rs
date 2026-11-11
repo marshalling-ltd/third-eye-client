@@ -217,6 +217,16 @@ impl MapTilesState {
         Some((lat, lon))
     }
 
+    /// The visible map area as a circle `(center_lat, center_lon, radius_m)`
+    /// that fully contains the viewport rectangle (radius is the distance from
+    /// the center to a corner).
+    pub fn view_circle(&self, zoom_level: u32) -> Option<(f64, f64, f64)> {
+        let (lat, lon) = self.center_lat_lon(zoom_level)?;
+        let half_diagonal_px = self.visible_width.hypot(self.visible_height) / 2.0;
+        let radius_m = half_diagonal_px * meters_per_pixel(lat, Self::world_size_px(zoom_level));
+        Some((lat, lon, radius_m))
+    }
+
     pub fn viewport_for_slint(&self, zoom_level: u32) -> (f32, f32, f32, f32) {
         let world_size = Self::world_size_px(zoom_level) as f32;
         (
@@ -436,6 +446,23 @@ pub struct ViewportAnimation {
     pub target_vp_y: f32,
     pub elapsed_ms: f64,
     pub duration_ms: f64,
+}
+
+const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
+/// Ground resolution (meters per screen pixel) at `lat` for a Web Mercator
+/// world that is `world_size_px` pixels wide.
+fn meters_per_pixel(lat: f64, world_size_px: f64) -> f64 {
+    2.0 * PI * 6_378_137.0 * lat.to_radians().cos() / world_size_px
+}
+
+/// Great-circle distance in meters between two `(lat, lon)` points.
+pub fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
+    let dphi = phi2 - phi1;
+    let dlambda = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().min(1.0).asin()
 }
 
 pub fn ease_out_cubic(t: f64) -> f64 {
@@ -721,6 +748,27 @@ fn decode_png_to_frame(bytes: &[u8]) -> Result<RgbaFrame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn haversine_known_distances() {
+        assert!(haversine_m(10.0, 20.0, 10.0, 20.0) < 1e-6);
+        // One degree of latitude is ~111.2 km.
+        let d = haversine_m(0.0, 0.0, 1.0, 0.0);
+        assert!((d - 111_195.0).abs() < 200.0, "{d}");
+    }
+
+    #[test]
+    fn view_circle_radius_halves_per_zoom_level() {
+        let mut tiles = MapTilesState::new();
+        tiles.update_visible_size(800.0, 600.0, 10);
+        tiles.center_on_location(45.0, 15.0, 10);
+        let (_, _, r10) = tiles.view_circle(10).unwrap();
+        tiles.center_on_location(45.0, 15.0, 11);
+        let (_, _, r11) = tiles.view_circle(11).unwrap();
+        assert!((r10 / r11 - 2.0).abs() < 0.01, "{r10} {r11}");
+        // 1000 px diagonal / 2 * ~(40075 km * cos45 / (256*1024) px) ≈ 108 m/px -> ~54 km.
+        assert!(r10 > 50_000.0 && r10 < 58_000.0, "{r10}");
+    }
 
     #[test]
     fn world_size_zoom_0() {

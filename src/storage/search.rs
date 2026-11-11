@@ -24,15 +24,15 @@ use third_eye_openapi::models::{
 
 use super::api::{ApiError, ApiSession, BACKEND_HTTP_TIMEOUT};
 
-/// Default search radius, in meters, used when pulling nearby resources for
-/// the Map screen. The OpenAPI schema doesn't document units for `r`;
-/// this is an assumption, easy to tune once confirmed against the web app.
-pub const DEFAULT_SEARCH_RADIUS_M: f64 = 5000.0;
+/// Smallest radius, in meters, ever searched around the map view. Keeps
+/// tightly zoomed-in views from re-fetching on every small pan. The OpenAPI
+/// schema doesn't document units for `r`; meters is an assumption.
+pub const MIN_SEARCH_RADIUS_M: f64 = 5_000.0;
 
-/// Search radius, in meters, for active-fire detections (NASA FIRMS). Fires are
-/// reported by satellite and are sparse, so this is wider than the radius used
-/// for AOIs/POIs.
-pub const FIRE_SEARCH_RADIUS_M: f64 = 50_000.0;
+/// Largest radius, in meters, searched for AOI/POI/Magnetograph/fires. The
+/// platform documents no maximum, so this is a client-side guard: zoomed out
+/// further than this we only show what is already loaded.
+pub const MAX_SEARCH_RADIUS_M: f64 = 200_000.0;
 
 /// How far back, in hours, to look for fire detections.
 pub const FIRE_LOOKBACK_HOURS: u64 = 24;
@@ -63,6 +63,20 @@ pub struct NearbyResource {
     pub lon: f64,
     /// AOI boundary as `(lat, lon)` vertices (first ring); empty for other kinds.
     pub outline: Vec<(f64, f64)>,
+    /// Latest processed RGB image of an AOI (`None` for other kinds, and for
+    /// AOIs whose RGB analysis hasn't succeeded yet). It covers exactly the
+    /// bounding box of `outline`.
+    pub rgb_image: Option<RgbImage>,
+}
+
+/// An AOI's RGB image as returned by the search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RgbImage {
+    /// Id of the RGB analysis; changes when a newer image is processed.
+    pub analysis_id: String,
+    /// Encoded image bytes (PNG/JPEG). Empty when the server sent only the
+    /// metadata (`include_rgb_images` unset).
+    pub bytes: Vec<u8>,
 }
 
 /// Facade held by `AppStore`, mirroring `DevicesClient`. Cloneable (like
@@ -156,6 +170,8 @@ impl SearchClient {
         let body = json!({
             "location": { "lat": lat, "lon": lon, "r": radius_m },
             "resource_types": ["aoi", "poi", "intermagnet_analysis"],
+            // AOIs come back with their processed RGB image when there is one.
+            "include_rgb_images": true,
         });
         self.api.call_with_token(server_base, |access_token| {
             let response = self
@@ -182,6 +198,16 @@ impl SearchClient {
     }
 }
 
+/// Decodes a base64 image payload, tolerating a `data:image/...;base64,` prefix.
+fn decode_base64_image(encoded: String) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let payload = encoded.split_once(',').map_or(encoded.as_str(), |(_, b)| b);
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()
+        .filter(|bytes| !bytes.is_empty())
+}
+
 /// Flattens a FIRMS record to a plottable pin. FIRMS records have no id, so
 /// one is derived from source/time/position.
 fn fire_resource(record: &PagedResponseFirmsAreaRecordItemsInner) -> NearbyResource {
@@ -202,6 +228,7 @@ fn fire_resource(record: &PagedResponseFirmsAreaRecordItemsInner) -> NearbyResou
         lat: record.latitude,
         lon: record.longitude,
         outline: Vec::new(),
+        rgb_image: None,
     }
 }
 
@@ -254,6 +281,7 @@ fn parse_item(item: &Value) -> Option<NearbyResource> {
                 lat,
                 lon,
                 outline: Vec::new(),
+                rgb_image: None,
             })
         }
         "intermagnet_analysis" => {
@@ -266,6 +294,7 @@ fn parse_item(item: &Value) -> Option<NearbyResource> {
                 lat,
                 lon,
                 outline: Vec::new(),
+                rgb_image: None,
             })
         }
         "aoi" => {
@@ -278,10 +307,23 @@ fn parse_item(item: &Value) -> Option<NearbyResource> {
                 lat,
                 lon,
                 outline: first_ring(area).unwrap_or_default(),
+                rgb_image: parse_rgb_image(data.get("rgb_image")),
             })
         }
         _ => None,
     }
+}
+
+/// Reads an AOI item's `rgb_image` object. `None` when absent (no processed
+/// RGB image) or when the image data can't be decoded.
+fn parse_rgb_image(value: Option<&Value>) -> Option<RgbImage> {
+    let value = value?;
+    let analysis_id = value.get("analysis_id")?.as_str()?.to_owned();
+    let bytes = match value.get("file_base64").and_then(Value::as_str) {
+        Some(encoded) => decode_base64_image(encoded.to_owned())?,
+        None => Vec::new(),
+    };
+    Some(RgbImage { analysis_id, bytes })
 }
 
 /// Approximates a GeoJSON-style geometry's centroid by averaging every
@@ -364,7 +406,7 @@ fn collect_coordinate_pairs(value: &Value, sum_lat: &mut f64, sum_lon: &mut f64,
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, FIRE_SEARCH_RADIUS_M, NearbyKind, parse_items, rfc3339_utc};
+    use super::{ApiError, MAX_SEARCH_RADIUS_M, NearbyKind, parse_items, rfc3339_utc};
     use serde_json::json;
 
     #[test]
@@ -509,6 +551,26 @@ mod tests {
     }
 
     #[test]
+    fn aoi_items_carry_rgb_image_when_processed() {
+        let area = json!({"type": "Polygon", "coordinates": [[[1.0, 2.0], [1.0, 3.0], [2.0, 3.0], [1.0, 2.0]]]});
+        let value = json!({"items": [
+            {"id": "a1", "resource_type": "aoi", "data": {"name": "With", "area": area,
+                "rgb_image": {"analysis_id": "an-1", "image_datetime": "2026-11-09T10:00:00Z",
+                              "file_base64": "data:image/png;base64,aGVsbG8="}}},
+            {"id": "a2", "resource_type": "aoi", "data": {"name": "Without", "area": area}},
+            {"id": "a3", "resource_type": "aoi", "data": {"name": "MetaOnly", "area": area,
+                "rgb_image": {"analysis_id": "an-3", "image_datetime": "2026-11-09T10:00:00Z"}}}
+        ]});
+        let items = parse_items(&value);
+        assert_eq!(items.len(), 3);
+        let rgb = items[0].rgb_image.as_ref().expect("rgb present");
+        assert_eq!(rgb.analysis_id, "an-1");
+        assert_eq!(rgb.bytes, b"hello");
+        assert!(items[1].rgb_image.is_none());
+        assert_eq!(items[2].rgb_image.as_ref().unwrap().bytes, Vec::<u8>::new());
+    }
+
+    #[test]
     fn fires_returns_pins_from_firms_records() {
         let mut server = mockito::Server::new();
         let store = signed_in_store(&mut server);
@@ -516,7 +578,7 @@ mod tests {
             .mock("POST", "/api/v1/firms/area-records/search")
             .match_query(mockito::Matcher::Any)
             .match_body(mockito::Matcher::PartialJson(
-                json!({"spatial": {"latitude": 42.6, "longitude": 18.1, "radius_meters": 50000.0}}),
+                json!({"spatial": {"latitude": 42.6, "longitude": 18.1, "radius_meters": 200_000.0}}),
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -533,7 +595,7 @@ mod tests {
 
         let fires = store
             .search()
-            .fires(&server.url(), 42.6, 18.1, FIRE_SEARCH_RADIUS_M)
+            .fires(&server.url(), 42.6, 18.1, MAX_SEARCH_RADIUS_M)
             .expect("fires succeed");
         mock.assert();
         assert_eq!(fires.len(), 1);
