@@ -5,7 +5,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "BSL-1.0", 
+    "BSL-1.0",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "GPL-3.0-only",
@@ -15,8 +15,8 @@ allow = [
     "MIT",
     "MPL-2.0",
     "NCSA",
-    "Unicode-3.0", 
-    "Zlib"
+    "Unicode-3.0",
+    "Zlib",
 ]
 
 # `generated/` (crate name `openapi`) is our own OpenAPI-generated client for
@@ -31,4 +31,16 @@ expression = "GPL-3.0-only"
 license-files = []
 
 [advisories]
-ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0192", "RUSTSEC-2026-0195", "RUSTSEC-2026-0206", "RUSTSEC-2026-0370", "RUSTSEC-2026-0371", "RUSTSEC-2026-0372", "RUSTSEC-2026-0441", "RUSTSEC-2026-0459"]
+ignore = [
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0206",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+    "RUSTSEC-2026-0441",
+    "RUSTSEC-2026-0459",
+]
